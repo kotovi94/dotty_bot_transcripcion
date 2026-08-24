@@ -17,6 +17,10 @@ import { shell } from "electron";
 
 import type {
   DottyOperationError,
+  EditorialFeedbackResult,
+  EditorialLearningState,
+  EditorialRuleView,
+  EditorialScope,
   DottyState,
   LogKind,
   MaintenanceAction,
@@ -329,6 +333,8 @@ export class DottySupervisor {
               narrativeError: narrative.error ?? null,
               campaignName: typeof manifest?.campaignName === "string" ? manifest.campaignName : null,
               sequenceNumber: typeof manifest?.sequenceNumber === "number" ? manifest.sequenceNumber : null,
+              startedAt,
+              endedAt,
               durationSeconds,
               participants,
               processing,
@@ -341,7 +347,10 @@ export class DottySupervisor {
     );
     return results
       .filter((entry): entry is TranscriptSummary => entry !== null)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      .sort((a, b) =>
+        (b.endedAt ?? b.startedAt ?? b.updatedAt)
+          .localeCompare(a.endedAt ?? a.startedAt ?? a.updatedAt),
+      );
   }
 
   async readTranscript(sessionId: string): Promise<TranscriptDetail> {
@@ -396,7 +405,42 @@ export class DottySupervisor {
       }, null, 2)}\n`,
       "utf8",
     );
+    await this.runBotScript(
+      join("apps", "bot", "scripts", "editorial-cli.ts"),
+      ["verify", sessionId],
+      120_000,
+    ).catch(() => undefined);
     return { saved: true, ...(backupName === undefined ? {} : { backupName }) };
+  }
+
+  async getEditorialLearning(sessionId: string): Promise<EditorialLearningState> {
+    this.validateSessionId(sessionId);
+    return this.runEditorialState(sessionId);
+  }
+
+  async submitEditorialFeedback(sessionId: string, comment: string, editedVersion: string): Promise<EditorialFeedbackResult> {
+    this.validateSessionId(sessionId);
+    if (editedVersion.length > 5_000_000) throw new Error("El guion es demasiado grande.");
+    const exportDirectory = dirname(this.narrativePath(sessionId));
+    const generatedVersion = await readFile(join(exportDirectory, "guion.generado.md"), "utf8")
+      .catch(() => readFile(this.narrativePath(sessionId), "utf8"));
+    return this.runEditorialRequest<EditorialFeedbackResult>("submit", {
+      sessionId,
+      generatedVersion,
+      editedVersion,
+      comment: comment.slice(0, 4_000),
+    });
+  }
+
+  async decideEditorialRule(ruleId: string, decision: "approve" | "reject" | "deprecate", scope?: EditorialScope): Promise<EditorialRuleView> {
+    if (!/^[a-zA-Z0-9_-]+$/u.test(ruleId)) throw new Error("Regla editorial inválida.");
+    return this.runEditorialRequest<EditorialRuleView>("decide", { ruleId, decision, ...(scope ? { scope } : {}) });
+  }
+
+  async rollbackEditorialRule(ruleId: string): Promise<EditorialRuleView> {
+    if (!/^[a-zA-Z0-9_-]+$/u.test(ruleId)) throw new Error("Regla editorial inválida.");
+    const { stdout } = await this.runBotScript(join("apps", "bot", "scripts", "editorial-cli.ts"), ["rollback", ruleId], 120_000);
+    return this.parseEditorialResult<EditorialRuleView>(stdout);
   }
 
   async generateNarrative(sessionId: string): Promise<NarrativeOperationResult> {
@@ -664,6 +708,32 @@ export class DottySupervisor {
     return response.json();
   }
 
+  private async runEditorialState(sessionId: string): Promise<EditorialLearningState> {
+    const { stdout } = await this.runBotScript(join("apps", "bot", "scripts", "editorial-cli.ts"), ["state", sessionId], 120_000);
+    return this.parseEditorialResult<EditorialLearningState>(stdout);
+  }
+
+  private async runEditorialRequest<T>(action: string, payload: Record<string, unknown>): Promise<T> {
+    const directory = join(this.dataRoot, "editorial-requests");
+    await mkdir(directory, { recursive: true });
+    const requestPath = join(directory, `request-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    await writeFile(requestPath, JSON.stringify(payload), "utf8");
+    try {
+      const { stdout } = await this.runBotScript(join("apps", "bot", "scripts", "editorial-cli.ts"), [action, requestPath], 120_000);
+      return this.parseEditorialResult<T>(stdout);
+    } finally {
+      await rm(requestPath, { force: true });
+    }
+  }
+
+  private parseEditorialResult<T>(stdout: string): T {
+    const lastLine = stdout.trim().split(/\r?\n/u).at(-1);
+    if (!lastLine) throw new Error("La operación editorial no devolvió resultado.");
+    const payload = JSON.parse(lastLine) as { ok?: boolean; result?: T };
+    if (payload.ok !== true || payload.result === undefined) throw new Error("Respuesta editorial inválida.");
+    return payload.result;
+  }
+
   private async runBotScript(
     scriptRelativePath: string,
     args: readonly string[],
@@ -829,13 +899,38 @@ export class DottySupervisor {
   private async findLastSessionSummary(): Promise<{ id: string; title: string } | null> {
     try {
       const entries = await readdir(this.exportsRoot, { withFileTypes: true });
-      const directories = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse();
-      for (const sessionId of directories) {
-        const transcriptPath = this.transcriptPath(sessionId);
+      const candidates = await Promise.all(
+        entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
+          try {
+            const transcriptPath = this.transcriptPath(entry.name);
+            const [fileStat, manifest] = await Promise.all([
+              stat(transcriptPath),
+              this.readManifest(entry.name),
+            ]);
+            const endedAt = typeof manifest?.endedAt === "string" ? manifest.endedAt : null;
+            const startedAt = typeof manifest?.startedAt === "string" ? manifest.startedAt : null;
+            const parsed = Date.parse(endedAt ?? startedAt ?? fileStat.mtime.toISOString());
+            return {
+              sessionId: entry.name,
+              transcriptPath,
+              timestamp: Number.isFinite(parsed) ? parsed : fileStat.mtimeMs,
+            };
+          } catch {
+            return null;
+          }
+        }),
+      );
+      const ordered = candidates
+        .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
+        .sort((a, b) => b.timestamp - a.timestamp);
+      for (const candidate of ordered) {
         try {
-          const content = await readFile(transcriptPath, "utf8");
-          const firstLine = content.split(/\r?\n/, 1)[0] ?? sessionId;
-          return { id: sessionId, title: firstLine.replace(/^#\s+/, "").trim() || sessionId };
+          const content = await readFile(candidate.transcriptPath, "utf8");
+          const firstLine = content.split(/\r?\n/, 1)[0] ?? candidate.sessionId;
+          return {
+            id: candidate.sessionId,
+            title: firstLine.replace(/^#\s+/, "").trim() || candidate.sessionId,
+          };
         } catch {
           continue;
         }

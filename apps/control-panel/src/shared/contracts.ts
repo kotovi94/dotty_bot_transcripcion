@@ -140,6 +140,8 @@ export interface TranscriptSummary {
   narrativeError: string | null;
   campaignName?: string | null;
   sequenceNumber?: number | null;
+  startedAt?: string | null;
+  endedAt?: string | null;
   durationSeconds?: number | null;
   participants?: SessionParticipant[];
   processing?: SessionProcessingStatus;
@@ -212,8 +214,51 @@ export interface SetupResult {
 
 export type SetupBrowseKind = "python" | "npm" | "data";
 
+export type EditorialScope = "session" | "campaign" | "user" | "global";
+export type EditorialRuleStatus = "candidate" | "approved" | "rejected" | "deprecated";
+
+export interface EditorialRuleView {
+  id: string;
+  scope: EditorialScope;
+  category: string;
+  text: string;
+  priority: number;
+  confidence: number;
+  status: EditorialRuleStatus;
+  occurrences: number;
+  version: number;
+  source: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EditorialLearningState {
+  rules: EditorialRuleView[];
+  candidates: EditorialRuleView[];
+  metrics: {
+    feedbackCount: number;
+    averageEditRatio: number;
+    repeatedCorrections: number;
+    categoryCounts: Record<string, number>;
+  };
+}
+
+export interface EditorialFeedbackResult {
+  feedbackId: string;
+  candidates: EditorialRuleView[];
+  diff: {
+    changes: Array<{ category: string; severity: string; generatedFragment: string; correctedFragment: string; kind: string }>;
+    editRatio: number;
+  };
+}
+
 export interface DottyDesktopApi {
   getState(): Promise<DottyState>;
+  getEditorialLearning(sessionId: string): Promise<EditorialLearningState>;
+  submitEditorialFeedback(sessionId: string, comment: string, editedVersion: string): Promise<EditorialFeedbackResult>;
+  decideEditorialRule(ruleId: string, decision: "approve" | "reject" | "deprecate", scope?: EditorialScope): Promise<EditorialRuleView>;
+  rollbackEditorialRule(ruleId: string): Promise<EditorialRuleView>;
+
   getSystemStatus(): Promise<SystemStatus>;
   getSessionDetails(sessionId: string): Promise<SessionDetails | null>;
   getSessionProcessingStatus(sessionId: string): Promise<SessionProcessingStatus>;

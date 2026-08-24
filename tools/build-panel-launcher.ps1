@@ -9,28 +9,36 @@ if (-not (Test-Path -LiteralPath $sourcePath) -or -not (Test-Path -LiteralPath $
   throw "Faltan el codigo del lanzador o el icono de Dotty."
 }
 
-if (Test-Path -LiteralPath $outputPath) {
-  Remove-Item -LiteralPath $outputPath -Force
+$compilerCandidates = @(
+  (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+  (Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe")
+)
+$compilerPath = $compilerCandidates |
+  Where-Object { Test-Path -LiteralPath $_ } |
+  Select-Object -First 1
+
+if (-not $compilerPath) {
+  throw "No se encontro el compilador de C# incluido en Windows."
 }
 
-Add-Type -AssemblyName Microsoft.CSharp
-
-$provider = New-Object Microsoft.CSharp.CSharpCodeProvider
-$parameters = New-Object System.CodeDom.Compiler.CompilerParameters
-$parameters.GenerateExecutable = $true
-$parameters.GenerateInMemory = $false
-$parameters.OutputAssembly = $outputPath
-$parameters.CompilerOptions = "/target:winexe /win32icon:`"$iconPath`""
-[void]$parameters.ReferencedAssemblies.Add("System.dll")
-[void]$parameters.ReferencedAssemblies.Add("System.Windows.Forms.dll")
-
-$source = Get-Content -LiteralPath $sourcePath -Raw
-$result = $provider.CompileAssemblyFromSource($parameters, $source)
-$provider.Dispose()
-
-if ($result.Errors.HasErrors) {
-  $messages = $result.Errors | ForEach-Object { $_.ToString() }
-  throw "No se pudo compilar el lanzador:`n$($messages -join "`n")"
+$temporaryOutputPath = Join-Path $projectRoot "Panel Dotty.nuevo.exe"
+if (Test-Path -LiteralPath $temporaryOutputPath) {
+  Remove-Item -LiteralPath $temporaryOutputPath -Force
 }
+
+& $compilerPath `
+  /nologo `
+  /target:winexe `
+  "/out:$temporaryOutputPath" `
+  "/win32icon:$iconPath" `
+  /reference:System.dll `
+  /reference:System.Windows.Forms.dll `
+  $sourcePath
+
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $temporaryOutputPath)) {
+  throw "No se pudo compilar el lanzador de Dotty."
+}
+
+Move-Item -LiteralPath $temporaryOutputPath -Destination $outputPath -Force
 
 Write-Output "Lanzador creado: $outputPath"

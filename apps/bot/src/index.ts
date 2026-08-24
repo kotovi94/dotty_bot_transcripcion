@@ -39,12 +39,15 @@ import { AdaptiveVocabularyStore } from "./transcription/adaptive-vocabulary.ts"
 import { NarrativeGenerator } from "./narrative/narrative-generator.ts";
 import { NarrativePublicationService } from "./narrative/narrative-publication.ts";
 import { NarrativeManager } from "./narrative/narrative-manager.ts";
+import { EditorialLearningService } from "./editorial/editorial-learning-service.ts";
 
 const environment = readEnvironment();
 const logger = createLogger(environment.DOTTY_LOG_LEVEL);
 const botStatusPath = resolve(environment.DOTTY_DATA_DIR, "dotty.status.json");
 await rm(botStatusPath, { force: true });
 const database = createDatabaseClient(environment.DATABASE_URL);
+const editorialLearning = new EditorialLearningService(database);
+await editorialLearning.ensureCriticalRules();
 const campaigns = new CampaignService(new PrismaCampaignRepository(database));
 const sessionRepository = new PrismaSessionRepository(database);
 const sessions = new SessionService(sessionRepository);
@@ -87,6 +90,7 @@ const narrativeGenerator = new NarrativeGenerator(
   environment.OLLAMA_MODEL,
   environment.TRANSCRIBER_BASE_URL,
   transcriberSecret,
+  editorialLearning,
 );
 const narrativePublication = new NarrativePublicationService(
   client,

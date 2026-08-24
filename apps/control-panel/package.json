@@ -57,7 +57,7 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": "resources/dotty-icon.png"
+      "icon": "resources/dotty-icon.ico"
     },
     "nsis": {
       "oneClick": false,

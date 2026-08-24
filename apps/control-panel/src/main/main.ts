@@ -11,7 +11,7 @@ import {
   Tray,
 } from "electron";
 
-import type { LogKind, MaintenanceAction, OperationKind, SetupBrowseKind, SetupConfig } from "../shared/contracts.js";
+import type { EditorialScope, LogKind, MaintenanceAction, OperationKind, SetupBrowseKind, SetupConfig } from "../shared/contracts.js";
 import { SetupManager } from "./setup-manager.js";
 import { DottySupervisor } from "./supervisor.js";
 
@@ -51,11 +51,17 @@ function findProjectRoot(): string {
 const projectRoot = findProjectRoot();
 const supervisor = new DottySupervisor(projectRoot);
 const setupManager = new SetupManager(projectRoot);
-const dottyIconPath = resolve(
-  app.getAppPath(),
-  "resources",
-  "dotty-icon.png",
-);
+function findIconPath(fileName: string): string {
+  const candidates = [
+    resolve(projectRoot, "apps", "control-panel", "resources", fileName),
+    resolve(app.getAppPath(), "resources", fileName),
+    resolve(process.resourcesPath, "resources", fileName),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
+}
+
+const dottyIconPath = findIconPath("dotty-icon.png");
+const dottyTrayIconPath = findIconPath("dotty-icon.ico");
 
 function createFallbackIcon() {
   const svg = `
@@ -72,6 +78,11 @@ function createDottyIcon(size: number) {
   const image = nativeImage.createFromPath(dottyIconPath);
   const source = image.isEmpty() ? createFallbackIcon() : image;
   return source.resize({ width: size, height: size, quality: "best" });
+}
+
+function createTrayIcon() {
+  const icon = nativeImage.createFromPath(dottyTrayIconPath);
+  return icon.isEmpty() ? createDottyIcon(32) : icon;
 }
 
 function showWindow(): void {
@@ -113,7 +124,7 @@ function createWindow(): void {
 }
 
 function createTray(): void {
-  tray = new Tray(createDottyIcon(32));
+  tray = new Tray(createTrayIcon());
   tray.setToolTip("Dotty - Panel de control");
   tray.setContextMenu(
     Menu.buildFromTemplate([
@@ -165,6 +176,18 @@ function registerIpc(): void {
     "dotty:save-narrative",
     (_event, sessionId: string, content: string) =>
       supervisor.saveNarrative(String(sessionId), String(content)),
+  );
+  ipcMain.handle("dotty:editorial-state", (_event, sessionId: string) =>
+    supervisor.getEditorialLearning(String(sessionId)),
+  );
+  ipcMain.handle("dotty:editorial-submit", (_event, sessionId: string, comment: string, editedVersion: string) =>
+    supervisor.submitEditorialFeedback(String(sessionId), String(comment), String(editedVersion)),
+  );
+  ipcMain.handle("dotty:editorial-decide", (_event, ruleId: string, decision: "approve" | "reject" | "deprecate", scope?: EditorialScope) =>
+    supervisor.decideEditorialRule(String(ruleId), decision, scope),
+  );
+  ipcMain.handle("dotty:editorial-rollback", (_event, ruleId: string) =>
+    supervisor.rollbackEditorialRule(String(ruleId)),
   );
   ipcMain.handle("dotty:generate-narrative", (_event, sessionId: string) =>
     supervisor.generateNarrative(String(sessionId)),
@@ -245,7 +268,7 @@ if (gotLock) {
 
   void app.whenReady().then(async () => {
     app.setName("Dotty");
-    app.setAppUserModelId("com.dotty.control-panel");
+    app.setAppUserModelId("com.dotty.transcriptor");
     await supervisor.initialize();
     registerIpc();
     createWindow();

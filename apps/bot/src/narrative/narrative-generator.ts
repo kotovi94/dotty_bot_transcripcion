@@ -3,6 +3,8 @@ import type { Dirent } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 import { writeFileAtomically } from "../recording/atomic-json-file.ts";
+import type { EditorialLearningService } from "../editorial/editorial-learning-service.ts";
+import { verifyDraft } from "../editorial/draft-verifier.ts";
 
 export type NarrativeState = "missing" | "queued" | "generating" | "ready" | "failed";
 
@@ -210,6 +212,7 @@ export class NarrativeGenerator {
     private readonly model: string,
     private readonly transcriberBaseUrl?: string,
     private readonly transcriberSecret?: string,
+    private readonly editorialLearning?: Pick<EditorialLearningService, "retrieve">,
   ) {}
 
   async getStatus(sessionId: string): Promise<NarrativeStatus> {
@@ -250,6 +253,10 @@ export class NarrativeGenerator {
       const sequenceNumber = Number(manifest.sequenceNumber ?? 0);
       const campaignName = String(manifest.campaignName ?? "Campaña");
       const context = await this.readContext(sessionId);
+      const campaignId = String(manifest.campaignId ?? "");
+      const editorialContext = campaignId !== "" && this.editorialLearning
+        ? await this.editorialLearning.retrieve({ sessionId, campaignId, query: campaignName }).catch(() => ({ rules: [], examples: [], prompt: "" }))
+        : { rules: [], examples: [], prompt: "" };
       const sourceLines: RawTranscriptLine[] = (transcript.lines ?? [])
         .filter((line) => typeof line.text === "string" && line.text.trim() !== "")
         .map((line, index) => ({
@@ -324,6 +331,7 @@ export class NarrativeGenerator {
             index + 1,
             transcriptBlocks.length,
             npcResolution,
+            editorialContext.prompt,
           );
         let audit = extraction.failed
           ? sceneArtifact.audit
@@ -494,6 +502,8 @@ export class NarrativeGenerator {
         ? 2_000
         : Math.min(16_000, Math.max(8_000, Math.round(sourceLength * 0.1)));
       validateScript(revised, sequenceNumber, minimumLength);
+      const verification = verifyDraft(revised, evidenceRecords.map((record) => JSON.stringify(record)), editorialContext.rules);
+      await writeFileAtomically(join(exportDirectory, "guion.verificacion.json"), `${JSON.stringify(verification, null, 2)}\n`);
 
       const scriptPath = join(exportDirectory, scriptFileName);
       const previousScriptPath = `${scriptPath}.anterior`;
@@ -501,6 +511,7 @@ export class NarrativeGenerator {
         await fs.copyFile(scriptPath, previousScriptPath);
       }
       await writeFileAtomically(scriptPath, `${revised.trim()}\n`);
+      await writeFileAtomically(join(exportDirectory, "guion.generado.md"), `${revised.trim()}\n`);
       await writeFileAtomically(
         join(exportDirectory, "guion.final.txt"),
         `${revised.trim()}\n`,
@@ -516,7 +527,7 @@ export class NarrativeGenerator {
         join(exportDirectory, evidenceFileName),
         `${JSON.stringify(finalEvidenceBundle, null, 2)}\n`,
       );
-      const status = await this.writeStatus(sessionId, "ready", 1, "Guion listo para revisión");
+      const status = await this.writeStatus(sessionId, "ready", 1, verification.issues.length === 0 ? "Guion listo para revisión" : `Guion listo con ${verification.issues.length} observaciones editoriales`);
       return { path: scriptPath, status };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -781,6 +792,7 @@ export class NarrativeGenerator {
     index: number,
     total: number,
     npcResolution: NpcResolutionResult,
+    editorialPrompt = "",
   ): Promise<SceneGenerationResult> {
     const filteredEvidence = filterWriterEvidence(evidence, continuity);
     const evidenceIds = collectWriterEvidenceIds(filteredEvidence);
@@ -796,7 +808,9 @@ export class NarrativeGenerator {
         `EVIDENCIA_IDS_ASIGNADOS:\n${JSON.stringify(unit.evidenceIds)}`,
         `RESOLUCIONES PNJ CONFIRMADAS:\n${JSON.stringify(resolvedNpcs)}`,
       ].join("\n\n");
-      const estimatedInput = estimateTokens(`${sceneBlockWriterPrompt}\n${input}`);
+      const compactEditorialPrompt = editorialPrompt.slice(0, 2_400);
+      const activeWriterPrompt = compactEditorialPrompt === "" ? sceneBlockWriterPrompt : `${sceneBlockWriterPrompt}\n\n${compactEditorialPrompt}`;
+      const estimatedInput = estimateTokens(`${activeWriterPrompt}\n${input}`);
       if (estimatedInput + 500 + 512 > 4_096) {
         writerTrace.push({ index: unitIndex, text: "", evidenceIds: unit.evidenceIds, startTimestamp: unit.startTimestamp, endTimestamp: unit.endTimestamp, status: "WRITER_SKIPPED_UNSAFE", valid: false });
         continue;
@@ -804,7 +818,7 @@ export class NarrativeGenerator {
       let text = "";
       try {
         const structured = await this.chatStructured<SceneWriterOutput>([
-          { role: "system", content: sceneBlockWriterPrompt },
+          { role: "system", content: activeWriterPrompt },
           { role: "user", content: input },
         ], 4_096, 500, 0, sceneWriterSchema(), "sceneWriter");
         text = String(structured.text ?? "").trim();

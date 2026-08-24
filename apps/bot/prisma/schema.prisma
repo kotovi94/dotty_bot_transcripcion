@@ -29,6 +29,10 @@ model Campaign {
   audioRetentionDays      Int?
   members               CampaignMember[]
   sessions              Session[]
+  editorialRules        EditorialRule[]
+  editorialFeedback     EditorialFeedback[]
+  editorialExamples     EditorialExample[]
+  editorialMetrics      EditorialMetric[]
   createdAt             DateTime         @default(now())
   updatedAt             DateTime         @updatedAt
 
@@ -64,7 +68,113 @@ model Session {
   endedAt        DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
+  editorialRules    EditorialRule[]
+  editorialFeedback EditorialFeedback[]
+  editorialMetrics  EditorialMetric[]
 
   @@unique([campaignId, sequenceNumber])
   @@index([campaignId, status])
+}
+
+
+model EditorialRule {
+  id String @id @default(cuid())
+  scope String
+  ownerId String?
+  campaignId String?
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  sessionId String?
+  session Session? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  category String
+  text String
+  normalizedText String
+  priority Int @default(50)
+  confidence Float @default(1)
+  status String @default("candidate")
+  source String
+  version Int @default(1)
+  occurrences Int @default(1)
+  metadataJson String @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  versions EditorialRuleVersion[]
+  @@index([status, scope, priority])
+  @@index([ownerId, status])
+  @@index([campaignId, status])
+  @@index([sessionId, status])
+  @@index([normalizedText, category])
+}
+
+model EditorialRuleVersion {
+  id String @id @default(cuid())
+  ruleId String
+  rule EditorialRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  version Int
+  snapshotJson String
+  action String
+  reason String?
+  createdAt DateTime @default(now())
+  @@unique([ruleId, version])
+  @@index([ruleId, createdAt])
+}
+
+model EditorialFeedback {
+  id String @id @default(cuid())
+  campaignId String
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  sessionId String
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  generatedVersion String
+  editedVersion String
+  comment String @default("")
+  diffJson String
+  status String @default("reviewed")
+  createdAt DateTime @default(now())
+  errors EditorialError[]
+  @@index([campaignId, createdAt])
+  @@index([sessionId, createdAt])
+}
+
+model EditorialError {
+  id String @id @default(cuid())
+  feedbackId String
+  feedback EditorialFeedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  category String
+  severity String
+  generatedFragment String
+  correctedFragment String
+  evidenceJson String @default("{}")
+  createdAt DateTime @default(now())
+  @@index([feedbackId, category])
+}
+
+model EditorialExample {
+  id String @id @default(cuid())
+  scope String
+  ownerId String?
+  campaignId String?
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  category String
+  input String
+  output String
+  normalizedText String
+  approved Boolean @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([campaignId, approved])
+  @@index([scope, approved])
+}
+
+model EditorialMetric {
+  id String @id @default(cuid())
+  campaignId String?
+  campaign Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  sessionId String?
+  session Session? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  name String
+  value Float
+  metadataJson String @default("{}")
+  createdAt DateTime @default(now())
+  @@index([name, createdAt])
+  @@index([campaignId, name])
 }

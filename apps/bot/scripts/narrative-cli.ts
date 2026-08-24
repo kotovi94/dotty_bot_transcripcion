@@ -6,6 +6,8 @@ import { readEnvironment } from "../src/config/environment.ts";
 import { NarrativeGenerator } from "../src/narrative/narrative-generator.ts";
 import { NarrativePublicationService } from "../src/narrative/narrative-publication.ts";
 import { resolveTranscriberSecret } from "../src/transcription/transcription-dispatcher.ts";
+import { createDatabaseClient } from "../src/database/client.ts";
+import { EditorialLearningService } from "../src/editorial/editorial-learning-service.ts";
 
 const [action, sessionId] = process.argv.slice(2);
 if (!/^[a-zA-Z0-9_-]+$/u.test(sessionId ?? "")) {
@@ -13,6 +15,8 @@ if (!/^[a-zA-Z0-9_-]+$/u.test(sessionId ?? "")) {
 }
 
 const environment = readEnvironment();
+const database = createDatabaseClient(environment.DATABASE_URL);
+const editorialLearning = new EditorialLearningService(database);
 const recordingsRoot = resolve(environment.DOTTY_DATA_DIR, "recordings");
 const exportsRoot = resolve(environment.DOTTY_DATA_DIR, "exports");
 const transcriberSecret = resolveTranscriberSecret(
@@ -26,6 +30,7 @@ const generator = new NarrativeGenerator(
   environment.OLLAMA_MODEL,
   environment.TRANSCRIBER_BASE_URL,
   transcriberSecret,
+  editorialLearning,
 );
 
 if (action === "generate") {

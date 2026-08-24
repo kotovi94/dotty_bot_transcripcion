@@ -29,6 +29,8 @@ import { SetupWizard } from "./SetupWizard";
 
 import type {
   DottyState,
+  EditorialLearningState,
+  EditorialScope,
   LogKind,
   MaintenanceAction,
   MaintenanceState,
@@ -74,6 +76,19 @@ function formatDate(value: string | null): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function formatSessionStatus(value: string | null): string {
+  if (!value) return "Sin estado";
+  const labels: Record<string, string> = {
+    completed: "Completada",
+    recording: "Grabando",
+    paused: "Pausada",
+    finalizing: "Finalizando",
+    interrupted: "Interrumpida",
+    failed: "Error",
+  };
+  return labels[value.toLocaleLowerCase("es")] ?? value;
 }
 
 function countDiscordMessages(value: string, limit = 1_900): number {
@@ -128,6 +143,9 @@ export function App() {
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [transcriptSearch, setTranscriptSearch] = useState("");
   const [speakerFilter, setSpeakerFilter] = useState("all");
+  const [editorialState, setEditorialState] = useState<EditorialLearningState | null>(null);
+  const [editorialComment, setEditorialComment] = useState("");
+  const [editorialBusy, setEditorialBusy] = useState(false);
 
   const loadTranscripts = useCallback(async () => {
     const next = await window.dotty.listTranscripts();
@@ -140,6 +158,11 @@ export function App() {
       setDraft(mode === "narrative" ? detail.narrativeContent ?? "" : detail.content);
     }
   }, [selected]);
+
+  useEffect(() => {
+    if (!selected?.sessionId) { setEditorialState(null); return; }
+    void window.dotty.getEditorialLearning(selected.sessionId).then(setEditorialState).catch(() => setEditorialState(null));
+  }, [selected?.sessionId]);
 
   const loadMaintenance = useCallback(async () => {
     setMaintenance(await window.dotty.getMaintenanceState());
@@ -237,6 +260,49 @@ export function App() {
       const backupNotice = result.backupName ? ` Respaldo: ${result.backupName}` : "";
       setNotice(`${readerMode === "narrative" ? "Guion" : "Transcripción"} guardado.${backupNotice}`);
       void loadTranscripts();
+    }
+  };
+
+  const saveEditorialLearning = async () => {
+    if (!selected || editorialBusy) return;
+    const editedVersion = editing ? draft : selected.narrativeContent ?? draft;
+    setEditorialBusy(true);
+    try {
+      if (editing) await window.dotty.saveNarrative(selected.sessionId, editedVersion);
+      const result = await window.dotty.submitEditorialFeedback(selected.sessionId, editorialComment, editedVersion);
+      setEditorialState(await window.dotty.getEditorialLearning(selected.sessionId));
+      setEditorialComment("");
+      setSelected({ ...selected, narrativeContent: editedVersion, updatedAt: new Date().toISOString() });
+      setEditing(false);
+      setNotice(`Aprendizaje guardado: ${result.candidates.length} propuesta(s) pendientes de aprobación.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "No se pudo guardar el aprendizaje.");
+    } finally {
+      setEditorialBusy(false);
+    }
+  };
+
+  const decideEditorialRule = async (ruleId: string, decision: "approve" | "reject" | "deprecate", scope?: EditorialScope) => {
+    if (!selected || editorialBusy) return;
+    setEditorialBusy(true);
+    try {
+      await window.dotty.decideEditorialRule(ruleId, decision, scope);
+      setEditorialState(await window.dotty.getEditorialLearning(selected.sessionId));
+      setNotice(decision === "approve" ? "Regla editorial aprobada." : "Propuesta descartada.");
+    } finally {
+      setEditorialBusy(false);
+    }
+  };
+
+  const rollbackEditorialRule = async (ruleId: string) => {
+    if (!selected || editorialBusy) return;
+    setEditorialBusy(true);
+    try {
+      await window.dotty.rollbackEditorialRule(ruleId);
+      setEditorialState(await window.dotty.getEditorialLearning(selected.sessionId));
+      setNotice("Regla editorial restaurada a su versión anterior.");
+    } finally {
+      setEditorialBusy(false);
     }
   };
 
@@ -392,7 +458,7 @@ export function App() {
               <StatusCard icon={<Bot size={22} />} title="DOTTY BOT" value={state.bot.connected ? "Online" : state.bot.running ? "Iniciando" : "Offline"} detail={state.bot.connectedAt ? `Conectado desde ${formatDate(state.bot.connectedAt)}` : "Sin conexión activa"} tone={state.bot.connected ? "good" : state.bot.running ? "warn" : "muted"} />
               <StatusCard icon={<Cpu size={22} />} title="TRANSCRIPTOR" value={state.transcriber.available ? "Disponible" : "No disponible"} detail={state.transcriber.model ?? (state.transcriber.available ? "Modelo cargado" : "Sin comprobación disponible")} tone={state.transcriber.available ? "good" : "muted"} />
               <StatusCard icon={<Gauge size={22} />} title="OLLAMA" value={systemStatus?.ollama.available ? "Disponible" : "No disponible"} detail={systemStatus?.ollama.error ?? systemStatus?.ollama.modelConfigured ?? "Sin modelo actual"} tone={systemStatus?.ollama.available ? "good" : "muted"} />
-              <StatusCard icon={<Database size={22} />} title="SESIÓN" value={systemStatus?.lastSession?.title ?? (lastSession ? lastSession.title : "Sin sesiones")} detail={systemStatus?.lastSession ? `${systemStatus.lastSession.id}` : (lastSession ? `${lastSession.sessionId} · ${lastSession.status ?? "Sin estado"}` : "No disponible")} tone={systemStatus?.lastSession || lastSession ? "good" : "muted"} />
+              <StatusCard icon={<Database size={22} />} title="ÚLTIMA SESIÓN" value={lastSession?.title ?? "Sin sesiones"} detail={lastSession ? `${lastSession.campaignName ?? "Campaña sin nombre"} · Sesión ${lastSession.sequenceNumber ?? "sin número"} · ${formatSessionStatus(lastSession.status)}` : "No disponible"} tone={lastSession ? "good" : "muted"} />
             </div>
 
             <div className="overview-grid dashboard-grid">
@@ -444,12 +510,12 @@ export function App() {
             </article>
 
             <article className="panel compact-panel session-summary-panel">
-              <div className="panel-heading"><div><span className="eyebrow">ÚLTIMA SESIÓN</span><h3>{lastSession ? lastSession.title : "Sin sesión registrada"}</h3></div><ChevronRight size={18} /></div>
+              <div className="panel-heading"><div><span className="eyebrow">ÚLTIMA SESIÓN REAL</span><h3>{lastSession ? lastSession.title : "Sin sesión registrada"}</h3></div><ChevronRight size={18} /></div>
               {lastSession ? (
                 <div className="mini-grid">
-                  <div><span>Campaña</span><strong>{lastSession.title}</strong></div>
-                  <div><span>Número</span><strong>{lastSession.sessionId}</strong></div>
-                  <div><span>Estado</span><strong>{lastSession.status ?? "Sin estado"}</strong></div>
+                  <div><span>Campaña</span><strong>{lastSession.campaignName ?? "Sin campaña"}</strong></div>
+                  <div><span>Sesión</span><strong>{lastSession.sequenceNumber ?? "Sin número"}</strong></div>
+                  <div><span>Estado</span><strong>{formatSessionStatus(lastSession.status)}</strong></div>
                   <div><span>Guion</span><strong>{getNarrativeStatusLabel(lastSession.narrativeState)}</strong></div>
                 </div>
               ) : (
@@ -475,7 +541,7 @@ export function App() {
                     <FileText size={18} />
                     <span>
                       <strong>{entry.title}</strong>
-                      <small>{entry.sessionId} · {formatDate(entry.updatedAt)}</small>
+                      <small>{entry.sequenceNumber !== null && entry.sequenceNumber !== undefined ? `Sesión ${entry.sequenceNumber}` : entry.sessionId} · {formatDate(entry.endedAt ?? entry.startedAt ?? entry.updatedAt)}</small>
                       <small>{entry.status ?? "Sin estado"} · {getNarrativeStatusLabel(entry.narrativeState)}</small>
                     </span>
                     <ChevronRight size={17} />
@@ -497,6 +563,13 @@ export function App() {
                 setDraft={setDraft}
                 setEditing={setEditing}
                 narrativeBusy={narrativeBusy}
+                editorialState={editorialState}
+                editorialComment={editorialComment}
+                setEditorialComment={setEditorialComment}
+                editorialBusy={editorialBusy}
+                onSaveEditorialLearning={() => void saveEditorialLearning()}
+                onDecideEditorialRule={(ruleId, decision, scope) => void decideEditorialRule(ruleId, decision, scope)}
+                onRollbackEditorialRule={(ruleId) => void rollbackEditorialRule(ruleId)}
                 onGenerateNarrative={() => void generateNarrative()}
                 onPublishNarrative={() => void publishNarrative()}
                 onSwitchReaderMode={switchReaderMode}

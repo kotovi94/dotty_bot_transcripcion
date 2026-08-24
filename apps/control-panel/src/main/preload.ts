@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 
 import type {
   DottyDesktopApi,
+  EditorialScope,
   DottyState,
   LogKind,
   MaintenanceAction,
@@ -12,6 +13,10 @@ import type {
 
 const api: DottyDesktopApi = {
   getState: () => ipcRenderer.invoke("dotty:get-state"),
+  getEditorialLearning: (sessionId: string) => ipcRenderer.invoke("dotty:editorial-state", sessionId),
+  submitEditorialFeedback: (sessionId: string, comment: string, editedVersion: string) => ipcRenderer.invoke("dotty:editorial-submit", sessionId, comment, editedVersion),
+  decideEditorialRule: (ruleId: string, decision: "approve" | "reject" | "deprecate", scope?: EditorialScope) => ipcRenderer.invoke("dotty:editorial-decide", ruleId, decision, scope),
+  rollbackEditorialRule: (ruleId: string) => ipcRenderer.invoke("dotty:editorial-rollback", ruleId),
   getSystemStatus: () => ipcRenderer.invoke("dotty:get-system-status"),
   getSessionDetails: (sessionId: string) => ipcRenderer.invoke("dotty:get-session-details", sessionId),
   getSessionProcessingStatus: (sessionId: string) => ipcRenderer.invoke("dotty:get-session-processing-status", sessionId),

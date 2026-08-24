@@ -64,6 +64,14 @@ export class NarrativePublicationService {
       throw new Error("El guion no superó la revisión de calidad y no puede publicarse.");
     }
 
+    try {
+      const verification = JSON.parse(await fs.readFile(join(exportDirectory, "guion.verificacion.json"), "utf8")) as { valid?: boolean; issues?: Array<{ severity?: string; reason?: string }> };
+      const critical = verification.issues?.filter((issue) => issue.severity === "error") ?? [];
+      if (verification.valid === false || critical.length > 0) throw new Error(`El verificador editorial detectó ${critical.length || 1} error(es) crítico(s). Corrige el guion antes de publicarlo.`);
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("El verificador editorial")) throw error;
+    }
+
     const script = (await fs.readFile(scriptPath, "utf8")).trim();
     if (script.length < 100) throw new Error("El guion todavía no está listo para publicarse.");
     const chunks = splitMessage(script, 1_900);

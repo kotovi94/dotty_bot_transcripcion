@@ -9,6 +9,7 @@ import {
   Wrench,
 } from "lucide-react";
 
+import dottyBotImage from "../assets/dotty-bot.png";
 import type { DottyState } from "../../shared/contracts";
 
 export type SidebarPage = "dashboard" | "sessions" | "processing" | "tools" | "settings";
@@ -42,7 +43,7 @@ export function Sidebar({
     <aside className="sidebar">
       <div className="brand">
         <div className="brand-mark">
-          <img src="./assets/dotty-bot.png" alt="Dotty" />
+          <img src={dottyBotImage} alt="Dotty" />
         </div>
         <div>
           <strong>Dotty</strong>

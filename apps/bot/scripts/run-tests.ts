@@ -45,6 +45,8 @@ try {
       "src/recording/clip-rotation.test.ts",
       "src/storage/audio-retention-manager.test.ts",
       "src/narrative/narrative-generator.test.ts",
+      "src/narrative/narrative-guards.test.ts",
+      "src/editorial/editorial-learning.integration.test.ts",
       "src/transcription/transcription-dispatcher.test.ts",
       "src/transcription/base-vocabulary.test.ts",
       "src/transcription/transcription-publisher.test.ts",
