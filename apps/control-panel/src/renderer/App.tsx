@@ -19,6 +19,7 @@ import {
   Square,
   Terminal,
   Wrench,
+  X,
 } from "lucide-react";
 
 import dottyBotImage from "./assets/dotty-bot.png";
@@ -160,6 +161,12 @@ export function App() {
   }, [selected]);
 
   useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
     if (!selected?.sessionId) { setEditorialState(null); return; }
     void window.dotty.getEditorialLearning(selected.sessionId).then(setEditorialState).catch(() => setEditorialState(null));
   }, [selected?.sessionId]);
@@ -266,6 +273,11 @@ export function App() {
   const saveEditorialLearning = async () => {
     if (!selected || editorialBusy) return;
     const editedVersion = editing ? draft : selected.narrativeContent ?? draft;
+    const originalVersion = selected.narrativeContent ?? "";
+    if (editorialComment.trim() === "" && editedVersion.trim() === originalVersion.trim()) {
+      setNotice("Primero modifica el guion o escribe una instrucción para que Dotty tenga algo que aprender.");
+      return;
+    }
     setEditorialBusy(true);
     try {
       if (editing) await window.dotty.saveNarrative(selected.sessionId, editedVersion);
@@ -276,7 +288,10 @@ export function App() {
       setEditing(false);
       setNotice(`Aprendizaje guardado: ${result.candidates.length} propuesta(s) pendientes de aprobación.`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "No se pudo guardar el aprendizaje.");
+      const message = error instanceof Error ? error.message : "";
+      setNotice(message.includes("No hay correcciones ni instrucciones")
+        ? "Primero modifica el guion o escribe una instrucción para que Dotty tenga algo que aprender."
+        : "No se pudo guardar el aprendizaje. El guion no fue dañado.");
     } finally {
       setEditorialBusy(false);
     }
@@ -450,7 +465,7 @@ export function App() {
           </div>
         </header>
 
-        {notice && <div className="notice"><Check size={17} /> {notice}</div>}
+        {notice && <div className="notice"><Check size={17} /><span>{notice}</span><button aria-label="Cerrar aviso" onClick={() => setNotice("")}><X size={14} /></button></div>}
 
         {page === "dashboard" && (
           <section className="page-content dashboard-page">

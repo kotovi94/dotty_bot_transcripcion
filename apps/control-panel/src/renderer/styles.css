@@ -403,3 +403,6 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .editorial-rule span { color: #90a1bf; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
 .editorial-rule p { margin: 5px 0 0; color: #e2e9f7; line-height: 1.45; }
 @media (max-width: 900px) { .editorial-rule, .editorial-heading { flex-direction: column; } }
+
+.notice span { flex: 1; }
+.notice button { border: 0; padding: 3px; color: inherit; background: transparent; }

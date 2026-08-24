@@ -159,7 +159,7 @@ export function SessionDetailPanel({
               <button className="primary" onClick={onSaveCurrentDocument}>
                 <Save size={17} /> Guardar
               </button>
-              {detailTab === "narrative" && <button onClick={onSaveEditorialLearning} disabled={editorialBusy}><Brain size={17} /> Guardar aprendizaje</button>}
+              {detailTab === "narrative" && <button onClick={onSaveEditorialLearning} disabled={editorialBusy || (editorialComment.trim() === "" && draft.trim() === (selected.narrativeContent ?? "").trim())}><Brain size={17} /> Guardar corrección para aprender</button>}
             </>
           ) : (
             <>
@@ -174,7 +174,7 @@ export function SessionDetailPanel({
                 </>
               )}
               {(detailTab === "transcript" || detailTab === "log" || detailTab === "narrative") && (
-                <button onClick={() => setEditing(true)}>
+                <button onClick={() => { if (detailTab === "narrative") onSwitchReaderMode("narrative"); setEditing(true); }}>
                   <Pencil size={17} /> Editar
                 </button>
               )}
@@ -257,7 +257,7 @@ export function SessionDetailPanel({
               {narrativeAvailable && <section className="editorial-learning">
                 <div className="editorial-heading"><div><span className="eyebrow">APRENDIZAJE EDITORIAL</span><h3>Mejorar los próximos guiones</h3></div><span className="editorial-metric">{editorialState?.metrics.feedbackCount ?? 0} revisiones</span></div>
                 <textarea value={editorialComment} onChange={(event) => setEditorialComment(event.target.value)} placeholder="Indica qué debe corregir Dotty la próxima vez. La propuesta no se aplicará hasta que elijas su alcance." maxLength={4000} disabled={editorialBusy} />
-                <div className="editorial-actions"><button onClick={() => setEditing(true)} disabled={editorialBusy}><Pencil size={15} /> Corregir guion</button><button className="primary" onClick={onSaveEditorialLearning} disabled={editorialBusy || (editorialComment.trim() === "" && draft === selected.narrativeContent)}><Brain size={15} /> {editorialBusy ? "Procesando..." : "Guardar aprendizaje"}</button></div>
+                <div className="editorial-actions"><button onClick={() => { if (detailTab === "narrative") onSwitchReaderMode("narrative"); setEditing(true); }} disabled={editorialBusy}><Pencil size={15} /> Corregir guion</button><button className="primary" onClick={onSaveEditorialLearning} disabled={editorialBusy || (editorialComment.trim() === "" && draft.trim() === (selected.narrativeContent ?? "").trim())}><Brain size={15} /> {editorialBusy ? "Procesando..." : "Guardar aprendizaje"}</button></div>
                 {(editorialState?.candidates.length ?? 0) > 0 && <div className="editorial-candidates"><strong>Propuestas pendientes</strong>{editorialState!.candidates.map((rule) => <article key={rule.id} className="editorial-rule candidate"><div><span>{rule.category} · repetida {rule.occurrences} vez/veces</span><p>{rule.text}</p></div><div className="editorial-rule-actions"><button onClick={() => onDecideEditorialRule(rule.id, "approve", "session")} disabled={editorialBusy}>Solo esta vez</button><button onClick={() => onDecideEditorialRule(rule.id, "approve", "campaign")} disabled={editorialBusy}>Campaña</button><button onClick={() => onDecideEditorialRule(rule.id, "approve", "global")} disabled={editorialBusy}>Global</button><button onClick={() => onDecideEditorialRule(rule.id, "reject")} disabled={editorialBusy}><Trash2 size={14} /> Descartar</button></div></article>)}</div>}
                 {(editorialState?.rules.filter((rule) => rule.status === "approved" && rule.source !== "system_seed").length ?? 0) > 0 && <details className="editorial-history"><summary>Reglas aprendidas activas</summary>{editorialState!.rules.filter((rule) => rule.status === "approved" && rule.source !== "system_seed").map((rule) => <article key={rule.id} className="editorial-rule"><div><span>{rule.scope} · {rule.category} · v{rule.version}</span><p>{rule.text}</p></div><button onClick={() => onRollbackEditorialRule(rule.id)} disabled={editorialBusy}><RotateCcw size={14} /> Revertir</button></article>)}</details>}
               </section>}
