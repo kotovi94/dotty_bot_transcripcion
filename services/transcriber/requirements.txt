@@ -1,0 +1,9 @@
+fastapi==0.116.1
+uvicorn==0.35.0
+faster-whisper==1.2.0
+httpx==0.28.1
+pytest==8.4.1
+python-dotenv==1.1.1
+requests==2.32.5
+nvidia-cublas-cu12==12.9.2.10; platform_system == "Windows"
+nvidia-cudnn-cu12==9.24.0.43; platform_system == "Windows"

@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "rootDir": "src",
+    "outDir": "dist/main",
+    "types": ["node", "electron"],
+    "esModuleInterop": true,
+    "verbatimModuleSyntax": false
+  },
+  "include": ["src/main/**/*.ts", "src/shared/**/*.ts"]
+}

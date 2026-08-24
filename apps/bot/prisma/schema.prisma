@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model DiscordServer {
+  id             String     @id @default(cuid())
+  discordGuildId String     @unique
+  name           String
+  campaigns      Campaign[]
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+}
+
+model Campaign {
+  id                    String           @id @default(cuid())
+  serverId              String
+  server                DiscordServer    @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  name                  String
+  normalizedName        String
+  defaultVoiceChannelId String?
+  defaultLogChannelId   String?
+  nextSessionNumber     Int              @default(1)
+  transcriptionVocabulary String         @default("")
+  audioRetentionDays      Int?
+  members               CampaignMember[]
+  sessions              Session[]
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  @@unique([serverId, normalizedName])
+  @@index([serverId])
+}
+
+model CampaignMember {
+  id            String   @id @default(cuid())
+  campaignId    String
+  campaign      Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  discordUserId String
+  playerName    String
+  characterName String?
+  role          String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([campaignId, discordUserId])
+  @@index([discordUserId])
+}
+
+model Session {
+  id             String    @id @default(cuid())
+  campaignId     String
+  campaign       Campaign  @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+  sequenceNumber Int
+  status         String    @default("scheduled")
+  scheduledFor   DateTime?
+  voiceChannelId String?
+  logChannelId   String?
+  startedAt      DateTime?
+  endedAt        DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([campaignId, sequenceNumber])
+  @@index([campaignId, status])
+}

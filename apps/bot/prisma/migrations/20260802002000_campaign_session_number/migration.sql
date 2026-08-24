@@ -1,0 +1,1 @@
+ALTER TABLE "Campaign" ADD COLUMN "nextSessionNumber" INTEGER NOT NULL DEFAULT 1;

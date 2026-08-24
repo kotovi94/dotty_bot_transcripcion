@@ -1,0 +1,72 @@
+{
+  "name": "@dotty/control-panel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Panel de escritorio de Dotty.",
+  "type": "commonjs",
+  "main": "dist/main/main/main.js",
+  "scripts": {
+    "build": "npm run prepare:runtime && npm run build:main && npm run build:renderer",
+    "prepare:runtime": "node ../../node_modules/electron/install.js",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:renderer": "vite build",
+    "start": "electron dist/main/main/main.js",
+    "dev": "npm run build && electron dist/main/main/main.js",
+    "smoke": "node scripts/e2e-smoke.mjs",
+    "installer": "npm run build && npm run stage:installer && electron-builder --win nsis",
+    "stage:installer": "node scripts/stage-runtime.mjs",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "electron": "43.3.0",
+    "electron-builder": "^26.0.12",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-markdown": "latest",
+    "typescript": "^5.9.3",
+    "vite": "latest"
+  },
+  "build": {
+    "appId": "com.dotty.transcriptor",
+    "productName": "Dotty",
+    "asar": true,
+    "electronVersion": "43.3.0",
+    "npmRebuild": false,
+    "directories": {
+      "output": "../../dist-installer"
+    },
+    "files": [
+      "dist/**/*",
+      "resources/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "installer-project",
+        "to": "project",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "resources/dotty-icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Dotty",
+      "artifactName": "Dotty-Setup-${version}.${ext}",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

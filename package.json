@@ -1,0 +1,32 @@
+{
+  "name": "dotty",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bot local de Discord para transcribir campanas de rol.",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @dotty/bot",
+    "test": "npm run test -w @dotty/bot",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "check": "npm run typecheck && npm test",
+    "db:migrate": "npm run db:migrate -w @dotty/bot",
+    "db:deploy": "npm run db:deploy -w @dotty/bot",
+    "commands:deploy": "npm run commands:deploy -w @dotty/bot",
+    "panel:build": "npm run build -w @dotty/control-panel",
+    "panel:start": "npm run start -w @dotty/control-panel",
+    "panel:dev": "npm run dev -w @dotty/control-panel",
+    "installer:win": "npm run installer -w @dotty/control-panel",
+    "transcriber:start": "services/transcriber/.venv/Scripts/python.exe -m uvicorn dotty_transcriber.main:app --app-dir services/transcriber --host 127.0.0.1 --port 8765",
+    "transcriber:test": "cd services/transcriber && .\\.venv\\Scripts\\python.exe -m pytest tests -q -p no:cacheprovider"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "opusscript": "0.0.8"
+  }
+}
