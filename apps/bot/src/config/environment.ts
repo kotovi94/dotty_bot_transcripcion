@@ -23,6 +23,10 @@ const environmentSchema = z.object({
   DOTTY_LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
+  DOTTY_DIAGNOSTICS_ENABLED: z
+    .string()
+    .default("true")
+    .transform((value) => !["0", "false", "no", "off"].includes(value.trim().toLowerCase())),
   RECORDING_CLIP_TARGET_MINUTES: z.coerce.number().positive().default(60),
   RECORDING_CLIP_SEARCH_START_MINUTES: z.coerce.number().positive().default(55),
   RECORDING_CLIP_MAX_MINUTES: z.coerce.number().positive().default(65),
