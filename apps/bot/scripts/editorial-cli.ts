@@ -4,6 +4,7 @@ import { readEnvironment } from "../src/config/environment.ts";
 import { createDatabaseClient } from "../src/database/client.ts";
 import { EditorialLearningService, type EditorialScope } from "../src/editorial/editorial-learning-service.ts";
 import { verifyDraft } from "../src/editorial/draft-verifier.ts";
+import { refreshNarrativeReview } from "../src/narrative/narrative-review.ts";
 
 const [action, argument] = process.argv.slice(2);
 const environment = readEnvironment();
@@ -43,6 +44,7 @@ try {
     const context = await service.retrieve({ sessionId: argument!, campaignId: session.campaignId, query: draft.slice(0, 2_000) });
     const report = verifyDraft(draft, [evidence], context.rules);
     await writeFile(join(exportDirectory, "guion.verificacion.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    await refreshNarrativeReview(exportDirectory, argument!, report);
     output(report);
   } else if (action === "export") {
     const request = await readRequest(argument);
