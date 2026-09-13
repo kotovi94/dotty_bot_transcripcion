@@ -61,6 +61,17 @@ if (action === "generate") {
   const review = await approveNarrativeReview(exportDirectory, sessionId!, "panel/manual");
   console.log(JSON.stringify({ ok: true, action, sessionId, review }));
 } else if (action === "publish") {
+  const review = await readNarrativeReview(exportDirectory, sessionId!);
+  if (review === null) {
+    throw new Error("El guion todavía no tiene revisión editorial. Genéralo o verifícalo antes de publicar.");
+  }
+  if (review.state === "NEEDS_REVIEW") {
+    throw new Error("El guion tiene escenas o errores editoriales pendientes. Revísalos antes de publicar.");
+  }
+  if (review.state === "READY_FOR_REVIEW") {
+    await approveNarrativeReview(exportDirectory, sessionId!, "publish-action");
+  }
+
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
   await client.login(environment.DISCORD_TOKEN);
   try {
