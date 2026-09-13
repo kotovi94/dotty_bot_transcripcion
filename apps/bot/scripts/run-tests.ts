@@ -46,6 +46,7 @@ try {
       "src/storage/audio-retention-manager.test.ts",
       "src/narrative/narrative-generator.test.ts",
       "src/narrative/narrative-guards.test.ts",
+      "src/narrative/narrative-review.test.ts",
       "src/editorial/editorial-learning.integration.test.ts",
       "src/transcription/transcription-dispatcher.test.ts",
       "src/transcription/base-vocabulary.test.ts",
