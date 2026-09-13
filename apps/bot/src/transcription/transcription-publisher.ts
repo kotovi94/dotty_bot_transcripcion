@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type { Logger } from "pino";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
+import type { DottyDiagnostics } from "../diagnostics/dotty-diagnostics.ts";
 import type { RecordingManifest } from "../recording/voice-capture-manager.ts";
 import {
   applyTranscriptCorrections,
@@ -87,6 +88,7 @@ export class TranscriptionPublisher {
     private readonly secret: string,
     private readonly adaptiveVocabulary: AdaptiveVocabularyStore,
     private readonly logger: Logger,
+    private readonly diagnosticsReporter?: Pick<DottyDiagnostics, "recordActivity">,
   ) {}
 
   start(): void {
@@ -114,6 +116,16 @@ export class TranscriptionPublisher {
             { error, directory: entry.name },
             "No se pudo publicar una sesión; las demás continuarán",
           );
+          await this.report({
+            sessionId: entry.name,
+            component: "transcription",
+            process: "consolidation",
+            outcome: "failure",
+            issue: "TRANSCRIPTION_EXPORT_FAILED",
+            message: "Falló la consolidación o escritura de los artefactos de transcripción.",
+            evidence: ["publisher_exception_captured", "other_sessions_continue"],
+            error,
+          });
         }
       }
     } catch (error) {
@@ -134,6 +146,16 @@ export class TranscriptionPublisher {
     const manifest = JSON.parse(
       await fs.readFile(join(directory, "manifest.json"), "utf8"),
     ) as RecordingManifest;
+    const publishStarted = performance.now();
+    await this.report({
+      sessionId: manifest.sessionId,
+      component: "transcription",
+      process: "consolidation",
+      outcome: "started",
+      message: "Dotty comenzó a comprobar y consolidar los trabajos de transcripción.",
+      evidence: ["session_enqueued_marker_found", "manifest_loaded"],
+      metrics: { chunks: manifest.chunks.length },
+    });
     let payload: { jobs: TranscriptionJob[] };
     try {
       const response = await fetch(
@@ -151,6 +173,17 @@ export class TranscriptionPublisher {
           { sessionId: manifest.sessionId, failedJobs: failedJobs.map((j) => ({ id: j.id, error: j.error })) },
           "Transcription jobs failed; abandoning session",
         );
+        await this.report({
+          sessionId: manifest.sessionId,
+          component: "transcription",
+          process: "consolidation_gate",
+          outcome: "failure",
+          issue: "TRANSCRIPTION_JOB_FAILED",
+          message: "La consolidación se detuvo porque uno o más trabajos terminaron en failed.",
+          durationMs: performance.now() - publishStarted,
+          evidence: ["failed_jobs_detected", "session_marked_failed"],
+          metrics: { failed_jobs: failedJobs.length, total_jobs: payload.jobs.length },
+        });
         for (const clip of manifest.clips ?? []) {
           const ids = new Set(manifest.chunks.filter((chunk) => chunk.clipIndex === clip.clipIndex).map((chunk) => `${manifest.sessionId}:${chunk.id}`));
           if (failedJobs.some((job) => ids.has(job.id))) clip.transcriptionStatus = "failed";
@@ -171,6 +204,17 @@ export class TranscriptionPublisher {
         { sessionId: manifest.sessionId, error },
         "Could not fetch transcription status; will retry",
       );
+      await this.report({
+        sessionId: manifest.sessionId,
+        component: "transcription",
+        process: "status_fetch",
+        outcome: "warning",
+        issue: "TRANSCRIPTION_STATUS_FETCH_FAILED",
+        message: "No se pudo consultar el estado de los trabajos; Dotty lo volverá a intentar.",
+        durationMs: performance.now() - publishStarted,
+        evidence: ["status_fetch_failed", "automatic_retry_expected"],
+        error,
+      });
       return;
     }
 
@@ -290,6 +334,23 @@ export class TranscriptionPublisher {
       ),
     );
     const quality = qualitySummary(lines);
+    if (diagnostics.length > 0) {
+      const hallucinationCount = diagnostics.filter((item) => item.reason.startsWith("posible alucinacion")).length;
+      await this.report({
+        sessionId: manifest.sessionId,
+        component: "transcription",
+        process: "validation",
+        outcome: "warning",
+        issue: hallucinationCount > 0 ? "SUSPECTED_HALLUCINATION" : "LOW_CONFIDENCE_OUTPUT",
+        message: "La consolidación encontró segmentos que deben quedar visibles como ininteligibles o revisarse.",
+        evidence: ["publisher_quality_filter_applied", "doubtful_segments_preserved_in_diagnostics"],
+        metrics: {
+          diagnostics: diagnostics.length,
+          suspected_hallucinations: hallucinationCount,
+          lines_to_review: quality.linesToReview,
+        },
+      });
+    }
     const chronicleTerms = [
       configuredCampaign?.name,
       ...(configuredCampaign?.transcriptionVocabulary.split(",") ?? []),
@@ -369,8 +430,40 @@ export class TranscriptionPublisher {
       { sessionId: manifest.sessionId },
       "Transcripcion preparada; queda pendiente generar y publicar el guion manualmente",
     );
+    await this.report({
+      sessionId: manifest.sessionId,
+      component: "transcription",
+      process: "consolidation",
+      outcome: diagnostics.length > 0 || quality.linesToReview > 0 ? "warning" : "success",
+      message: diagnostics.length > 0 || quality.linesToReview > 0
+        ? "Transcripción consolidada y exportada correctamente, con elementos marcados para revisión."
+        : "Transcripción consolidada y exportada correctamente sin alertas de calidad en esta etapa.",
+      durationMs: performance.now() - publishStarted,
+      evidence: [
+        "all_jobs_completed",
+        "transcript_raw_written",
+        "bitacora_written",
+        "full_transcript_written",
+        "ready_marker_written",
+      ],
+      metrics: {
+        jobs: payload.jobs.length,
+        lines: lines.length,
+        diagnostics: diagnostics.length,
+        lines_to_review: quality.linesToReview,
+        average_word_confidence: quality.averageWordConfidence,
+        activated_vocabulary_terms: activatedTerms.length,
+      },
+    });
   }
 
+  private async report(
+    input: Parameters<DottyDiagnostics["recordActivity"]>[0],
+  ): Promise<void> {
+    await this.diagnosticsReporter?.recordActivity(input).catch((error) => {
+      this.logger.debug({ error }, "No se pudo guardar el diagnóstico interno de consolidación");
+    });
+  }
 }
 
 export function deduplicateOverlapLines(lines: readonly TranscriptLine[]): TranscriptLine[] {
