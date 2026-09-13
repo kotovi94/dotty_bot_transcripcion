@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .config import Settings
 from .diagnostics import DiagnosticReporter, summarize_transcription_result
 from .engine import WhisperEngine
+from .error_codes import classify_transcription_error
 from .storage import JobInput, JobStore
 from .voice_processing import AdaptiveVoiceProcessor, VoiceAnalysis
 
@@ -279,6 +280,7 @@ def _worker_loop() -> None:
                     "warning",
                     "El análisis VAD falló; Dotty usó el fallback conservador SPEECH para no perder audio.",
                     job_id=job["id"],
+                    issue="VAD_ANALYSIS_FAILED_FALLBACK",
                     duration_ms=(time.perf_counter() - analysis_started) * 1000,
                     evidence=["vad_exception", "fallback_speech_selected"],
                     error=error,
@@ -373,7 +375,8 @@ def _worker_loop() -> None:
                     rms_dbfs=analysis.rms_dbfs,
                 )
                 suspected = int(result_metrics.get("segments_suspected_hallucination", 0) or 0)
-                outcome = "warning" if result.get("status") == "unintelligible" or suspected > 0 else "success"
+                unintelligible = result.get("status") == "unintelligible"
+                outcome = "warning" if unintelligible or suspected > 0 else "success"
                 evidence = ["whisper_completed", "segment_quality_classification_applied"]
                 if suspected > 0:
                     evidence.append("suspicious_segments_preserved_and_marked")
@@ -389,11 +392,23 @@ def _worker_loop() -> None:
                         else "Whisper terminó correctamente y los segmentos devueltos pasaron los controles primarios."
                     ),
                     job_id=job["id"],
+                    issue="WHISPER_UNINTELLIGIBLE" if unintelligible else None,
                     duration_ms=transcription_wall_seconds * 1000,
                     evidence=evidence,
                     metrics=result_metrics,
                 )
-                if result.get("status") == "unintelligible":
+                if suspected > 0:
+                    _record_diagnostic(
+                        session_id,
+                        "validation",
+                        "warning",
+                        "La validación marcó segmentos como posibles alucinaciones y los preservó para revisión.",
+                        job_id=job["id"],
+                        issue="SUSPECTED_HALLUCINATION",
+                        evidence=["suspected_hallucination_detected", "segment_preserved_for_review"],
+                        metrics={"suspected_segments": suspected},
+                    )
+                if unintelligible:
                     logger.info("[Whisper] Segment marked unintelligible user=%s", job["speaker_user_id"])
 
             result["speaker_user_id"] = job["speaker_user_id"]
@@ -444,6 +459,7 @@ def _worker_loop() -> None:
                         "failure",
                         "La transcripción terminó, pero no se pudieron guardar las métricas de voz.",
                         job_id=job["id"],
+                        issue="VOICE_METRICS_WRITE_FAILED",
                         error=error,
                     )
                 logger.info("Completed transcription job=%s segments=%d", job["id"], len(result.get("segments", [])))
@@ -470,6 +486,7 @@ def _worker_loop() -> None:
                     "warning",
                     "Resultado descartado porque el claim del trabajo ya no era vigente.",
                     job_id=job["id"],
+                    issue="STALE_CLAIM_DISCARDED",
                     evidence=["stale_claim_token", "result_not_committed"],
                 )
                 _record_diagnostic(
@@ -484,14 +501,27 @@ def _worker_loop() -> None:
         except Exception as error:
             logger.exception("Transcription job %s failed", job["id"])
             store.fail(job["id"], job["claim_token"], str(error))
+            cause_issue = classify_transcription_error(error)
+            _record_diagnostic(
+                session_id,
+                "failure_cause",
+                "failure",
+                "Dotty clasificó la causa técnica principal del fallo de transcripción.",
+                job_id=job["id"],
+                issue=cause_issue,
+                evidence=["exception_classified", "specific_issue_code_assigned"],
+                metrics={"active_device": engine.active_device},
+                error=error,
+            )
             _record_diagnostic(
                 session_id,
                 "job",
                 "failure",
                 "Trabajo de transcripción falló y quedó registrado para diagnóstico/reintento.",
                 job_id=job["id"],
+                issue="TRANSCRIPTION_JOB_FAILED",
                 duration_ms=(time.perf_counter() - job_started) * 1000,
-                evidence=["exception_captured", "job_marked_failed"],
+                evidence=["exception_captured", "job_marked_failed", f"cause={cause_issue}"],
                 metrics={"attempts": job["attempts"], "active_device": engine.active_device},
                 error=error,
             )
@@ -509,6 +539,7 @@ def _record_diagnostic(
     message: str,
     *,
     job_id: str | None = None,
+    issue: str | None = None,
     duration_ms: float | int | None = None,
     evidence: list[str] | tuple[str, ...] | None = None,
     metrics: dict[str, Any] | None = None,
@@ -521,6 +552,7 @@ def _record_diagnostic(
             outcome,
             message,
             job_id=job_id,
+            issue=issue,
             duration_ms=duration_ms,
             evidence=evidence,
             metrics=metrics,
