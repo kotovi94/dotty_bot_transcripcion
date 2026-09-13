@@ -73,9 +73,10 @@ export class NarrativePublicationService {
       if (error instanceof Error && error.message.startsWith("El verificador editorial")) throw error;
     }
 
-    const script = (await fs.readFile(scriptPath, "utf8")).trim();
+    const rawScript = await fs.readFile(scriptPath, "utf8");
+    const script = rawScript.trim();
     if (script.length < 100) throw new Error("El guion todavía no está listo para publicarse.");
-    await assertNarrativeApproved(exportDirectory, sessionId, script);
+    await assertNarrativeApproved(exportDirectory, sessionId, rawScript);
 
     const chunks = splitMessage(script, 1_900);
     const existing = manifest.publication;
