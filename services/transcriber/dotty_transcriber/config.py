@@ -31,6 +31,7 @@ class Settings:
     vad_enabled: bool = True
     voice_profiles_enabled: bool = True
     hallucination_detection_enabled: bool = True
+    diagnostics_enabled: bool = True
     prebuffer_min_ms: int = 300
     prebuffer_max_ms: int = 600
     hangover_min_ms: int = 400
@@ -71,6 +72,7 @@ class Settings:
             vad_enabled=_env_bool("VOICE_VAD_ENABLED", True),
             voice_profiles_enabled=_env_bool("VOICE_PROFILES_ENABLED", True),
             hallucination_detection_enabled=_env_bool("HALLUCINATION_DETECTION_ENABLED", True),
+            diagnostics_enabled=_env_bool("DOTTY_DIAGNOSTICS_ENABLED", True),
             prebuffer_min_ms=int(os.getenv("VOICE_PREBUFFER_MIN_MS", "300")),
             prebuffer_max_ms=int(os.getenv("VOICE_PREBUFFER_MAX_MS", "600")),
             hangover_min_ms=int(os.getenv("VOICE_HANGOVER_MIN_MS", "400")),
