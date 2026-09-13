@@ -4,6 +4,11 @@ import { join } from "node:path";
 import type { Logger } from "pino";
 
 import type { DottyDiagnostics } from "./dotty-diagnostics.ts";
+import {
+  dottyIssue,
+  type DottyIssueName,
+  type DottyIssueSeverity,
+} from "./error-codes.ts";
 import { writeJsonAtomically } from "../recording/atomic-json-file.ts";
 
 interface TranscriptRaw {
@@ -29,10 +34,29 @@ interface VoiceMetrics {
   readonly gpu_seconds?: number;
 }
 
+interface ActivityCodeSummary {
+  readonly name?: string;
+  readonly count?: number;
+  readonly severity?: string;
+  readonly last_seen?: string;
+  readonly lastSeen?: string;
+}
+
 interface ActivitySummary {
   readonly event_count?: number;
   readonly eventCount?: number;
   readonly outcomes?: Readonly<Record<string, number>>;
+  readonly codes?: Readonly<Record<string, ActivityCodeSummary>>;
+}
+
+interface ReportIssue {
+  readonly code: string;
+  readonly name: DottyIssueName;
+  readonly severity: DottyIssueSeverity;
+  readonly count: number;
+  readonly recoverable: boolean;
+  readonly description: string;
+  readonly suggestedAction: string;
 }
 
 interface TranscriptionReport {
@@ -47,6 +71,7 @@ interface TranscriptionReport {
     readonly detail: string;
     readonly evidence: readonly string[];
   }[];
+  readonly issues: readonly ReportIssue[];
   readonly whatWentWell: readonly string[];
   readonly warnings: readonly string[];
   readonly failures: readonly string[];
@@ -125,11 +150,17 @@ export class TranscriptionReportService {
     const completed = readyStat !== null && (failedStat === null || readyStat.mtimeMs >= failedStat.mtimeMs);
     const report = await this.buildReport(sessionId, recordingDirectory, completed);
     await writeJsonAtomically(reportPath, report);
+    const reportIssue = report.outcome === "warning"
+      ? "FINAL_REPORT_WARNING"
+      : report.outcome === "failure"
+        ? "FINAL_REPORT_FAILURE"
+        : undefined;
     await this.diagnostics.recordActivity({
       sessionId,
       component: "transcription",
       process: "final_report",
       outcome: report.outcome === "success" ? "success" : report.outcome === "warning" ? "warning" : "failure",
+      ...(reportIssue === undefined ? {} : { issue: reportIssue }),
       message: report.outcome === "success"
         ? "Reporte final generado: la transcripción terminó sin alertas detectadas."
         : report.outcome === "warning"
@@ -139,11 +170,13 @@ export class TranscriptionReportService {
         "transcription_terminal_marker_detected",
         "activity_logs_aggregated",
         "quality_metrics_aggregated",
+        "error_codes_aggregated",
         "transcription_report_written",
       ],
       metrics: {
         bot_events: report.activity.botEvents,
         transcriber_events: report.activity.transcriberEvents,
+        issues: report.issues.length,
         warnings: report.warnings.length,
         failures: report.failures.length,
         artifacts: report.artifacts.length,
@@ -175,6 +208,7 @@ export class TranscriptionReportService {
     const botFailures = outcomeCount(botActivity, "failure");
     const transcriberFailures = outcomeCount(transcriberActivity, "failure");
     const activityFailures = botFailures + transcriberFailures;
+    const issueMap = mergeIssueCodes(botActivity, transcriberActivity);
 
     const artifacts = await existingArtifacts([
       join(exportDirectory, "transcript.raw.json"),
@@ -190,7 +224,10 @@ export class TranscriptionReportService {
     const failures: string[] = [];
     const whatWentWell: string[] = [];
 
-    if (!completed) failures.push("La sesión terminó con el marcador de transcripción fallida.");
+    if (!completed) {
+      failures.push("La sesión terminó con el marcador de transcripción fallida.");
+      ensureIssue(issueMap, "TRANSCRIPTION_JOB_FAILED", 1);
+    }
     if (activityFailures > 0) {
       const detail = `${activityFailures} evento(s) interno(s) registraron un fallo durante el procesamiento.`;
       if (completed) warnings.push(`${detail} La sesión consiguió recuperarse y consolidarse después.`);
@@ -199,9 +236,18 @@ export class TranscriptionReportService {
     if (completed && transcript === null) warnings.push("La sesión terminó, pero falta transcript.raw.json para auditar la calidad consolidada.");
     if (completed && voiceMetrics === null) warnings.push("La sesión terminó, pero falta voice_metrics.json para auditar VAD y uso de GPU.");
     if (completed && artifacts.length < 4) warnings.push(`Solo se encontraron ${artifacts.length} artefacto(s) principal(es) de salida.`);
-    if (suspiciousSegments > 0) warnings.push(`${suspiciousSegments} segmento(s) fueron marcados como posibles alucinaciones o dudosos.`);
-    if (unintelligible > 0) warnings.push(`${unintelligible} fragmento(s) terminaron como ininteligibles.`);
-    if (linesToReview > 0) warnings.push(`${linesToReview} intervención(es) tienen confianza suficiente para conservarse, pero conviene revisarlas.`);
+    if (suspiciousSegments > 0) {
+      warnings.push(`${suspiciousSegments} segmento(s) fueron marcados como posibles alucinaciones o dudosos.`);
+      ensureIssue(issueMap, "SUSPECTED_HALLUCINATION", suspiciousSegments);
+    }
+    if (unintelligible > 0) {
+      warnings.push(`${unintelligible} fragmento(s) terminaron como ininteligibles.`);
+      ensureIssue(issueMap, "WHISPER_UNINTELLIGIBLE", unintelligible);
+    }
+    if (linesToReview > 0) {
+      warnings.push(`${linesToReview} intervención(es) tienen confianza suficiente para conservarse, pero conviene revisarlas.`);
+      ensureIssue(issueMap, "LOW_CONFIDENCE_OUTPUT", linesToReview);
+    }
 
     if (completed) whatWentWell.push("Todos los trabajos necesarios alcanzaron un estado terminal y se consolidó la transcripción.");
     if (transcript !== null) whatWentWell.push("Se generó transcript.raw.json con líneas, calidad y diagnósticos de segmentos.");
@@ -254,6 +300,8 @@ export class TranscriptionReportService {
       : warnings.length > 0
         ? "warning"
         : "success";
+    if (outcome === "warning") ensureIssue(issueMap, "FINAL_REPORT_WARNING", 1);
+    if (outcome === "failure") ensureIssue(issueMap, "FINAL_REPORT_FAILURE", 1);
 
     return {
       version: 1,
@@ -276,6 +324,7 @@ export class TranscriptionReportService {
         segmentsTranscribed: numberOrZero(voiceMetrics?.segments_transcribed),
       },
       checks,
+      issues: [...issueMap.values()].sort((left, right) => left.code.localeCompare(right.code)),
       whatWentWell,
       warnings,
       failures,
@@ -286,6 +335,52 @@ export class TranscriptionReportService {
       },
     };
   }
+}
+
+function mergeIssueCodes(
+  ...summaries: readonly (ActivitySummary | null)[]
+): Map<string, ReportIssue> {
+  const result = new Map<string, ReportIssue>();
+  for (const summary of summaries) {
+    for (const [code, value] of Object.entries(summary?.codes ?? {})) {
+      const name = value.name as DottyIssueName | undefined;
+      if (name === undefined) continue;
+      try {
+        const definition = dottyIssue(name);
+        const current = result.get(code);
+        result.set(code, {
+          code: definition.code,
+          name: definition.name,
+          severity: definition.severity,
+          count: (current?.count ?? 0) + Math.max(1, numberOrZero(value.count)),
+          recoverable: definition.recoverable,
+          description: definition.description,
+          suggestedAction: definition.suggestedAction,
+        });
+      } catch {
+        // Unknown legacy codes are ignored rather than breaking the final report.
+      }
+    }
+  }
+  return result;
+}
+
+function ensureIssue(
+  issues: Map<string, ReportIssue>,
+  name: DottyIssueName,
+  observedCount: number,
+): void {
+  const definition = dottyIssue(name);
+  const current = issues.get(definition.code);
+  issues.set(definition.code, {
+    code: definition.code,
+    name: definition.name,
+    severity: definition.severity,
+    count: Math.max(current?.count ?? 0, Math.max(1, Math.round(observedCount))),
+    recoverable: definition.recoverable,
+    description: definition.description,
+    suggestedAction: definition.suggestedAction,
+  });
 }
 
 function eventCount(summary: ActivitySummary | null): number {
