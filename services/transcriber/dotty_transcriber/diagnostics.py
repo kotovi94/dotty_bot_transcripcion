@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .error_codes import get_issue
+
 
 _OUTCOMES = ("started", "success", "warning", "failure", "skipped", "info")
 
@@ -29,6 +31,7 @@ class DiagnosticReporter:
         message: str,
         *,
         job_id: str | None = None,
+        issue: str | None = None,
         duration_ms: float | int | None = None,
         evidence: list[str] | tuple[str, ...] | None = None,
         metrics: dict[str, Any] | None = None,
@@ -54,6 +57,8 @@ class DiagnosticReporter:
             }
             if job_id:
                 event["job_id"] = job_id
+            if issue:
+                event["issue"] = get_issue(issue)
             if duration_ms is not None and math.isfinite(float(duration_ms)):
                 event["duration_ms"] = max(0, round(float(duration_ms)))
             if evidence:
@@ -100,9 +105,14 @@ class DiagnosticReporter:
             "event_count": 0,
             "outcomes": _empty_outcomes(),
             "processes": {},
+            "codes": {},
+            "recent_issues": [],
             "recent_failures": [],
             "last_event": event,
         }
+        report.setdefault("codes", {})
+        report.setdefault("recent_issues", [])
+        report.setdefault("recent_failures", [])
         report["updated_at"] = event["timestamp"]
         report["event_count"] = int(report.get("event_count", 0)) + 1
         outcomes = report.setdefault("outcomes", _empty_outcomes())
@@ -127,6 +137,24 @@ class DiagnosticReporter:
         if "duration_ms" in event:
             process["total_duration_ms"] = int(process.get("total_duration_ms", 0)) + int(event["duration_ms"])
             process["timed_events"] = int(process.get("timed_events", 0)) + 1
+
+        issue = event.get("issue")
+        if isinstance(issue, dict) and isinstance(issue.get("code"), str):
+            codes = report.setdefault("codes", {})
+            code = issue["code"]
+            current = codes.setdefault(
+                code,
+                {
+                    "name": issue.get("name", "UNKNOWN"),
+                    "count": 0,
+                    "severity": issue.get("severity", "error"),
+                    "last_seen": event["timestamp"],
+                },
+            )
+            current["count"] = int(current.get("count", 0)) + 1
+            current["severity"] = issue.get("severity", current.get("severity", "error"))
+            current["last_seen"] = event["timestamp"]
+            report["recent_issues"] = [*report.get("recent_issues", []), event][-30:]
 
         if event["outcome"] == "failure":
             report["recent_failures"] = [*report.get("recent_failures", []), event][-20:]
