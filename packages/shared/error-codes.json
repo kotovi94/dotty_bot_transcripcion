@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "format": "DOTTY-<AREA>-<NNNN>",
+  "issues": {
+    "TRANSCRIBER_UNAVAILABLE": {
+      "code": "DOTTY-DSP-1001",
+      "category": "dispatch",
+      "severity": "error",
+      "recoverable": true,
+      "description": "El bot no pudo comunicarse con el servicio local de transcripción.",
+      "suggestedAction": "Comprobar que el transcriptor esté iniciado, que /health responda y que TRANSCRIBER_BASE_URL sea correcto."
+    },
+    "JOB_ENQUEUE_REJECTED": {
+      "code": "DOTTY-DSP-1002",
+      "category": "dispatch",
+      "severity": "error",
+      "recoverable": true,
+      "description": "El transcriptor rechazó un trabajo que el bot intentó encolar.",
+      "suggestedAction": "Revisar el estado HTTP, la ruta del audio, el secreto compartido y si el trabajo ya existía."
+    },
+    "SESSION_DISPATCH_FAILED": {
+      "code": "DOTTY-DSP-1003",
+      "category": "dispatch",
+      "severity": "error",
+      "recoverable": true,
+      "description": "La sesión no pudo completar el despacho de sus fragmentos al transcriptor.",
+      "suggestedAction": "Revisar los eventos inmediatamente anteriores de enqueue_job y reintentar cuando el servicio esté disponible."
+    },
+    "VAD_ANALYSIS_FAILED_FALLBACK": {
+      "code": "DOTTY-VAD-2001",
+      "category": "voice_analysis",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "El análisis de actividad de voz falló y Dotty utilizó el fallback conservador SPEECH.",
+      "suggestedAction": "Revisar decodificación de audio y VAD. La transcripción puede continuar, pero puede procesar más ruido de lo normal."
+    },
+    "WHISPER_RUNTIME_FAILURE": {
+      "code": "DOTTY-WSP-3001",
+      "category": "whisper",
+      "severity": "error",
+      "recoverable": true,
+      "description": "Whisper falló durante la transcripción por un error de ejecución no clasificado como CUDA.",
+      "suggestedAction": "Revisar la excepción, el archivo de audio, el modelo y los parámetros usados; después reintentar el trabajo."
+    },
+    "WHISPER_CUDA_FAILURE": {
+      "code": "DOTTY-WSP-3002",
+      "category": "whisper",
+      "severity": "critical",
+      "recoverable": true,
+      "description": "Whisper falló en la ruta GPU/CUDA, incluyendo memoria, cuBLAS, cuDNN o inicialización CUDA.",
+      "suggestedAction": "Revisar VRAM, drivers, librerías CUDA/cuDNN y procesos que estén usando la GPU antes de reintentar."
+    },
+    "WHISPER_UNINTELLIGIBLE": {
+      "code": "DOTTY-WSP-3003",
+      "category": "whisper",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "Whisper recibió voz o audio procesable, pero no obtuvo texto confiable.",
+      "suggestedAction": "Revisar el audio original, ruido, volumen y métricas de confianza; normalmente no requiere detener la sesión."
+    },
+    "SUSPECTED_HALLUCINATION": {
+      "code": "DOTTY-VAL-4001",
+      "category": "validation",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "Uno o más segmentos fueron marcados como posible alucinación y preservados para revisión.",
+      "suggestedAction": "Comparar los segmentos marcados con el audio original y ajustar filtros solo si aparecen falsos positivos repetidos."
+    },
+    "LOW_CONFIDENCE_OUTPUT": {
+      "code": "DOTTY-VAL-4002",
+      "category": "validation",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "La salida contiene líneas o palabras con confianza baja que conviene revisar.",
+      "suggestedAction": "Inspeccionar las líneas señaladas y corregir vocabulario, audio o perfiles si el patrón se repite."
+    },
+    "STALE_CLAIM_DISCARDED": {
+      "code": "DOTTY-PST-5001",
+      "category": "persistence",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "Un resultado terminado fue descartado porque el claim del trabajo ya no era vigente.",
+      "suggestedAction": "Comprobar reintentos concurrentes o workers lentos. El resultado nuevo/vigente debe ser el único que se publique."
+    },
+    "VOICE_METRICS_WRITE_FAILED": {
+      "code": "DOTTY-PST-5002",
+      "category": "persistence",
+      "severity": "error",
+      "recoverable": true,
+      "description": "La transcripción terminó, pero Dotty no pudo persistir métricas o perfil de voz.",
+      "suggestedAction": "Revisar permisos, espacio en disco y archivos JSON de métricas/perfiles. La transcripción puede seguir siendo utilizable."
+    },
+    "TRANSCRIPTION_JOB_FAILED": {
+      "code": "DOTTY-PST-5003",
+      "category": "job",
+      "severity": "error",
+      "recoverable": true,
+      "description": "Un trabajo de transcripción terminó en estado failed y quedó disponible para diagnóstico o reintento.",
+      "suggestedAction": "Usar el código específico asociado al mismo trabajo cuando exista; después corregir la causa y reintentar."
+    },
+    "TRANSCRIPTION_STATUS_FETCH_FAILED": {
+      "code": "DOTTY-PUB-6001",
+      "category": "publication",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "El bot no pudo consultar temporalmente el estado de los trabajos antes de consolidar la transcripción.",
+      "suggestedAction": "Comprobar el transcriptor local; el publicador reintentará automáticamente."
+    },
+    "TRANSCRIPTION_EXPORT_FAILED": {
+      "code": "DOTTY-PUB-6002",
+      "category": "publication",
+      "severity": "error",
+      "recoverable": true,
+      "description": "Falló la consolidación o escritura de los artefactos finales de transcripción.",
+      "suggestedAction": "Revisar disco, permisos y los datos de entrada antes de volver a publicar la sesión."
+    },
+    "FINAL_REPORT_WARNING": {
+      "code": "DOTTY-RPT-7001",
+      "category": "reporting",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "El reporte final se generó, pero encontró elementos que requieren revisión.",
+      "suggestedAction": "Abrir transcription-report.json y revisar warnings/issues antes de considerar la sesión totalmente limpia."
+    },
+    "FINAL_REPORT_FAILURE": {
+      "code": "DOTTY-RPT-7002",
+      "category": "reporting",
+      "severity": "error",
+      "recoverable": true,
+      "description": "El reporte final determinó que la transcripción terminó con uno o más fallos no recuperados.",
+      "suggestedAction": "Revisar failures, recentIssues y los trabajos fallidos; corregir y reprocesar la sesión."
+    },
+    "DIAGNOSTIC_WRITE_FAILED": {
+      "code": "DOTTY-RPT-7003",
+      "category": "reporting",
+      "severity": "warning",
+      "recoverable": true,
+      "description": "Dotty no pudo escribir parte de sus diagnósticos internos.",
+      "suggestedAction": "Revisar espacio en disco y permisos de DOTTY_DATA_DIR/.diagnostics."
+    },
+    "UNKNOWN_TRANSCRIPTION_FAILURE": {
+      "code": "DOTTY-SYS-9001",
+      "category": "system",
+      "severity": "error",
+      "recoverable": true,
+      "description": "La transcripción falló por una causa que todavía no tiene una clasificación más específica.",
+      "suggestedAction": "Usar la excepción y evidencia adjunta para clasificar el caso y, si se repite, asignarle un código específico."
+    }
+  }
+}
