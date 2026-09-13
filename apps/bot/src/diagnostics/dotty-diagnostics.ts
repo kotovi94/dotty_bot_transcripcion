@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import { join } from "node:path";
 
 import {
   ChannelType,
@@ -9,6 +10,7 @@ import {
 } from "discord.js";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
+import { writeJsonAtomically } from "../recording/atomic-json-file.ts";
 import type { SessionService } from "../sessions/session-service.ts";
 
 export interface DiagnosticCheck {
@@ -23,13 +25,126 @@ export interface DiagnosticReport {
   readonly ready: boolean;
 }
 
+export type DiagnosticOutcome =
+  | "started"
+  | "success"
+  | "warning"
+  | "failure"
+  | "skipped"
+  | "info";
+
+export type DiagnosticMetric = string | number | boolean | null;
+
+export interface DiagnosticActivityInput {
+  readonly sessionId: string;
+  readonly component: string;
+  readonly process: string;
+  readonly outcome: DiagnosticOutcome;
+  readonly message: string;
+  readonly durationMs?: number;
+  readonly evidence?: readonly string[];
+  readonly metrics?: Readonly<Record<string, DiagnosticMetric>>;
+  readonly error?: unknown;
+}
+
+export interface DiagnosticActivityEvent {
+  readonly version: 1;
+  readonly id: string;
+  readonly timestamp: string;
+  readonly sessionId: string;
+  readonly component: string;
+  readonly process: string;
+  readonly outcome: DiagnosticOutcome;
+  readonly message: string;
+  readonly durationMs?: number;
+  readonly evidence?: readonly string[];
+  readonly metrics?: Readonly<Record<string, DiagnosticMetric>>;
+  readonly error?: {
+    readonly name?: string;
+    readonly message: string;
+    readonly stack?: string;
+  };
+}
+
+interface ProcessActivitySummary {
+  events: number;
+  outcomes: Record<DiagnosticOutcome, number>;
+  totalDurationMs: number;
+  timedEvents: number;
+  lastEvent: DiagnosticActivityEvent;
+}
+
+interface SessionActivityReport {
+  version: 1;
+  sessionId: string;
+  component: "bot";
+  updatedAt: string;
+  eventCount: number;
+  outcomes: Record<DiagnosticOutcome, number>;
+  processes: Record<string, ProcessActivitySummary>;
+  recentFailures: DiagnosticActivityEvent[];
+  lastEvent: DiagnosticActivityEvent;
+}
+
 export class DottyDiagnostics {
+  private readonly activityWrites = new Map<string, Promise<void>>();
+  private activitySequence = 0;
+
   constructor(
     private readonly campaigns: CampaignService,
     private readonly sessions: SessionService,
     private readonly transcriberBaseUrl: string,
     private readonly dataDirectory: string,
   ) {}
+
+  async recordActivity(input: DiagnosticActivityInput): Promise<void> {
+    const sessionId = input.sessionId.trim() || "_system";
+    const error = serializeError(input.error);
+    const durationMs = input.durationMs === undefined || !Number.isFinite(input.durationMs)
+      ? undefined
+      : Math.max(0, Math.round(input.durationMs));
+    const event: DiagnosticActivityEvent = {
+      version: 1,
+      id: `${Date.now()}-${process.pid}-${++this.activitySequence}`,
+      timestamp: new Date().toISOString(),
+      sessionId,
+      component: input.component.trim() || "bot",
+      process: input.process.trim() || "unknown",
+      outcome: input.outcome,
+      message: input.message.trim(),
+      ...(durationMs === undefined ? {} : { durationMs }),
+      ...(input.evidence === undefined
+        ? {}
+        : { evidence: input.evidence.map((item) => item.trim()).filter(Boolean).slice(0, 30) }),
+      ...(input.metrics === undefined ? {} : { metrics: sanitizeMetrics(input.metrics) }),
+      ...(error === undefined ? {} : { error }),
+    };
+
+    const key = safePathSegment(sessionId);
+    const previous = this.activityWrites.get(key) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() => this.persistActivity(key, event));
+    this.activityWrites.set(key, next);
+    try {
+      await next;
+    } finally {
+      if (this.activityWrites.get(key) === next) this.activityWrites.delete(key);
+    }
+  }
+
+  async readActivityReport(sessionId: string): Promise<unknown | null> {
+    try {
+      return JSON.parse(
+        await fs.readFile(
+          join(this.activityDirectory(sessionId), "report.bot.json"),
+          "utf8",
+        ),
+      ) as unknown;
+    } catch {
+      return null;
+    }
+  }
 
   async run(guild: Guild, campaignName: string): Promise<DiagnosticReport> {
     const checks: DiagnosticCheck[] = [];
@@ -91,6 +206,52 @@ export class DottyDiagnostics {
       checks,
       ready: !checks.some((check) => check.level === "error"),
     };
+  }
+
+  private activityDirectory(sessionId: string): string {
+    return join(this.dataDirectory, ".diagnostics", safePathSegment(sessionId.trim() || "_system"));
+  }
+
+  private async persistActivity(
+    safeSessionId: string,
+    event: DiagnosticActivityEvent,
+  ): Promise<void> {
+    const directory = join(this.dataDirectory, ".diagnostics", safeSessionId);
+    await fs.mkdir(directory, { recursive: true });
+    await fs.appendFile(
+      join(directory, "activity.bot.jsonl"),
+      `${JSON.stringify(event)}\n`,
+      "utf8",
+    );
+
+    const reportPath = join(directory, "report.bot.json");
+    const report = await readSessionActivityReport(reportPath, event.sessionId, event);
+    report.eventCount += 1;
+    report.updatedAt = event.timestamp;
+    report.outcomes[event.outcome] += 1;
+    report.lastEvent = event;
+
+    const key = `${event.component}.${event.process}`;
+    const existing = report.processes[key] ?? {
+      events: 0,
+      outcomes: emptyOutcomeCounts(),
+      totalDurationMs: 0,
+      timedEvents: 0,
+      lastEvent: event,
+    };
+    existing.events += 1;
+    existing.outcomes[event.outcome] += 1;
+    existing.lastEvent = event;
+    if (event.durationMs !== undefined) {
+      existing.totalDurationMs += event.durationMs;
+      existing.timedEvents += 1;
+    }
+    report.processes[key] = existing;
+
+    if (event.outcome === "failure") {
+      report.recentFailures = [...report.recentFailures, event].slice(-20);
+    }
+    await writeJsonAtomically(reportPath, report);
   }
 
   private checkVoiceChannel(
@@ -222,6 +383,69 @@ export class DottyDiagnostics {
       };
     }
   }
+}
+
+async function readSessionActivityReport(
+  path: string,
+  sessionId: string,
+  event: DiagnosticActivityEvent,
+): Promise<SessionActivityReport> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(path, "utf8")) as SessionActivityReport;
+    if (parsed.version === 1 && parsed.sessionId === sessionId) return parsed;
+  } catch {
+    // A missing/corrupt report must not prevent the append-only activity log from continuing.
+  }
+  return {
+    version: 1,
+    sessionId,
+    component: "bot",
+    updatedAt: event.timestamp,
+    eventCount: 0,
+    outcomes: emptyOutcomeCounts(),
+    processes: {},
+    recentFailures: [],
+    lastEvent: event,
+  };
+}
+
+function emptyOutcomeCounts(): Record<DiagnosticOutcome, number> {
+  return {
+    started: 0,
+    success: 0,
+    warning: 0,
+    failure: 0,
+    skipped: 0,
+    info: 0,
+  };
+}
+
+function safePathSegment(value: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9._-]/gu, "_").slice(0, 160);
+  return safe || "_system";
+}
+
+function sanitizeMetrics(
+  metrics: Readonly<Record<string, DiagnosticMetric>>,
+): Record<string, DiagnosticMetric> {
+  return Object.fromEntries(
+    Object.entries(metrics).map(([key, value]) => [
+      key,
+      /token|secret|authorization|password/iu.test(key) ? "[REDACTED]" : value,
+    ]),
+  );
+}
+
+function serializeError(error: unknown): DiagnosticActivityEvent["error"] | undefined {
+  if (error === undefined || error === null) return undefined;
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      ...(error.stack === undefined ? {} : { stack: error.stack }),
+    };
+  }
+  return { message: String(error) };
 }
 
 function missingPermissions(
