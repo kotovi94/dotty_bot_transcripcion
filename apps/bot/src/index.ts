@@ -9,6 +9,7 @@ import { BackupManager } from "./backup/backup-manager.ts";
 import { readEnvironment } from "./config/environment.ts";
 import { createDatabaseClient } from "./database/client.ts";
 import { DottyDiagnostics } from "./diagnostics/dotty-diagnostics.ts";
+import { TranscriptionReportService } from "./diagnostics/transcription-report-service.ts";
 import {
   handleDottyAutocomplete,
   handleDottyCommand,
@@ -51,6 +52,13 @@ await editorialLearning.ensureCriticalRules();
 const campaigns = new CampaignService(new PrismaCampaignRepository(database));
 const sessionRepository = new PrismaSessionRepository(database);
 const sessions = new SessionService(sessionRepository);
+const diagnostics = new DottyDiagnostics(
+  campaigns,
+  sessions,
+  environment.TRANSCRIBER_BASE_URL,
+  environment.DOTTY_DATA_DIR,
+);
+const activityDiagnostics = environment.DOTTY_DIAGNOSTICS_ENABLED ? diagnostics : undefined;
 const recordings = new VoiceCaptureManager(environment.DOTTY_DATA_DIR, logger, {
   targetMs: environment.RECORDING_CLIP_TARGET_MINUTES * 60_000,
   searchStartMs: environment.RECORDING_CLIP_SEARCH_START_MINUTES * 60_000,
@@ -71,6 +79,7 @@ const transcriptions = new TranscriptionDispatcher(
   transcriberSecret,
   adaptiveVocabulary,
   logger,
+  activityDiagnostics,
 );
 const recoveredRecordings = await recordings.recoverInterrupted();
 if (recoveredRecordings.length > 0) {
@@ -110,6 +119,14 @@ const publisher = new TranscriptionPublisher(
   transcriberSecret,
   adaptiveVocabulary,
   logger,
+  activityDiagnostics,
+);
+const transcriptionReports = new TranscriptionReportService(
+  resolve(environment.DOTTY_DATA_DIR, "recordings"),
+  resolve(environment.DOTTY_DATA_DIR, "exports"),
+  environment.DOTTY_DATA_DIR,
+  diagnostics,
+  logger,
 );
 const sessionAdministration = new SessionAdministration(
   client,
@@ -122,12 +139,6 @@ const sessionAdministration = new SessionAdministration(
   transcriberSecret,
   logger,
 );
-const diagnostics = new DottyDiagnostics(
-  campaigns,
-  sessions,
-  environment.TRANSCRIBER_BASE_URL,
-  environment.DOTTY_DATA_DIR,
-);
 const audioRetention = new AudioRetentionManager(
   campaigns,
   resolve(environment.DOTTY_DATA_DIR, "recordings"),
@@ -136,6 +147,7 @@ const audioRetention = new AudioRetentionManager(
 );
 const backups = new BackupManager(environment.DOTTY_DATA_DIR);
 transcriptions.start();
+if (environment.DOTTY_DIAGNOSTICS_ENABLED) transcriptionReports.start();
 audioRetention.start();
 
 client.once(Events.ClientReady, async (readyClient) => {
@@ -312,6 +324,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   logger.info({ signal }, "Cerrando Dotty");
   transcriptions.stop();
+  transcriptionReports.stop();
   publisher.stop();
   audioRetention.stop();
   await recordings.shutdown();

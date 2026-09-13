@@ -33,6 +33,7 @@ try {
       "src/domain/session.test.ts",
       "src/config/environment.test.ts",
       "src/diagnostics/dotty-diagnostics.test.ts",
+      "src/diagnostics/transcription-report-service.test.ts",
       "src/discord/dotty-panel.test.ts",
       "src/backup/backup-manager.test.ts",
       "src/campaigns/campaign-repository.test.ts",

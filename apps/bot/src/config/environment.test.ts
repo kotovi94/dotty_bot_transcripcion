@@ -13,6 +13,18 @@ describe("Dotty environment", () => {
 
     assert.equal(environment.DATABASE_URL, "file:../../data/dotty.db");
     assert.equal(environment.DOTTY_LOG_LEVEL, "info");
+    assert.equal(environment.DOTTY_DIAGNOSTICS_ENABLED, true);
+  });
+
+  it("can disable persistent diagnostics explicitly", () => {
+    const environment = readEnvironment({
+      DISCORD_TOKEN: "test-token",
+      DISCORD_CLIENT_ID: "client-1",
+      DISCORD_GUILD_ID: "guild-1",
+      DOTTY_DIAGNOSTICS_ENABLED: "false",
+    });
+
+    assert.equal(environment.DOTTY_DIAGNOSTICS_ENABLED, false);
   });
 
   it("reports missing keys without printing secret values", () => {
