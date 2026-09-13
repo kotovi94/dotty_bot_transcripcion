@@ -10,6 +10,7 @@ import {
 import type { RecordingManifest } from "../recording/voice-capture-manager.ts";
 import { writeFileAtomically } from "../recording/atomic-json-file.ts";
 import { splitMessage } from "../transcription/transcription-publisher.ts";
+import { assertNarrativeApproved } from "./narrative-review.ts";
 
 export class NarrativePublicationService {
   private readonly active = new Map<
@@ -58,7 +59,7 @@ export class NarrativePublicationService {
         await fs.readFile(join(exportDirectory, "guion.estado.json"), "utf8"),
       ) as { state?: string };
     } catch {
-      // Un guion manual guardado sin estado de calidad sigue siendo publicable.
+      // La aprobación editorial explícita es la barrera definitiva de publicación.
     }
     if (narrativeStatus.state !== undefined && narrativeStatus.state !== "ready") {
       throw new Error("El guion no superó la revisión de calidad y no puede publicarse.");
@@ -74,11 +75,13 @@ export class NarrativePublicationService {
 
     const script = (await fs.readFile(scriptPath, "utf8")).trim();
     if (script.length < 100) throw new Error("El guion todavía no está listo para publicarse.");
+    await assertNarrativeApproved(exportDirectory, sessionId, script);
+
     const chunks = splitMessage(script, 1_900);
     const existing = manifest.publication;
 
     if (existing !== undefined) {
-      const updated = await this.updateExisting(existing, chunks).catch(() => null);
+      const updated = await this.updateExisting(existing, chunks, scriptPath).catch(() => null);
       if (updated !== null) {
         manifest.publication = { ...existing, messageIds: updated };
         await this.persistPublication(manifestPath, manifest);
@@ -90,7 +93,7 @@ export class NarrativePublicationService {
       }
     }
 
-    const created = await this.createPublication(manifest, chunks);
+    const created = await this.createPublication(manifest, chunks, scriptPath);
     manifest.publication = created;
     await this.persistPublication(manifestPath, manifest);
     return {
@@ -103,6 +106,7 @@ export class NarrativePublicationService {
   private async updateExisting(
     publication: NonNullable<RecordingManifest["publication"]>,
     chunks: readonly string[],
+    scriptPath: string,
   ): Promise<string[]> {
     const channel = await this.client.channels.fetch(
       publication.threadId ?? publication.channelId,
@@ -120,10 +124,21 @@ export class NarrativePublicationService {
       const currentId = currentIds[index];
       if (currentId !== undefined) {
         const message = await channel.messages.fetch(currentId);
-        await message.edit(chunk);
+        if (index === 0) {
+          await message.edit({
+            content: chunk,
+            attachments: [],
+            files: [{ attachment: scriptPath, name: "guion.md" }],
+          });
+        } else {
+          await message.edit(chunk);
+        }
         nextIds.push(message.id);
       } else {
-        nextIds.push((await channel.send(chunk)).id);
+        const message = index === 0
+          ? await channel.send({ content: chunk, files: [{ attachment: scriptPath, name: "guion.md" }] })
+          : await channel.send(chunk);
+        nextIds.push(message.id);
       }
     }
     const obsoleteIds = currentIds
@@ -145,6 +160,7 @@ export class NarrativePublicationService {
   private async createPublication(
     manifest: RecordingManifest,
     chunks: readonly string[],
+    scriptPath: string,
   ): Promise<NonNullable<RecordingManifest["publication"]>> {
     const title = manifest.campaignName ?? "Campaña";
     const voiceChannel = await this.client.channels.fetch(manifest.voiceChannelId);
@@ -161,7 +177,10 @@ export class NarrativePublicationService {
         const thread = await logChannel.threads.create({
           name: `Sesión ${manifest.sequenceNumber} — ${title}`.slice(0, 100),
           autoArchiveDuration: 10080,
-          message: { content: chunks[0] ?? "*(Guion vacío)*" },
+          message: {
+            content: chunks[0] ?? "*(Guion vacío)*",
+            files: [{ attachment: scriptPath, name: "guion.md" }],
+          },
           ...(preferredTag === undefined ? {} : { appliedTags: [preferredTag.id] }),
           reason: `Publicación narrativa manual de la sesión ${manifest.sequenceNumber}`,
         });
@@ -181,7 +200,7 @@ export class NarrativePublicationService {
           name: `Guion ${manifest.sequenceNumber} — ${title}`.slice(0, 100),
           autoArchiveDuration: 10080,
         });
-        const messageIds = await sendChunks(thread, chunks);
+        const messageIds = await sendChunks(thread, chunks, scriptPath);
         await voiceChannel.send(`🎬 El guion narrativo quedó publicado en ${thread}.`).catch(() => undefined);
         return {
           channelId: logChannel.id,
@@ -195,6 +214,7 @@ export class NarrativePublicationService {
     const messageIds = await sendChunks(
       voiceChannel as GuildTextBasedChannel,
       splitMessage(`🎬 **${title} — Sesión ${manifest.sequenceNumber}**\n${chunks.join("\n")}`, 1_900),
+      scriptPath,
     );
     return { channelId: voiceChannel.id, messageIds };
   }
@@ -224,9 +244,15 @@ export class NarrativePublicationService {
 async function sendChunks(
   channel: GuildTextBasedChannel,
   chunks: readonly string[],
+  scriptPath?: string,
 ): Promise<string[]> {
   const messageIds: string[] = [];
-  for (const chunk of chunks) messageIds.push((await channel.send(chunk)).id);
+  for (const [index, chunk] of chunks.entries()) {
+    const message = index === 0 && scriptPath !== undefined
+      ? await channel.send({ content: chunk, files: [{ attachment: scriptPath, name: "guion.md" }] })
+      : await channel.send(chunk);
+    messageIds.push(message.id);
+  }
   return messageIds;
 }
 
