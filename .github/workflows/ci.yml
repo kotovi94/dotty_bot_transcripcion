@@ -45,6 +45,7 @@ jobs:
           python -m pip install pytest==8.4.1
           python -m py_compile \
             services/transcriber/dotty_transcriber/config.py \
+            services/transcriber/dotty_transcriber/error_codes.py \
             services/transcriber/dotty_transcriber/diagnostics.py \
             services/transcriber/dotty_transcriber/main.py
           cd services/transcriber
