@@ -59,6 +59,22 @@ describe("narrative review gate", () => {
     }
   });
 
+  it("blocks an otherwise valid scene when it has no evidence IDs", async () => {
+    const root = await createFixture({ auditValid: true, verification: validVerification, evidenceIds: [] });
+    try {
+      const review = await refreshNarrativeReview(root, "session-2-no-evidence", validVerification);
+      assert.equal(review.state, "NEEDS_REVIEW");
+      assert.equal(review.scenes[0]?.status, "NEEDS_REVIEW");
+      assert.equal(review.scenes[0]?.errorCount, 1);
+      await assert.rejects(
+        () => approveNarrativeReview(root, "session-2-no-evidence", "test"),
+        /requieren revisión/u,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks approval when final verification has errors", async () => {
     const invalidVerification: VerificationReport = {
       valid: false,
@@ -104,6 +120,7 @@ describe("narrative review gate", () => {
 async function createFixture(options: {
   auditValid: boolean;
   verification: VerificationReport;
+  evidenceIds?: string[];
 }): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "dotty-narrative-review-"));
   await mkdir(join(root, "guion.work"), { recursive: true });
@@ -118,7 +135,7 @@ async function createFixture(options: {
     `${JSON.stringify({
       id: "scene_001",
       title: "Escena 1",
-      evidence_ids: ["B001-F-1"],
+      evidence_ids: options.evidenceIds ?? ["B001-F-1"],
       audit: options.auditValid
         ? { valid: true, status: "VALIDATED", reviewStatus: "VALIDATED", issues: [] }
         : {
