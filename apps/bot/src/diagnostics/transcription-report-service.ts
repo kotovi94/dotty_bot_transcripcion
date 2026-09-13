@@ -1,5 +1,5 @@
 import { constants, promises as fs } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 import type { Logger } from "pino";
 
@@ -33,9 +33,6 @@ interface ActivitySummary {
   readonly event_count?: number;
   readonly eventCount?: number;
   readonly outcomes?: Readonly<Record<string, number>>;
-  readonly processes?: Readonly<Record<string, unknown>>;
-  readonly recent_failures?: readonly unknown[];
-  readonly recentFailures?: readonly unknown[];
 }
 
 interface TranscriptionReport {
@@ -115,7 +112,7 @@ export class TranscriptionReportService {
     const terminalStat = newestStat(readyStat, failedStat);
     if (terminalStat === null) return;
 
-    const manifest = await readJson(join(recordingDirectory, "manifest.json"));
+    const manifest = await readJson<{ sessionId?: unknown }>(join(recordingDirectory, "manifest.json"));
     const sessionId = typeof manifest?.sessionId === "string" && manifest.sessionId.trim() !== ""
       ? manifest.sessionId
       : fallbackSessionId;
@@ -125,7 +122,8 @@ export class TranscriptionReportService {
     if (existingStat !== null && existingStat.mtimeMs >= terminalStat.mtimeMs) return;
 
     await fs.mkdir(diagnosticsDirectory, { recursive: true });
-    const report = await this.buildReport(sessionId, recordingDirectory, readyStat !== null && (failedStat === null || readyStat.mtimeMs >= failedStat.mtimeMs));
+    const completed = readyStat !== null && (failedStat === null || readyStat.mtimeMs >= failedStat.mtimeMs);
+    const report = await this.buildReport(sessionId, recordingDirectory, completed);
     await writeJsonAtomically(reportPath, report);
     await this.diagnostics.recordActivity({
       sessionId,
@@ -161,10 +159,10 @@ export class TranscriptionReportService {
     const exportDirectory = join(this.exportsRoot, sessionId);
     const diagnosticsDirectory = join(this.dataRoot, ".diagnostics", safePathSegment(sessionId));
     const [transcript, voiceMetrics, botActivity, transcriberActivity] = await Promise.all([
-      readJson(join(exportDirectory, "transcript.raw.json")) as Promise<TranscriptRaw | null>,
-      readJson(join(recordingDirectory, "voice_metrics.json")) as Promise<VoiceMetrics | null>,
-      readJson(join(diagnosticsDirectory, "report.bot.json")) as Promise<ActivitySummary | null>,
-      readJson(join(diagnosticsDirectory, "report.transcriber.json")) as Promise<ActivitySummary | null>,
+      readJson<TranscriptRaw>(join(exportDirectory, "transcript.raw.json")),
+      readJson<VoiceMetrics>(join(recordingDirectory, "voice_metrics.json")),
+      readJson<ActivitySummary>(join(diagnosticsDirectory, "report.bot.json")),
+      readJson<ActivitySummary>(join(diagnosticsDirectory, "report.transcriber.json")),
     ]);
 
     const quality = transcript?.quality ?? {};
@@ -193,7 +191,14 @@ export class TranscriptionReportService {
     const whatWentWell: string[] = [];
 
     if (!completed) failures.push("La sesión terminó con el marcador de transcripción fallida.");
-    if (activityFailures > 0) failures.push(`${activityFailures} evento(s) interno(s) terminaron con fallo.`);
+    if (activityFailures > 0) {
+      const detail = `${activityFailures} evento(s) interno(s) registraron un fallo durante el procesamiento.`;
+      if (completed) warnings.push(`${detail} La sesión consiguió recuperarse y consolidarse después.`);
+      else failures.push(detail);
+    }
+    if (completed && transcript === null) warnings.push("La sesión terminó, pero falta transcript.raw.json para auditar la calidad consolidada.");
+    if (completed && voiceMetrics === null) warnings.push("La sesión terminó, pero falta voice_metrics.json para auditar VAD y uso de GPU.");
+    if (completed && artifacts.length < 4) warnings.push(`Solo se encontraron ${artifacts.length} artefacto(s) principal(es) de salida.`);
     if (suspiciousSegments > 0) warnings.push(`${suspiciousSegments} segmento(s) fueron marcados como posibles alucinaciones o dudosos.`);
     if (unintelligible > 0) warnings.push(`${unintelligible} fragmento(s) terminaron como ininteligibles.`);
     if (linesToReview > 0) warnings.push(`${linesToReview} intervención(es) tienen confianza suficiente para conservarse, pero conviene revisarlas.`);
@@ -304,11 +309,11 @@ function roundMetric(value: unknown): number {
   return Math.round(numberOrZero(value) * 1000) / 1000;
 }
 
-async function readJson(path: string): Promise<Record<string, any> | null> {
+async function readJson<T extends object>(path: string): Promise<T | null> {
   try {
     const value = JSON.parse(await fs.readFile(path, "utf8")) as unknown;
     return value !== null && typeof value === "object" && !Array.isArray(value)
-      ? value as Record<string, any>
+      ? value as T
       : null;
   } catch {
     return null;
