@@ -12,6 +12,12 @@ import {
 import type { CampaignService } from "../campaigns/campaign-service.ts";
 import { writeJsonAtomically } from "../recording/atomic-json-file.ts";
 import type { SessionService } from "../sessions/session-service.ts";
+import {
+  dottyIssue,
+  type DottyIssueDefinition,
+  type DottyIssueName,
+  type DottyIssueSeverity,
+} from "./error-codes.ts";
 
 export interface DiagnosticCheck {
   readonly level: "ok" | "warning" | "error";
@@ -41,6 +47,7 @@ export interface DiagnosticActivityInput {
   readonly process: string;
   readonly outcome: DiagnosticOutcome;
   readonly message: string;
+  readonly issue?: DottyIssueName;
   readonly durationMs?: number;
   readonly evidence?: readonly string[];
   readonly metrics?: Readonly<Record<string, DiagnosticMetric>>;
@@ -56,6 +63,7 @@ export interface DiagnosticActivityEvent {
   readonly process: string;
   readonly outcome: DiagnosticOutcome;
   readonly message: string;
+  readonly issue?: DottyIssueDefinition;
   readonly durationMs?: number;
   readonly evidence?: readonly string[];
   readonly metrics?: Readonly<Record<string, DiagnosticMetric>>;
@@ -74,6 +82,13 @@ interface ProcessActivitySummary {
   lastEvent: DiagnosticActivityEvent;
 }
 
+interface CodeActivitySummary {
+  name: DottyIssueName;
+  count: number;
+  severity: DottyIssueSeverity;
+  lastSeen: string;
+}
+
 interface SessionActivityReport {
   version: 1;
   sessionId: string;
@@ -82,6 +97,8 @@ interface SessionActivityReport {
   eventCount: number;
   outcomes: Record<DiagnosticOutcome, number>;
   processes: Record<string, ProcessActivitySummary>;
+  codes: Record<string, CodeActivitySummary>;
+  recentIssues: DiagnosticActivityEvent[];
   recentFailures: DiagnosticActivityEvent[];
   lastEvent: DiagnosticActivityEvent;
 }
@@ -100,6 +117,7 @@ export class DottyDiagnostics {
   async recordActivity(input: DiagnosticActivityInput): Promise<void> {
     const sessionId = input.sessionId.trim() || "_system";
     const error = serializeError(input.error);
+    const issue = input.issue === undefined ? undefined : dottyIssue(input.issue);
     const durationMs = input.durationMs === undefined || !Number.isFinite(input.durationMs)
       ? undefined
       : Math.max(0, Math.round(input.durationMs));
@@ -112,6 +130,7 @@ export class DottyDiagnostics {
       process: input.process.trim() || "unknown",
       outcome: input.outcome,
       message: input.message.trim(),
+      ...(issue === undefined ? {} : { issue }),
       ...(durationMs === undefined ? {} : { durationMs }),
       ...(input.evidence === undefined
         ? {}
@@ -248,6 +267,19 @@ export class DottyDiagnostics {
     }
     report.processes[key] = existing;
 
+    if (event.issue !== undefined) {
+      const current = report.codes[event.issue.code] ?? {
+        name: event.issue.name,
+        count: 0,
+        severity: event.issue.severity,
+        lastSeen: event.timestamp,
+      };
+      current.count += 1;
+      current.severity = event.issue.severity;
+      current.lastSeen = event.timestamp;
+      report.codes[event.issue.code] = current;
+      report.recentIssues = [...report.recentIssues, event].slice(-30);
+    }
     if (event.outcome === "failure") {
       report.recentFailures = [...report.recentFailures, event].slice(-20);
     }
@@ -392,7 +424,12 @@ async function readSessionActivityReport(
 ): Promise<SessionActivityReport> {
   try {
     const parsed = JSON.parse(await fs.readFile(path, "utf8")) as SessionActivityReport;
-    if (parsed.version === 1 && parsed.sessionId === sessionId) return parsed;
+    if (parsed.version === 1 && parsed.sessionId === sessionId) {
+      parsed.codes ??= {};
+      parsed.recentIssues ??= [];
+      parsed.recentFailures ??= [];
+      return parsed;
+    }
   } catch {
     // A missing/corrupt report must not prevent the append-only activity log from continuing.
   }
@@ -404,6 +441,8 @@ async function readSessionActivityReport(
     eventCount: 0,
     outcomes: emptyOutcomeCounts(),
     processes: {},
+    codes: {},
+    recentIssues: [],
     recentFailures: [],
     lastEvent: event,
   };
