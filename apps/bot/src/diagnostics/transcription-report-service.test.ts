@@ -10,7 +10,7 @@ import type { DottyDiagnostics } from "./dotty-diagnostics.ts";
 import { TranscriptionReportService } from "./transcription-report-service.ts";
 
 describe("transcription diagnostic report", () => {
-  it("combines quality, voice and activity evidence into a final session report", async () => {
+  it("combines quality, voice, named error codes and activity evidence into a final session report", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-transcription-report-"));
     const sessionId = "session-42";
     const recordings = join(root, "recordings");
@@ -63,8 +63,8 @@ describe("transcription diagnostic report", () => {
         writeFile(join(exported, "contexto-narrativo.json"), "{}\n", "utf8"),
         writeFile(join(recording, "transcript_full.json"), "{}\n", "utf8"),
         writeFile(join(recording, "transcript_full.txt"), "test\n", "utf8"),
-        writeFile(join(diagnosticsDirectory, "report.bot.json"), `${JSON.stringify({ eventCount: 4, outcomes: { failure: 0 } })}\n`, "utf8"),
-        writeFile(join(diagnosticsDirectory, "report.transcriber.json"), `${JSON.stringify({ event_count: 12, outcomes: { failure: 0 } })}\n`, "utf8"),
+        writeFile(join(diagnosticsDirectory, "report.bot.json"), `${JSON.stringify({ eventCount: 4, outcomes: { failure: 0 }, codes: {} })}\n`, "utf8"),
+        writeFile(join(diagnosticsDirectory, "report.transcriber.json"), `${JSON.stringify({ event_count: 12, outcomes: { failure: 0 }, codes: {} })}\n`, "utf8"),
       ]);
       await writeFile(join(recording, ".transcription-ready"), `${new Date().toISOString()}\n`, "utf8");
 
@@ -86,6 +86,7 @@ describe("transcription diagnostic report", () => {
       ) as {
         outcome: string;
         summary: Record<string, number>;
+        issues: Array<{ code: string; name: string; count: number }>;
         warnings: string[];
         whatWentWell: string[];
         activity: { botEvents: number; transcriberEvents: number };
@@ -98,7 +99,12 @@ describe("transcription diagnostic report", () => {
       assert.equal(report.activity.transcriberEvents, 12);
       assert(report.warnings.some((item) => item.includes("posibles alucinaciones")));
       assert(report.whatWentWell.some((item) => item.includes("91 %")));
+      assert(report.issues.some((item) => item.code === "DOTTY-VAL-4001" && item.name === "SUSPECTED_HALLUCINATION"));
+      assert(report.issues.some((item) => item.code === "DOTTY-WSP-3003" && item.name === "WHISPER_UNINTELLIGIBLE"));
+      assert(report.issues.some((item) => item.code === "DOTTY-VAL-4002" && item.name === "LOW_CONFIDENCE_OUTPUT"));
+      assert(report.issues.some((item) => item.code === "DOTTY-RPT-7001" && item.name === "FINAL_REPORT_WARNING"));
       assert.equal(recorded.length, 1);
+      assert.equal((recorded[0] as { issue?: string }).issue, "FINAL_REPORT_WARNING");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
