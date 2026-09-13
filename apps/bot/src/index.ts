@@ -119,6 +119,7 @@ const publisher = new TranscriptionPublisher(
   transcriberSecret,
   adaptiveVocabulary,
   logger,
+  activityDiagnostics,
 );
 const transcriptionReports = new TranscriptionReportService(
   resolve(environment.DOTTY_DATA_DIR, "recordings"),
