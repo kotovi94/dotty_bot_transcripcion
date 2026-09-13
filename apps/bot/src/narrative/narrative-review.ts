@@ -112,6 +112,20 @@ export async function refreshNarrativeReview(
       : sceneHasErrors
         ? "SCENE_REVIEW_REQUIRED"
         : "AWAITING_APPROVAL";
+  const scenesWithApproval = normalizedScenes.map((scene): NarrativeSceneReview => {
+    if (stillApproved) {
+      return {
+        ...scene,
+        status: "APPROVED",
+        approvedAt: previous?.approval?.approvedAt ?? now,
+      };
+    }
+    if (scene.status === "APPROVED") {
+      const { approvedAt: _approvedAt, ...rest } = scene;
+      return { ...rest, status: "GENERATED" };
+    }
+    return scene;
+  });
   const manifest: NarrativeReviewManifest = {
     version: 1,
     sessionId,
@@ -126,13 +140,7 @@ export async function refreshNarrativeReview(
       warningCount: verificationWarnings,
       checkedAt: verification.checkedAt,
     },
-    scenes: normalizedScenes.map((scene) => ({
-      ...scene,
-      ...(stillApproved ? {
-        status: "APPROVED" as const,
-        approvedAt: previous?.approval?.approvedAt ?? now,
-      } : scene.status === "APPROVED" ? { ...scene, status: "GENERATED" as const, approvedAt: undefined } : scene),
-    })),
+    scenes: scenesWithApproval,
     ...(stillApproved && previous?.approval !== undefined ? { approval: previous.approval } : {}),
   };
   await writeNarrativeReview(exportDirectory, manifest);
@@ -240,23 +248,25 @@ async function readSceneReviews(exportDirectory: string): Promise<NarrativeScene
       const issues = Array.isArray(artifact.audit?.issues)
         ? artifact.audit.issues as Array<{ severity?: unknown }>
         : [];
-      const errorCount = issues.filter((issue) => issue.severity === "error").length;
-      const warningCount = issues.filter((issue) => issue.severity === "warning").length;
-      const auditValid = artifact.audit?.valid === true
-        && artifact.audit?.status !== "NEEDS_REVIEW"
-        && artifact.audit?.reviewStatus !== "NEEDS_REVIEW"
-        && errorCount === 0;
       const evidenceIds = Array.isArray(artifact.evidence_ids)
         ? artifact.evidence_ids.filter((value): value is string => typeof value === "string")
         : Array.isArray(artifact.evidenceIds)
           ? artifact.evidenceIds.filter((value): value is string => typeof value === "string")
           : [];
+      const auditErrors = issues.filter((issue) => issue.severity === "error").length;
+      const missingTraceability = evidenceIds.length === 0 ? 1 : 0;
+      const errorCount = auditErrors + missingTraceability;
+      const warningCount = issues.filter((issue) => issue.severity === "warning").length;
+      const auditValid = artifact.audit?.valid === true
+        && artifact.audit?.status !== "NEEDS_REVIEW"
+        && artifact.audit?.reviewStatus !== "NEEDS_REVIEW"
+        && errorCount === 0;
       scenes.push({
         id: typeof artifact.id === "string" ? artifact.id : `scene_${scenes.length + 1}`,
         title: typeof artifact.title === "string" ? artifact.title : `Escena ${scenes.length + 1}`,
         status: auditValid ? "GENERATED" : "NEEDS_REVIEW",
         auditValid,
-        issueCount: issues.length,
+        issueCount: issues.length + missingTraceability,
         errorCount,
         warningCount,
         evidenceIds,
