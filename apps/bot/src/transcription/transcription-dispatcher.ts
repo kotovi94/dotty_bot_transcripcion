@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 
 import type { Logger } from "pino";
 import type { CampaignService } from "../campaigns/campaign-service.ts";
+import type { DottyDiagnostics } from "../diagnostics/dotty-diagnostics.ts";
 import {
   baseTranscriptionVocabulary,
   priorityTranscriptionHotwords,
@@ -42,6 +43,7 @@ export class TranscriptionDispatcher {
     private readonly secret: string,
     private readonly adaptiveVocabulary: AdaptiveVocabularyStore,
     private readonly logger: Logger,
+    private readonly diagnostics?: Pick<DottyDiagnostics, "recordActivity">,
   ) {}
 
   start(): void {
@@ -69,6 +71,15 @@ export class TranscriptionDispatcher {
             { error, directory: entry.name },
             "No se pudo encolar una sesión; las demás continuarán",
           );
+          await this.report({
+            sessionId: entry.name,
+            component: "transcription",
+            process: "dispatch",
+            outcome: "failure",
+            message: "No se pudo enviar la sesión al transcriptor local.",
+            evidence: ["dispatch_exception_captured", "other_sessions_continue"],
+            error,
+          });
         }
       }
     } catch (error) {
@@ -91,7 +102,21 @@ export class TranscriptionDispatcher {
     }
     if (manifest.chunks.length === 0) return;
 
+    const contextStarted = performance.now();
     const transcriptionContext = await this.buildContext(manifest);
+    await this.report({
+      sessionId: manifest.sessionId,
+      component: "transcription",
+      process: "context",
+      outcome: "success",
+      message: "Contexto de campaña preparado para Whisper.",
+      durationMs: performance.now() - contextStarted,
+      evidence: ["campaign_context_loaded", "hotwords_built", "known_corrections_loaded"],
+      metrics: {
+        prompt_chars: transcriptionContext.initialPrompt.length,
+        hotwords_chars: transcriptionContext.hotwords.length,
+      },
+    });
 
     const eligible = manifest.chunks.filter((chunk) => {
       if (manifest.version === 1 || manifest.clips === undefined) return manifest.status === "completed";
@@ -104,6 +129,7 @@ export class TranscriptionDispatcher {
     for (const chunk of eligible) {
       const jobMarker = join(jobMarkers, chunk.id);
       if (existsSync(jobMarker)) continue;
+      const queuedAt = performance.now();
       const response = await fetch(new URL("/v1/jobs", this.baseUrl), {
         method: "POST",
         headers: {
@@ -122,10 +148,37 @@ export class TranscriptionDispatcher {
         signal: AbortSignal.timeout(4_000),
       });
       if (!response.ok) {
+        await this.report({
+          sessionId: manifest.sessionId,
+          component: "transcription",
+          process: "enqueue_job",
+          outcome: "failure",
+          message: "El transcriptor rechazó un fragmento de audio.",
+          durationMs: performance.now() - queuedAt,
+          evidence: [`http_status_${response.status}`],
+          metrics: {
+            speaker_user_id: chunk.speakerUserId,
+            start_offset_ms: chunk.startedOffsetMs,
+          },
+        });
         throw new Error(`Transcriber rejected job with HTTP ${response.status}.`);
       }
       await fs.writeFile(jobMarker, `${new Date().toISOString()}\n`, { flag: "wx" });
       newlyQueued += 1;
+      await this.report({
+        sessionId: manifest.sessionId,
+        component: "transcription",
+        process: "enqueue_job",
+        outcome: "success",
+        message: "Fragmento de audio aceptado por el transcriptor.",
+        durationMs: performance.now() - queuedAt,
+        evidence: ["http_request_ok", "job_marker_written"],
+        metrics: {
+          speaker_user_id: chunk.speakerUserId,
+          start_offset_ms: chunk.startedOffsetMs,
+          clip_index: chunk.clipIndex ?? 1,
+        },
+      });
     }
     if (newlyQueued > 0) {
       this.logger.info(
@@ -139,6 +192,19 @@ export class TranscriptionDispatcher {
         { sessionId: manifest.sessionId, chunks: manifest.chunks.length },
         "Grabacion completa enviada al transcriptor",
       );
+      await this.report({
+        sessionId: manifest.sessionId,
+        component: "transcription",
+        process: "dispatch",
+        outcome: "success",
+        message: "Todos los fragmentos elegibles de la sesión fueron enviados al transcriptor.",
+        evidence: ["all_chunks_eligible", "session_enqueue_marker_written"],
+        metrics: {
+          chunks_total: manifest.chunks.length,
+          chunks_eligible: eligible.length,
+          chunks_queued_now: newlyQueued,
+        },
+      });
     }
   }
 
@@ -192,6 +258,14 @@ export class TranscriptionDispatcher {
       .join(", ")
       .slice(0, 1_000);
     return { initialPrompt: parts.join(" ").slice(0, 4_000), hotwords };
+  }
+
+  private async report(
+    input: Parameters<DottyDiagnostics["recordActivity"]>[0],
+  ): Promise<void> {
+    await this.diagnostics?.recordActivity(input).catch((error) => {
+      this.logger.debug({ error }, "No se pudo guardar el diagnóstico interno de despacho");
+    });
   }
 }
 
