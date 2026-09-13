@@ -34,3 +34,18 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate transcription diagnostics Python
+        run: |
+          python -m pip install pytest==8.4.1
+          python -m py_compile \
+            services/transcriber/dotty_transcriber/config.py \
+            services/transcriber/dotty_transcriber/diagnostics.py \
+            services/transcriber/dotty_transcriber/main.py
+          cd services/transcriber
+          python -m pytest tests/test_diagnostics.py -q
