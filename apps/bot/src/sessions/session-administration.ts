@@ -23,6 +23,7 @@ import type { ManagedSession } from "./session-repository.ts";
 import type { SessionService } from "./session-service.ts";
 import type { ReprocessIntentStore } from "./reprocess-intent-store.ts";
 import type { SessionFileCoordinator } from "./session-file-coordinator.ts";
+import type { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
 
 const buttonPrefix = "dotty:session-delete:";
 const campaignButtonPrefix = "dotty:campaign-delete:";
@@ -41,26 +42,89 @@ export class SessionAdministration {
     private readonly logger: Logger,
     private readonly intents: ReprocessIntentStore,
     private readonly coordinator: SessionFileCoordinator,
+    private readonly campaignCoordinator: CampaignFileCoordinator,
   ) {}
 
   async deleteCampaign(
     campaignId: string,
     discordGuildId: string,
   ): Promise<{ campaignName: string; sessionCount: number }> {
-    const campaign = await this.campaigns.findById(campaignId);
-    if (campaign === null || campaign.discordGuildId !== discordGuildId) {
-      throw new SessionDeletionError("La campaña ya no existe.");
-    }
-    const sessions = await this.sessions.listByCampaignId(campaign.id);
-    for (const session of sessions) {
-      await this.delete(session.id, discordGuildId);
-    }
-    await this.campaigns.deleteById(campaign.id);
-    this.logger.info(
-      { campaignId, sessionCount: sessions.length },
-      "Campaña eliminada por un administrador",
-    );
-    return { campaignName: campaign.name, sessionCount: sessions.length };
+    return this.campaignCoordinator.runExclusive(campaignId, async () => {
+      const campaign = await this.campaigns.findById(campaignId);
+      if (campaign === null || campaign.id !== campaignId || campaign.discordGuildId !== discordGuildId) {
+        throw new SessionDeletionError("La campaña ya no existe.");
+      }
+      const listed = [...await this.sessions.listByCampaignId(campaign.id)]
+        .sort((left, right) => compareIds(left.id, right.id));
+      const sessionIds = listed.map((session) => session.id);
+
+      return this.withSessionLocks(sessionIds, async () => {
+        const currentCampaign = await this.campaigns.findById(campaignId);
+        if (
+          currentCampaign === null || currentCampaign.id !== campaignId ||
+          currentCampaign.discordGuildId !== discordGuildId
+        ) {
+          throw new SessionDeletionError("La campaña ya no existe.");
+        }
+
+        const currentMembers = [...await this.sessions.listByCampaignId(campaignId)]
+          .sort((left, right) => compareIds(left.id, right.id));
+        if (!sameSessionIds(sessionIds, currentMembers.map((session) => session.id))) {
+          throw new SessionDeletionError("La pertenencia de sesiones a la campaña cambió; no se borró nada.");
+        }
+
+        const validated: ManagedSession[] = [];
+        for (const member of currentMembers) {
+          const session = await this.sessions.findById(member.id);
+          if (
+            session === null || session.id !== member.id ||
+            session.discordGuildId !== discordGuildId ||
+            session.campaignName !== currentCampaign.name ||
+            session.status !== member.status || !isKnownSessionStatus(session.status)
+          ) {
+            throw new SessionDeletionError(`La sesión ${member.id} cambió o tiene un estado incierto; no se borró nada.`);
+          }
+          await this.assertNoPendingIntent(session.id);
+          validated.push(session);
+        }
+
+        const deletedSessionIds: string[] = [];
+        let currentSessionId: string | undefined;
+        let campaignDeleteAttempted = false;
+        try {
+          for (const session of validated) {
+            currentSessionId = session.id;
+            await this.deleteLocked(session, discordGuildId);
+            deletedSessionIds.push(session.id);
+          }
+          currentSessionId = undefined;
+          campaignDeleteAttempted = true;
+          await this.campaigns.deleteById(campaignId);
+        } catch (error) {
+          this.logger.error(
+            {
+              campaignId,
+              discordGuildId,
+              completedSessionIds: deletedSessionIds,
+              currentSessionId,
+              campaignDeleteAttempted,
+              error,
+            },
+            "Falló el borrado de campaña después de iniciar; los efectos pueden ser parciales",
+          );
+          throw new SessionDeletionError(
+            `El borrado de la campaña se interrumpió tras iniciar. Se completaron ${deletedSessionIds.length} sesiones; puede haber efectos parciales y no se revirtió lo realizado. Revisa los registros antes de reintentar.`,
+            { cause: error },
+          );
+        }
+
+        this.logger.info(
+          { campaignId, sessionCount: validated.length },
+          "Campaña eliminada por un administrador",
+        );
+        return { campaignName: currentCampaign.name, sessionCount: validated.length };
+      });
+    });
   }
 
   async delete(sessionId: string, discordGuildId: string): Promise<ManagedSession> {
@@ -69,31 +133,59 @@ export class SessionAdministration {
       if (session === null || session.id !== sessionId || session.discordGuildId !== discordGuildId) {
         throw new SessionDeletionError("La sesión ya no existe.");
       }
-      let pending: boolean;
-      try {
-        pending = await this.intents.hasPending(sessionId);
-      } catch (error) {
-        throw new SessionDeletionError("No se pudo verificar la intención de reprocesamiento; se conserva la grabación.", { cause: error });
-      }
-      if (pending) {
-        throw new SessionDeletionError("La sesión tiene un reprocesamiento pendiente; se conserva la grabación.");
-      }
-
-      if (session.status === "recording" || session.status === "paused") {
-        await this.recordings.cancel(discordGuildId, session.id);
-      }
-
-      await this.deleteTranscriberJobs(session.id, false);
-      await this.deleteDiscordPublication(session);
-      await fs.rm(join(this.recordingsRoot, session.id), { recursive: true, force: true });
-      await fs.rm(join(this.exportsRoot, session.id), { recursive: true, force: true });
-      await this.sessions.deleteById(session.id);
-      this.logger.info(
-        { sessionId: session.id, sequenceNumber: session.sequenceNumber },
-        "Sesion eliminada por un administrador",
-      );
-      return session;
+      await this.assertNoPendingIntent(sessionId);
+      return this.deleteLocked(session, discordGuildId);
     });
+  }
+
+  private async withSessionLocks<T>(
+    sessionIds: readonly string[],
+    action: () => Promise<T>,
+    index = 0,
+  ): Promise<T> {
+    if (index >= sessionIds.length) return action();
+    return this.coordinator.runExclusive(sessionIds[index]!, () =>
+      this.withSessionLocks(sessionIds, action, index + 1),
+    );
+  }
+
+  private async assertNoPendingIntent(sessionId: string): Promise<void> {
+    let pending: boolean;
+    try {
+      pending = await this.intents.hasPending(sessionId);
+    } catch (error) {
+      throw new SessionDeletionError(
+        "No se pudo verificar la intención de reprocesamiento; se conserva la grabación.",
+        { cause: error },
+      );
+    }
+    if (pending) {
+      throw new SessionDeletionError("La sesión tiene un reprocesamiento pendiente; se conserva la grabación.");
+    }
+  }
+
+  private async deleteLocked(
+    session: ManagedSession,
+    discordGuildId: string,
+  ): Promise<ManagedSession> {
+    const captureCancelled = await this.recordings.cancelIfActive(discordGuildId, session.id);
+    if (
+      !captureCancelled &&
+      (session.status === "recording" || session.status === "paused" || session.status === "finalizing")
+    ) {
+      throw new SessionDeletionError("No se pudo confirmar el cierre de la captura; se conservan los WAV.");
+    }
+
+    await this.deleteTranscriberJobs(session.id, false);
+    await this.deleteDiscordPublication(session);
+    await fs.rm(join(this.recordingsRoot, session.id), { recursive: true, force: true });
+    await fs.rm(join(this.exportsRoot, session.id), { recursive: true, force: true });
+    await this.sessions.deleteById(session.id);
+    this.logger.info(
+      { sessionId: session.id, sequenceNumber: session.sequenceNumber },
+      "Sesion eliminada por un administrador",
+    );
+    return session;
   }
 
   async reprocess(sessionId: string, discordGuildId: string): Promise<ManagedSession> {
@@ -477,3 +569,24 @@ export function sessionReprocessButtonId(
 }
 
 export class SessionDeletionError extends Error {}
+
+const knownSessionStatuses = new Set<string>([
+  "scheduled",
+  "recording",
+  "paused",
+  "finalizing",
+  "completed",
+  "failed",
+]);
+
+function compareIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function sameSessionIds(expected: readonly string[], current: readonly string[]): boolean {
+  return expected.length === current.length && expected.every((id, index) => id === current[index]);
+}
+
+function isKnownSessionStatus(status: string): boolean {
+  return knownSessionStatuses.has(status);
+}

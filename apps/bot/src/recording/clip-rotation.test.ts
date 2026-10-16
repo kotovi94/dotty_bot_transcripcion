@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -11,11 +11,13 @@ import type { Guild } from "discord.js";
 import { VoiceConnectionStatus, type VoiceConnection } from "@discordjs/voice";
 import type prism from "prism-media";
 import type { PersistedSession } from "../sessions/session-repository.ts";
+import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
 import { WavFileWriter } from "./wav-writer.ts";
 
 import {
   clipRotationDecision,
   inferRecoveredChunkOffsets,
+  CaptureClosureError,
   VoiceCaptureManager,
   type ClipRotationOptions,
 } from "./voice-capture-manager.ts";
@@ -120,11 +122,10 @@ describe("capture cancellation identity", () => {
     const active = (manager as unknown as { active: Map<string, { chunks: Map<string, unknown> }> }).active.get("guild")!;
     const failure = Promise.reject(new Error("stop failed"));
     void failure.catch(() => undefined);
-    active.chunks.set("speaker", { stop() {}, finished: failure });
-    await assert.rejects(manager.cancel("guild", "session-a"), /stop failed/);
+    active.chunks.set("speaker", { stop() { active.chunks.delete("speaker"); }, finished: failure });
+    await assert.rejects(manager.cancel("guild", "session-a"), (error: unknown) =>
+      error instanceof CaptureClosureError && error.closureState === "failed");
     assert.equal(await readFile(wav, "utf8"), "fictional audio");
-    active.chunks.clear();
-    await manager.cancel("guild", "session-a");
   });
 });
 
@@ -196,16 +197,23 @@ describe("interrupted recording recovery", () => {
       if (failure === "disconnect") connection.emit("stateChange", connection.state, { status: VoiceConnectionStatus.Disconnected });
       // Allow stream events to finish before shutdown joins the interruption.
       await new Promise((done) => setImmediate(done));
-      await manager.shutdown();
       const path = join(root, "recordings", "session", "manifest.json");
+      if (failure === "writer") {
+        const report = await manager.shutdown();
+        assert.deepEqual(report.failedCaptures.map((capture) => capture.sessionId), ["session"]);
+        assert.deepEqual(report.uncertainCaptures, []);
+      } else {
+        await manager.shutdown();
+      }
       const interrupted = JSON.parse(await readFile(path, "utf8"));
-      assert.equal(interrupted.status, "interrupted");
-      if (failure !== "shutdown") assert.match(interrupted.interruptionReason, /ENOSPC|disconnected/iu);
+      assert.equal(interrupted.status, failure === "writer" ? "recording" : "interrupted");
+      if (failure === "disconnect") assert.match(interrupted.interruptionReason, /disconnected/iu);
       const endedAt = interrupted.endedAt;
       assert.deepEqual(await manager.recoverInterrupted(), ["session"]);
       const recovered = JSON.parse(await readFile(path, "utf8"));
       assert.equal(recovered.status, "completed");
-      assert.equal(recovered.endedAt, endedAt);
+      if (endedAt === null) assert.ok(recovered.endedAt);
+      else assert.equal(recovered.endedAt, endedAt);
       assert.equal(recovered.chunks.length, 1);
       assert.equal((await readFile(join(root, "recordings", "session", recovered.chunks[0].file))).readUInt32LE(40), 960);
       assert.deepEqual(await manager.recoverInterrupted(), []);
@@ -255,5 +263,339 @@ describe("interrupted recording recovery", () => {
     assert.equal(manifest.chunks.length, 1);
     assert.equal(wav.toString("ascii", 0, 4), "RIFF");
     assert.equal(wav.readUInt32LE(40), pcm.length);
+  });
+});
+
+function deferred() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  return { promise, release };
+}
+
+interface ActiveCaptureForTest {
+  closeState: string;
+  manifest: {
+    status: string;
+    clips: Array<{ startTimestamp: string }>;
+    chunks: unknown[];
+  };
+  chunks: Map<string, { finished: Promise<void> }>;
+  manifestWrite: Promise<void>;
+}
+
+function managerInternals(manager: VoiceCaptureManager) {
+  return manager as unknown as {
+    active: Map<string, ActiveCaptureForTest>;
+    scheduleRotation(recording: ActiveCaptureForTest): void;
+    queueManifestWrite(recording: ActiveCaptureForTest): Promise<void>;
+  };
+}
+
+async function closureFixture(
+  test: { after(callback: () => Promise<void>): void },
+  setup: {
+    writer?: (path: string) => WavFileWriter;
+    writerCloseTimeoutMs?: number;
+    writeManifest?: (path: string, value: unknown) => Promise<void>;
+  } = {},
+) {
+  const root = await mkdtemp(join(tmpdir(), "dotty-close-barrier-"));
+  test.after(() => rm(root, { recursive: true, force: true }));
+  const speaking = new EventEmitter();
+  const subscriptions = new Map<string, PassThrough>();
+  const connection = Object.assign(new EventEmitter(), {
+    state: { status: VoiceConnectionStatus.Ready },
+    receiver: {
+      speaking,
+      subscribe: (userId: string) => {
+        const subscription = new PassThrough();
+        subscriptions.set(userId, subscription);
+        return subscription;
+      },
+    },
+    destroy() { this.state = { status: VoiceConnectionStatus.Destroyed }; },
+  });
+  const adapters = {
+    connect: () => connection as unknown as VoiceConnection,
+    decoder: () => new PassThrough() as unknown as prism.opus.Decoder,
+    ...(setup.writer === undefined ? {} : { writer: setup.writer }),
+    ...(setup.writeManifest === undefined ? {} : { writeManifest: setup.writeManifest }),
+    writerCloseTimeoutMs: setup.writerCloseTimeoutMs ?? 1_000,
+  };
+  const manager = new VoiceCaptureManager(
+    root,
+    { info() {}, error() {}, warn() {} } as unknown as Logger,
+    options,
+    adapters,
+  );
+  const guild = { id: "guild", voiceAdapterCreator: {}, members: { cache: new Map() } } as unknown as Guild;
+  await manager.start(guild, {
+    id: "session",
+    campaignId: "campaign",
+    sequenceNumber: 1,
+    voiceChannelId: "voice",
+    startedAt: new Date(),
+  } as PersistedSession);
+  return {
+    root,
+    manager,
+    connection,
+    speaking,
+    subscriptions,
+    recording: () => managerInternals(manager).active.get("guild")!,
+    internals: managerInternals(manager),
+    startSpeaker(userId = "speaker") {
+      speaking.emit("start", userId);
+      return subscriptions.get(userId)!;
+    },
+    directory: join(root, "recordings", "session"),
+  };
+}
+
+class HeldFinalWavWriter extends WavFileWriter {
+  constructor(
+    path: string,
+    private readonly finalGate: Promise<void>,
+    private readonly onFinalizing: () => void,
+  ) {
+    super(path);
+  }
+
+  override _final(callback: (error?: Error | null) => void): void {
+    this.onFinalizing();
+    void this.finalGate.then(
+      () => super._final(callback),
+      (error: unknown) => callback(error as Error),
+    );
+  }
+}
+
+describe("capture closure barrier", () => {
+  it("reports absence or drains only the matching active capture", async (test) => {
+    const f = await closureFixture(test);
+    assert.equal(await f.manager.cancelIfActive("other-guild", "session"), false);
+    f.startSpeaker().write(Buffer.alloc(960, 1));
+    assert.equal(await f.manager.cancelIfActive("guild", "session"), true);
+    assert.equal(managerInternals(f.manager).active.has("guild"), false);
+    await assert.rejects(access(f.directory));
+  });
+
+  it("pauses with no writers while keeping the connection available for resume", async (test) => {
+    const f = await closureFixture(test);
+    f.startSpeaker("before-pause").write(Buffer.alloc(960, 2));
+    await f.manager.pause("guild");
+    assert.equal(f.connection.state.status, VoiceConnectionStatus.Ready);
+    assert.equal(f.recording().closeState, "closed");
+    assert.equal(JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8")).status, "paused");
+    f.speaking.emit("start", "while-paused");
+    assert.equal(f.subscriptions.has("while-paused"), false);
+
+    await f.manager.resume("guild");
+    f.startSpeaker("after-resume").write(Buffer.alloc(960, 3));
+    await f.manager.finish("guild");
+    const manifest = JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8"));
+    assert.equal(manifest.status, "completed");
+    assert.equal(manifest.clips.length, 2);
+    assert.equal(manifest.chunks.length, 2);
+  });
+
+  it("cancels normally only after active WAV writers finish", async (test) => {
+    const f = await closureFixture(test);
+    const recording = f.recording();
+    const source = f.startSpeaker();
+    source.write(Buffer.alloc(960, 3));
+    await f.manager.cancel("guild", "session");
+    await assert.rejects(access(f.directory));
+    assert.equal(recording.closeState, "closed");
+  });
+
+  it("keeps finish pending until a delayed WAV writer has finalized", async (test) => {
+    const release = deferred();
+    const finalizing = deferred();
+    const f = await closureFixture(test, {
+      writer: (path) => new HeldFinalWavWriter(path, release.promise, finalizing.release),
+    });
+    f.startSpeaker().write(Buffer.alloc(960, 4));
+    let completed = false;
+    const finishing = f.manager.finish("guild").then(() => { completed = true; });
+    await finalizing.promise;
+    await new Promise((done) => setTimeout(done, 20));
+    assert.equal(completed, false);
+    assert.equal(f.recording().closeState, "closing");
+    release.release();
+    await finishing;
+    assert.equal(completed, true);
+    assert.equal(JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8")).status, "completed");
+  });
+
+  it("waits for an in-flight rotation before finalizing the next clip", async (test) => {
+    const release = deferred();
+    const finalizing = deferred();
+    let writerCount = 0;
+    const f = await closureFixture(test, {
+      writer: (path) => {
+        writerCount += 1;
+        return new HeldFinalWavWriter(path, release.promise, finalizing.release);
+      },
+    });
+    f.startSpeaker().write(Buffer.alloc(960, 5));
+    const startMs = Date.parse(f.recording().manifest.clips[0]!.startTimestamp);
+    test.mock.method(Date, "now", () => startMs + options.maxMs);
+    f.internals.scheduleRotation(f.recording());
+    await finalizing.promise;
+    let completed = false;
+    const finishing = f.manager.finish("guild").then(() => { completed = true; });
+    await new Promise((done) => setTimeout(done, 20));
+    assert.equal(completed, false);
+    assert.equal(writerCount, 2);
+    release.release();
+    await finishing;
+    const manifest = JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8"));
+    assert.equal(manifest.status, "completed");
+    assert.equal(manifest.clips.length, 2);
+    assert.equal(manifest.chunks.length, 2);
+  });
+
+  it("times out as uncertain and preserves WAV data and the session directory", async (test) => {
+    const release = deferred();
+    const finalizing = deferred();
+    let wavPath = "";
+    const f = await closureFixture(test, {
+      writerCloseTimeoutMs: 35,
+      writer: (path) => {
+        wavPath = path;
+        return new HeldFinalWavWriter(path, release.promise, finalizing.release);
+      },
+    });
+    f.startSpeaker().write(Buffer.alloc(960, 6));
+    const closing = f.manager.cancel("guild", "session");
+    await finalizing.promise;
+    await assert.rejects(closing, (error: unknown) =>
+      error instanceof CaptureClosureError && error.closureState === "uncertain");
+    assert.equal(f.recording().closeState, "uncertain");
+    await access(f.directory);
+    await access(wavPath);
+    const writerFinished = f.recording().chunks.get("speaker")?.finished;
+    release.release();
+    await writerFinished?.catch(() => undefined);
+    await access(wavPath);
+  });
+
+  it("continues closing later captures when one writer times out", async (test) => {
+    const release = deferred();
+    const finalizing = deferred();
+    let wavPath = "";
+    const f = await closureFixture(test, {
+      writerCloseTimeoutMs: 35,
+      writer: (path) => {
+        wavPath = path;
+        return new HeldFinalWavWriter(path, release.promise, finalizing.release);
+      },
+    });
+    f.startSpeaker().write(Buffer.alloc(960, 9));
+    await f.manager.start({ id: "guild-two", voiceAdapterCreator: {}, members: { cache: new Map() } } as unknown as Guild, {
+      id: "session-two",
+      campaignId: "campaign",
+      sequenceNumber: 2,
+      voiceChannelId: "voice",
+      startedAt: new Date(),
+    } as PersistedSession);
+
+    const report = await f.manager.shutdown();
+    assert.deepEqual(report.closedSessionIds, ["session-two"]);
+    assert.deepEqual(report.failedCaptures, []);
+    assert.deepEqual(report.uncertainCaptures.map((capture) => capture.sessionId), ["session"]);
+    assert.equal(f.recording().closeState, "uncertain");
+    await access(f.directory);
+    await access(join(f.root, "recordings", "session-two", "manifest.json"));
+    assert.equal(JSON.parse(await readFile(join(f.root, "recordings", "session-two", "manifest.json"), "utf8")).status, "interrupted");
+    const writerFinished = f.recording().chunks.get("speaker")?.finished;
+    release.release();
+    await writerFinished?.catch(() => undefined);
+    await access(wavPath);
+  });
+
+  it("waits for an already queued manifest write before removing the directory", async (test) => {
+    const f = await closureFixture(test);
+    const pendingWrite = deferred();
+    f.recording().manifestWrite = pendingWrite.promise;
+    let completed = false;
+    const cancelling = f.manager.cancel("guild", "session").then(() => { completed = true; });
+    await new Promise((done) => setTimeout(done, 20));
+    assert.equal(completed, false);
+    await access(join(f.directory, "manifest.json"));
+    pendingWrite.release();
+    await cancelling;
+    await assert.rejects(access(f.directory));
+  });
+
+  it("drains active writers during shutdown before writing interrupted status", async (test) => {
+    const release = deferred();
+    const finalizing = deferred();
+    const f = await closureFixture(test, {
+      writer: (path) => new HeldFinalWavWriter(path, release.promise, finalizing.release),
+    });
+    f.startSpeaker().write(Buffer.alloc(960, 7));
+    let completed = false;
+    const shuttingDown = f.manager.shutdown().then(() => { completed = true; });
+    await finalizing.promise;
+    await new Promise((done) => setTimeout(done, 20));
+    assert.equal(completed, false);
+    release.release();
+    await shuttingDown;
+    assert.equal(JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8")).status, "interrupted");
+    assert.equal(managerInternals(f.manager).active.size, 0);
+  });
+
+  it("runs shutdown closure while holding the supplied session lock", async (test) => {
+    const f = await closureFixture(test);
+    const coordinator = new SessionFileCoordinator(join(f.root, "session-locks"));
+    let lockHeld = false;
+    await f.manager.shutdown((sessionId, action) => coordinator.runExclusive(sessionId, async () => {
+      lockHeld = true;
+      return action();
+    }));
+    assert.equal(lockHeld, true);
+    assert.equal(managerInternals(f.manager).active.size, 0);
+  });
+
+  it("reports a manifest write failure and preserves the session files", async (test) => {
+    const f = await closureFixture(test, {
+      writeManifest: async () => { throw new Error("manifest disk failure"); },
+    });
+    const report = await f.manager.shutdown();
+    assert.deepEqual(report.closedSessionIds, []);
+    assert.deepEqual(report.failedCaptures.map((capture) => capture.sessionId), ["session"]);
+    assert.deepEqual(report.uncertainCaptures, []);
+    assert.equal(f.recording().closeState, "failed");
+    await access(f.directory);
+    assert.equal(JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8")).status, "recording");
+  });
+
+  it("rejects new speaker writers, rotations, and manifest writes after closure", async (test) => {
+    const release = deferred();
+    const finalizing = deferred();
+    let writerCount = 0;
+    const f = await closureFixture(test, {
+      writer: (path) => {
+        writerCount += 1;
+        return new HeldFinalWavWriter(path, release.promise, finalizing.release);
+      },
+    });
+    f.startSpeaker("first").write(Buffer.alloc(960, 8));
+    const finishing = f.manager.finish("guild");
+    await finalizing.promise;
+    f.speaking.emit("start", "late");
+    f.internals.scheduleRotation(f.recording());
+    const newWrite = f.internals.queueManifestWrite(f.recording()).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    assert.equal(writerCount, 1);
+    assert.equal(f.recording().chunks.has("late"), false);
+    release.release();
+    await finishing;
+    assert.ok(await newWrite instanceof CaptureClosureError);
+    assert.equal(writerCount, 1);
   });
 });

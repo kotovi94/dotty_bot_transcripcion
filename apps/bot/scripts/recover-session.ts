@@ -3,8 +3,12 @@ import { basename, join, resolve } from "node:path";
 
 import { config as loadDotenv } from "dotenv";
 
+import { PrismaCampaignRepository } from "../src/campaigns/campaign-repository.ts";
+import { CampaignService } from "../src/campaigns/campaign-service.ts";
 import { createDatabaseClient } from "../src/database/client.ts";
 import { writeJsonAtomically } from "../src/recording/atomic-json-file.ts";
+import { CampaignFileCoordinator } from "../src/sessions/campaign-file-coordinator.ts";
+import { SessionFileCoordinator } from "../src/sessions/session-file-coordinator.ts";
 import { PrismaSessionRepository } from "../src/sessions/session-repository.ts";
 import { SessionService } from "../src/sessions/session-service.ts";
 import { resolveTranscriberSecret } from "../src/transcription/transcription-dispatcher.ts";
@@ -54,7 +58,10 @@ await copyFile(manifestPath, join(backupRoot, "manifest.json"));
 const databaseUrl = process.env.DATABASE_URL ?? "file:../../data/dotty.db";
 const database = createDatabaseClient(databaseUrl);
 try {
-  const sessions = new SessionService(new PrismaSessionRepository(database));
+  const campaigns = new CampaignService(new PrismaCampaignRepository(database));
+  const campaignCoordinator = new CampaignFileCoordinator(join(dataRoot, "campaign-locks"));
+  const sessionCoordinator = new SessionFileCoordinator(join(dataRoot, "session-locks"));
+  const sessions = new SessionService(new PrismaSessionRepository(database), campaigns, campaignCoordinator, sessionCoordinator);
   const session = await sessions.findById(sessionId);
   if (session === null) throw new Error("La sesión no existe en la base de datos.");
 

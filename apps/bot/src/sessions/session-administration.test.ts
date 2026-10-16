@@ -13,16 +13,18 @@ import type { AdaptiveVocabularyStore } from "../transcription/adaptive-vocabula
 import { TranscriptionDispatcher } from "../transcription/transcription-dispatcher.ts";
 import { SessionAdministration } from "./session-administration.ts";
 import { ReprocessIntentStore } from "./reprocess-intent-store.ts";
+import { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
 import { SessionFileCoordinator } from "./session-file-coordinator.ts";
 import type { SessionService } from "./session-service.ts";
 
 const directories: string[] = [];
 after(async () => Promise.all(directories.map((directory) => rm(directory, { recursive: true }))));
 
-function protection(root: string): [ReprocessIntentStore, SessionFileCoordinator] {
+function protection(root: string): [ReprocessIntentStore, SessionFileCoordinator, CampaignFileCoordinator] {
   const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
+  const campaignCoordinator = new CampaignFileCoordinator(join(root, "campaign-locks"));
   return [new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator,
-    { assertEligible: async (_sessionId: string) => {} }), coordinator];
+    { assertEligible: async (_sessionId: string) => {} }), coordinator, campaignCoordinator];
 }
 
 describe("session administration", () => {
@@ -37,7 +39,7 @@ describe("session administration", () => {
     await writeFile(join(active, "active.wav"), "active audio");
     await writeFile(join(requested, "requested.wav"), "requested audio");
     const calls: Array<[string, string]> = [];
-    const recordingsManager = { cancel: async (guildId: string, sessionId: string) => {
+    const recordingsManager = { cancelIfActive: async (guildId: string, sessionId: string) => {
       calls.push([guildId, sessionId]);
       throw new Error("Active voice capture does not match the requested session.");
     } } as unknown as VoiceCaptureManager;

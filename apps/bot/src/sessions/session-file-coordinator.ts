@@ -15,14 +15,17 @@ export interface SessionLockOptions {
 export class SessionFileCoordinator {
   private static readonly active = new AsyncLocalStorage<ReadonlySet<string>>();
 
-  constructor(private readonly root: string) {}
+  constructor(
+    private readonly root: string,
+    private readonly namespace = "session",
+  ) {}
 
   pathFor(sessionId: string): string {
     if (!sessionId || sessionId === "." || sessionId === ".." ||
       sessionId.length > 128 || /[/\\\x00-\x1f]/u.test(sessionId)) {
-      throw new SessionCoordinationError("Invalid session ID");
+      throw new SessionCoordinationError(`Invalid ${this.namespace} ID`);
     }
-    return join(this.root, `${Buffer.from(sessionId, "utf8").toString("hex")}.session.lock`);
+    return join(this.root, `${Buffer.from(sessionId, "utf8").toString("hex")}.${this.namespace}.lock`);
   }
 
   async runExclusive<T>(sessionId: string, action: () => Promise<T>, options: SessionLockOptions = {}): Promise<T> {
@@ -33,7 +36,7 @@ export class SessionFileCoordinator {
       throw new SessionCoordinationError("Invalid lock timing");
     }
     const key = resolve(path).toLowerCase();
-    if (SessionFileCoordinator.active.getStore()?.has(key)) throw new SessionCoordinationError("Reentrant session lock acquisition");
+    if (SessionFileCoordinator.active.getStore()?.has(key)) throw new SessionCoordinationError(`Reentrant ${this.namespace} lock acquisition`);
     await fs.mkdir(this.root, { recursive: true });
     const deadline = Date.now() + timeoutMs;
     let handle: fs.FileHandle;
@@ -44,7 +47,7 @@ export class SessionFileCoordinator {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         if (Date.now() >= deadline) {
-          throw new SessionCoordinationError(`Timed out waiting for session lock: ${sessionId}; inspect ${path}`);
+          throw new SessionCoordinationError(`Timed out waiting for ${this.namespace} lock: ${sessionId}; inspect ${path}`);
         }
         await new Promise((done) => setTimeout(done, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
       }
@@ -67,7 +70,7 @@ export class SessionFileCoordinator {
           let recordedToken: string | undefined;
           try { recordedToken = (JSON.parse(current) as { token?: string }).token; } catch { /* Foreign lock. */ }
           if (recordedToken !== token || stat.dev !== identity!.dev || stat.ino !== identity!.ino) {
-            throw new SessionCoordinationError(`Session lock ownership changed; inspect ${path}`);
+            throw new SessionCoordinationError(`${this.namespace} lock ownership changed; inspect ${path}`);
           }
           // Node has no atomic compare-and-unlink. External replacement during
           // this final check remains a Windows limitation; never force removal.

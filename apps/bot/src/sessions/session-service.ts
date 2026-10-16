@@ -4,12 +4,74 @@ import type {
   SessionRepository,
   StartSessionInput,
 } from "./session-repository.ts";
+import { CampaignNotFoundError } from "./session-repository.ts";
+import type { CampaignService } from "../campaigns/campaign-service.ts";
+import type { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
+import type { SessionFileCoordinator } from "./session-file-coordinator.ts";
 
 export class SessionService {
-  constructor(private readonly sessions: SessionRepository) {}
+  constructor(
+    private readonly sessions: SessionRepository,
+    private readonly campaigns: Pick<CampaignService, "findByGuildAndName">,
+    private readonly campaignCoordinator: CampaignFileCoordinator,
+    private readonly sessionCoordinator: SessionFileCoordinator,
+  ) {}
 
-  start(input: StartSessionInput): Promise<PersistedSession> {
-    return this.sessions.start(input);
+  async start(input: StartSessionInput): Promise<PersistedSession> {
+    return this.startWithCapture(input, async () => {});
+  }
+
+  async startWithCapture(
+    input: StartSessionInput,
+    startCapture: (session: PersistedSession) => Promise<void>,
+  ): Promise<PersistedSession> {
+    const campaign = await this.campaigns.findByGuildAndName(
+      input.discordGuildId,
+      input.campaignName,
+    );
+    if (campaign === null) throw new CampaignNotFoundError(input.campaignName);
+
+    return this.campaignCoordinator.runExclusive(campaign.id, async () => {
+      const current = await this.campaigns.findByGuildAndName(
+        input.discordGuildId,
+        input.campaignName,
+      );
+      if (current === null || current.id !== campaign.id) {
+        throw new CampaignNotFoundError(input.campaignName);
+      }
+      const session = await this.sessions.start(input);
+      return this.sessionCoordinator.runExclusive(session.id, async () => {
+        const persisted = await this.sessions.findById(session.id);
+        if (
+          persisted === null || persisted.id !== session.id ||
+          persisted.discordGuildId !== input.discordGuildId ||
+          persisted.campaignName !== campaign.name ||
+          persisted.sequenceNumber !== session.sequenceNumber ||
+          persisted.status !== session.status
+        ) {
+          throw new Error("Session changed before capture startup; retry the command.");
+        }
+        try {
+          await startCapture(session);
+        } catch (captureError) {
+          try {
+            await this.sessions.transition({
+              discordGuildId: input.discordGuildId,
+              campaignName: input.campaignName,
+              event: { type: "fail", occurredAt: new Date() },
+            });
+          } catch (databaseError) {
+            throw new AggregateError(
+              [captureError, databaseError],
+              "Capture startup failed and the session failure state could not be recorded.",
+              { cause: captureError },
+            );
+          }
+          throw captureError;
+        }
+        return session;
+      });
+    });
   }
 
   pause(discordGuildId: string, campaignName: string): Promise<PersistedSession> {
@@ -72,6 +134,10 @@ export class SessionService {
 
   findById(sessionId: string) {
     return this.sessions.findById(sessionId);
+  }
+
+  findActive(discordGuildId: string, campaignName: string) {
+    return this.sessions.findActive(discordGuildId, campaignName);
   }
 
   deleteById(sessionId: string) {

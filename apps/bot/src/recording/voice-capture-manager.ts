@@ -90,10 +90,42 @@ interface ActiveRecording {
   acceptingAudio: boolean;
   currentClip: RecordingClip | null;
   rotationInProgress: boolean;
+  closeState: CaptureClosureState;
+  closeMode: CaptureCloseMode | undefined;
+  closeTask: Promise<void> | undefined;
+  closeError: CaptureClosureError | undefined;
+  rotationTask: Promise<void> | undefined;
   manifestWrite: Promise<void>;
+  manifestWriteFailure?: unknown;
   rotationTimer: NodeJS.Timeout;
   failure?: Error;
   interruption?: Promise<void>;
+}
+
+type CaptureClosureState = "open" | "closing" | "closed" | "failed" | "uncertain";
+type CaptureCloseMode = "pause" | "finish" | "cancel" | "shutdown" | "interrupt";
+
+export class CaptureClosureError extends Error {
+  constructor(
+    readonly closureState: "failed" | "uncertain",
+    readonly sessionId: string,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(`Capture ${sessionId} closure ${closureState}: ${message}`, options);
+    this.name = "CaptureClosureError";
+  }
+}
+
+export interface CaptureShutdownIssue {
+  readonly sessionId: string;
+  readonly message: string;
+}
+
+export interface CaptureShutdownReport {
+  readonly closedSessionIds: readonly string[];
+  readonly failedCaptures: readonly CaptureShutdownIssue[];
+  readonly uncertainCaptures: readonly CaptureShutdownIssue[];
 }
 
 interface SegmentWriter {
@@ -126,6 +158,8 @@ export class VoiceCaptureManager {
       connect?: typeof joinVoiceChannel;
       decoder?: () => prism.opus.Decoder;
       writer?: (path: string) => WavFileWriter;
+      writerCloseTimeoutMs?: number;
+      writeManifest?: typeof writeJsonAtomically;
     } = {},
   ) {
     if (!(rotation.searchStartMs <= rotation.targetMs && rotation.targetMs <= rotation.maxMs)) {
@@ -264,6 +298,11 @@ export class VoiceCaptureManager {
       acceptingAudio: true,
       currentClip: firstClip,
       rotationInProgress: false,
+      closeState: "open",
+      closeMode: undefined,
+      closeTask: undefined,
+      closeError: undefined,
+      rotationTask: undefined,
       manifestWrite: Promise.resolve(),
       rotationTimer: setInterval(() => this.scheduleRotation(recording), 1_000),
     });
@@ -271,7 +310,7 @@ export class VoiceCaptureManager {
     this.active.set(guild.id, recording);
     connection.on("error", (error) => this.interrupt(recording, error));
     connection.on("stateChange", (_previous, next) => {
-      if (!recording.acceptingAudio && recording.manifest.status !== "paused") return;
+      if (recording.closeState !== "open") return;
       if (next.status === VoiceConnectionStatus.Disconnected || next.status === VoiceConnectionStatus.Destroyed) {
         // Stop conservatively: automatic reconnection cannot restore missing audio.
         this.interrupt(recording, new Error(`Voice connection ${next.status}; recording interrupted`));
@@ -297,46 +336,39 @@ export class VoiceCaptureManager {
 
   async pause(discordGuildId: string): Promise<void> {
     const recording = this.requireActive(discordGuildId);
-    recording.acceptingAudio = false;
-    await this.stopChunks(recording);
     if (recording.failure) throw recording.failure;
-    await this.closeCurrentClip(recording);
-    recording.manifest.status = "paused";
-    await this.queueManifestWrite(recording);
+    await this.closeCapture(recording, "pause");
+    if (recording.failure) throw recording.failure;
   }
 
   async resume(discordGuildId: string): Promise<void> {
     const recording = this.requireActive(discordGuildId);
     if (recording.failure) throw recording.failure;
+    if (recording.closeState !== "closed" || recording.closeMode !== "pause") {
+      throw new CaptureClosureError("failed", recording.manifest.sessionId, "capture is not safely paused");
+    }
+    recording.closeState = "open";
+    recording.closeMode = undefined;
+    recording.closeTask = undefined;
+    recording.closeError = undefined;
+    recording.acceptingAudio = false;
     this.openNextClip(recording, Date.now());
-    recording.acceptingAudio = true;
     recording.manifest.status = "recording";
-    await this.queueManifestWrite(recording);
+    try {
+      await this.queueManifestWrite(recording);
+    } catch (error) {
+      throw this.failClosure(recording, error, "manifest write failed while resuming");
+    }
+    recording.rotationTimer = setInterval(() => this.scheduleRotation(recording), 1_000);
+    recording.rotationTimer.unref();
+    recording.acceptingAudio = true;
   }
 
   async finish(discordGuildId: string): Promise<void> {
     const recording = this.requireActive(discordGuildId);
-    if (recording.interruption) {
-      await recording.interruption;
-      this.active.delete(discordGuildId);
-      throw recording.failure;
-    }
-    this.logger.info({ sessionId: recording.manifest.sessionId }, "[Session] Finalizing");
-    recording.acceptingAudio = false;
-    clearInterval(recording.rotationTimer);
-    recording.manifest.status = "finalizing";
-    recording.manifest.endedAt = new Date().toISOString();
-    const finalizingWrite = this.queueManifestWrite(recording);
-    // Leave Discord before waiting on decoder/file finalization. A decoder that
-    // fails to emit `end` must never leave Dotty visibly connected forever.
-    recording.connection.destroy();
-    await finalizingWrite;
-    await this.stopChunks(recording);
-    if (recording.failure) throw recording.failure;
-    await this.closeCurrentClip(recording);
-    recording.manifest.status = "completed";
-    await this.queueManifestWrite(recording);
+    await this.closeCapture(recording, "finish");
     this.active.delete(discordGuildId);
+    if (recording.failure) throw recording.failure;
   }
 
   async cancel(discordGuildId: string, sessionId: string): Promise<void> {
@@ -345,40 +377,91 @@ export class VoiceCaptureManager {
       resolve(recording.directory) !== join(this.recordingsRoot, sessionId)) {
       throw new Error("Active voice capture does not match the requested session.");
     }
-    recording.acceptingAudio = false;
-    clearInterval(recording.rotationTimer);
-    recording.connection.destroy();
-    await this.stopChunks(recording);
+    await this.closeCapture(recording, "cancel");
     this.active.delete(discordGuildId);
     await fs.rm(recording.directory, { recursive: true, force: true });
   }
 
-  async shutdown(): Promise<void> {
-    await Promise.all([...this.active.keys()].map(async (guildId) => {
-      const recording = this.requireActive(guildId);
-      if (recording.interruption) {
-        await recording.interruption;
-        this.active.delete(guildId);
-        return;
-      }
-      recording.acceptingAudio = false;
-      clearInterval(recording.rotationTimer);
-      recording.manifest.status = "finalizing";
-      recording.connection.destroy();
+  async cancelIfActive(discordGuildId: string, sessionId: string): Promise<boolean> {
+    if (!this.active.has(discordGuildId)) return false;
+    await this.cancel(discordGuildId, sessionId);
+    return true;
+  }
+
+  assertTransitionAllowed(
+    discordGuildId: string,
+    sessionId: string,
+    transition: "pause" | "resume" | "finish",
+  ): void {
+    const recording = this.active.get(discordGuildId);
+    if (recording === undefined || recording.manifest.sessionId !== sessionId) {
+      throw new CaptureClosureError("uncertain", sessionId, "no matching active capture is available");
+    }
+    if (recording.closeState === "failed" || recording.closeState === "uncertain" || recording.closeState === "closing") {
+      throw recording.closeError ?? new CaptureClosureError(
+        recording.closeState === "uncertain" ? "uncertain" : "failed",
+        sessionId,
+        `cannot ${transition} while capture closure is ${recording.closeState}`,
+      );
+    }
+    if (recording.failure !== undefined) throw recording.failure;
+    const safelyPaused = recording.closeState === "closed" && recording.closeMode === "pause";
+    if (
+      (transition === "pause" && recording.closeState !== "open" && !safelyPaused) ||
+      (transition === "resume" && !safelyPaused) ||
+      (transition === "finish" && recording.closeState !== "open" && !safelyPaused)
+    ) {
+      throw new CaptureClosureError("failed", sessionId, `capture state does not allow ${transition}`);
+    }
+  }
+
+  async shutdown(
+    runExclusive?: <T>(sessionId: string, action: () => Promise<T>) => Promise<T>,
+  ): Promise<CaptureShutdownReport> {
+    const entries = [...this.active.entries()]
+      .sort((left, right) => left[1].manifest.sessionId < right[1].manifest.sessionId ? -1 : 1);
+    const closedSessionIds: string[] = [];
+    const failedCaptures: CaptureShutdownIssue[] = [];
+    const uncertainCaptures: CaptureShutdownIssue[] = [];
+    for (const [guildId, recording] of entries) {
+      const close = async () => {
+        if (this.active.get(guildId) !== recording) return;
+        await this.closeCapture(recording, "shutdown");
+        if (this.active.get(guildId) === recording) this.active.delete(guildId);
+      };
       try {
-        await this.stopChunks(recording);
+        if (runExclusive === undefined) await close();
+        else await runExclusive(recording.manifest.sessionId, close);
+        closedSessionIds.push(recording.manifest.sessionId);
       } catch (error) {
-        this.logger.error({ error, sessionId: recording.manifest.sessionId }, "Cierre incompleto; se recuperará al iniciar");
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof CaptureClosureError && error.closureState === "failed") {
+          failedCaptures.push({ sessionId: recording.manifest.sessionId, message });
+        } else {
+          this.markUncertain(recording, error);
+          uncertainCaptures.push({ sessionId: recording.manifest.sessionId, message });
+        }
       }
-      await this.closeCurrentClip(recording);
-      recording.manifest.status = "interrupted";
-      recording.manifest.endedAt = new Date().toISOString();
-      await this.queueManifestWrite(recording);
-      this.active.delete(guildId);
-    }));
+    }
+    return { closedSessionIds, failedCaptures, uncertainCaptures };
+  }
+
+  private markUncertain(recording: ActiveRecording, cause: unknown): void {
+    if (recording.closeState === "failed" || recording.closeState === "uncertain") return;
+    const error = new CaptureClosureError(
+      "uncertain",
+      recording.manifest.sessionId,
+      "shutdown could not verify exclusive closure; audio was preserved",
+      { cause },
+    );
+    recording.closeState = "uncertain";
+    recording.closeError = error;
+    recording.acceptingAudio = false;
+    clearInterval(recording.rotationTimer);
   }
 
   private startChunk(recording: ActiveRecording, userId: string, speakerName: string): void {
+    if (recording.closeState !== "open" || !recording.acceptingAudio) return;
     const clip = recording.currentClip;
     if (clip === null) return;
     const subscription = recording.connection.receiver.subscribe(userId, {
@@ -408,7 +491,7 @@ export class VoiceCaptureManager {
           pcmDurationMs: Math.round(Math.max(0, stats.size - 44) / PCM_BYTES_PER_MS),
           timingSource: "receive_clock",
         });
-        await this.queueManifestWrite(recording);
+        await this.queueManifestWrite(recording, true);
       });
       pending.push(work);
       return work;
@@ -443,13 +526,14 @@ export class VoiceCaptureManager {
       closing = true;
       current.endedOffsetMs = this.sessionOffset(recording);
       void finalize(current).then(() => Promise.all(pending)).then(() => {
+        recording.chunks.delete(userId);
+        this.scheduleRotation(recording);
         resolveFinished();
       }).catch((error) => {
         this.logger.error({ error, userId }, "No se pudo cerrar un fragmento de audio");
-        rejectFinished(error);
-      }).finally(() => {
         recording.chunks.delete(userId);
         this.scheduleRotation(recording);
+        rejectFinished(error);
       });
     };
     decoder.once("end", closeChunk);
@@ -513,7 +597,7 @@ export class VoiceCaptureManager {
 
   private async maybeRotate(recording: ActiveRecording): Promise<void> {
     const clip = recording.currentClip;
-    if (!recording.acceptingAudio || clip === null || recording.rotationInProgress) return;
+    if (recording.closeState !== "open" || !recording.acceptingAudio || clip === null || recording.rotationInProgress) return;
     const elapsed = Date.now() - Date.parse(clip.startTimestamp);
     const decision = clipRotationDecision(elapsed, recording.chunks.size, this.rotation);
     if (decision === "none") return;
@@ -522,28 +606,32 @@ export class VoiceCaptureManager {
   }
 
   private scheduleRotation(recording: ActiveRecording): void {
-    void this.maybeRotate(recording).catch((error) => this.interrupt(recording, error));
+    if (recording.closeState !== "open" || recording.rotationTask !== undefined) return;
+    const rotation = this.maybeRotate(recording);
+    recording.rotationTask = rotation;
+    void rotation.catch((error) => this.interrupt(recording, error)).finally(() => {
+      if (recording.rotationTask === rotation) recording.rotationTask = undefined;
+    });
   }
 
   private interrupt(recording: ActiveRecording, cause: unknown): void {
-    if (recording.failure) return;
+    if (recording.closeState === "closing") {
+      recording.failure ??= cause instanceof Error ? cause : new Error(String(cause));
+      return;
+    }
+    if (recording.closeState !== "open" || recording.failure) return;
     recording.failure = cause instanceof Error ? cause : new Error(String(cause));
     recording.acceptingAudio = false;
-    clearInterval(recording.rotationTimer);
     recording.manifest.status = "interrupted";
     recording.manifest.endedAt = new Date().toISOString();
     recording.manifest.interruptionReason = recording.failure.message;
     this.logger.error({ error: recording.failure, sessionId: recording.manifest.sessionId }, "Captura interrumpida; se conserva el audio para recuperación");
-    recording.interruption = (async () => {
-      if (recording.connection.state.status !== VoiceConnectionStatus.Destroyed) recording.connection.destroy();
-      await this.stopChunks(recording).catch(() => undefined);
-      await this.closeCurrentClip(recording);
-      await this.queueManifestWrite(recording);
-    })();
+    recording.interruption = this.closeCapture(recording, "interrupt");
     void recording.interruption.catch((error) => this.logger.error({ error }, "No se pudo persistir la interrupción de captura"));
   }
 
   private async rotate(recording: ActiveRecording, reason: string): Promise<void> {
+    if (recording.closeState !== "open" || !recording.acceptingAudio) return;
     const oldClip = recording.currentClip;
     if (oldClip === null || recording.rotationInProgress) return;
     recording.rotationInProgress = true;
@@ -553,7 +641,7 @@ export class VoiceCaptureManager {
     try {
       await Promise.all([...recording.chunks.values()].map((chunk) => chunk.rotate(nextClip, boundaryOffsetMs)));
       closeClip(oldClip, boundaryMs);
-      await this.queueManifestWrite(recording);
+      await this.queueManifestWrite(recording, true);
       this.logger.info(
         { clipIndex: oldClip.clipIndex, durationSeconds: oldClip.durationSeconds, reason },
         `[Recording] clip_${String(oldClip.clipIndex).padStart(3, "0")} closed; clip_${String(nextClip.clipIndex).padStart(3, "0")} started`,
@@ -575,26 +663,181 @@ export class VoiceCaptureManager {
     return clip;
   }
 
-  private async closeCurrentClip(recording: ActiveRecording): Promise<void> {
+  private closeCurrentClip(recording: ActiveRecording): void {
     if (recording.currentClip === null) return;
     closeClip(recording.currentClip, Date.now());
     recording.currentClip = null;
-    await this.queueManifestWrite(recording);
+    void this.queueManifestWrite(recording, true).catch(() => undefined);
   }
 
-  private async stopChunks(recording: ActiveRecording): Promise<void> {
+  private async stopChunks(recording: ActiveRecording, deadline: number): Promise<void> {
     const chunks = [...recording.chunks.values()];
-    for (const chunk of chunks) chunk.stop();
-    if (chunks.length === 0) return;
+    const failures: unknown[] = [];
+    for (const chunk of chunks) {
+      try {
+        chunk.stop();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    const results = await this.waitForClosure(
+      recording,
+      Promise.allSettled(chunks.map((chunk) => chunk.finished)),
+      deadline,
+      "WAV writers",
+    );
+    for (const result of results) if (result.status === "rejected") failures.push(result.reason);
+    if (recording.chunks.size !== 0) {
+      throw new CaptureClosureError("uncertain", recording.manifest.sessionId, "WAV writers did not leave the active set");
+    }
+    if (failures.length > 0) throw new AggregateError(failures, "One or more WAV writers failed to close cleanly.");
+  }
+
+  private async closeCapture(recording: ActiveRecording, mode: CaptureCloseMode): Promise<void> {
+    if (recording.closeState === "closing" && recording.closeTask !== undefined) {
+      await recording.closeTask;
+      return this.closeCapture(recording, mode);
+    }
+    if (recording.closeState === "failed" || recording.closeState === "uncertain") {
+      throw recording.closeError ?? new CaptureClosureError(
+        recording.closeState,
+        recording.manifest.sessionId,
+        "a previous closure attempt did not confirm completion",
+      );
+    }
+    if (recording.closeState === "closed") {
+      if (recording.closeMode === "pause" && (mode === "finish" || mode === "shutdown")) {
+        recording.closeState = "open";
+        recording.closeMode = undefined;
+        recording.closeTask = undefined;
+      } else if (
+        mode === "cancel" || mode === "shutdown" || mode === recording.closeMode ||
+        (recording.closeMode === "interrupt" && mode === "finish")
+      ) {
+        return;
+      } else {
+        throw new CaptureClosureError("failed", recording.manifest.sessionId, `capture already closed as ${recording.closeMode}`);
+      }
+    }
+
+    recording.closeState = "closing";
+    recording.closeMode = mode;
+    recording.acceptingAudio = false;
+    clearInterval(recording.rotationTimer);
+    const task = this.performClosure(recording, mode);
+    recording.closeTask = task;
+    try {
+      await task;
+      recording.closeState = "closed";
+    } catch (error) {
+      const closureError = error instanceof CaptureClosureError
+        ? error
+        : new CaptureClosureError("failed", recording.manifest.sessionId, "closure work failed", { cause: error });
+      recording.closeState = closureError.closureState;
+      recording.closeError = closureError;
+      throw closureError;
+    }
+  }
+
+  private async performClosure(recording: ActiveRecording, mode: CaptureCloseMode): Promise<void> {
+    const timeoutMs = this.adapters.writerCloseTimeoutMs ?? CHUNK_FINALIZATION_TIMEOUT_MS;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new CaptureClosureError("failed", recording.manifest.sessionId, "invalid writer close timeout");
+    }
+    const deadline = Date.now() + timeoutMs;
+    if (mode === "finish" || mode === "shutdown") {
+      recording.manifest.status = "finalizing";
+      recording.manifest.endedAt = new Date().toISOString();
+      void this.queueManifestWrite(recording, true).catch(() => undefined);
+    } else if (mode === "interrupt") {
+      recording.manifest.status = "interrupted";
+      recording.manifest.endedAt ??= new Date().toISOString();
+      recording.manifest.interruptionReason ??= recording.failure?.message ?? "Capture interrupted";
+    }
+
+    if (mode !== "pause" && recording.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+      recording.connection.destroy();
+    }
+
+    const failures: unknown[] = [];
+    const rotation = recording.rotationTask;
+    if (rotation !== undefined) {
+      try {
+        await this.waitForClosure(recording, rotation, deadline, "clip rotation");
+      } catch (error) {
+        if (error instanceof CaptureClosureError && error.closureState === "uncertain") throw error;
+        failures.push(error);
+      } finally {
+        if (recording.rotationTask === rotation && !recording.rotationInProgress) {
+          recording.rotationTask = undefined;
+        }
+      }
+    }
+    try {
+      await this.stopChunks(recording, deadline);
+    } catch (error) {
+      if (error instanceof CaptureClosureError && error.closureState === "uncertain") throw error;
+      failures.push(error);
+    }
+    try {
+      await this.waitForClosure(recording, recording.manifestWrite, deadline, "manifest writes");
+    } catch (error) {
+      if (error instanceof CaptureClosureError && error.closureState === "uncertain") throw error;
+      failures.push(error);
+    }
+    if (recording.manifestWriteFailure !== undefined) failures.push(recording.manifestWriteFailure);
+    if (failures.length > 0) {
+      throw new CaptureClosureError(
+        "failed",
+        recording.manifest.sessionId,
+        "one or more writers, rotations, or manifest writes failed",
+        { cause: new AggregateError(failures) },
+      );
+    }
+
+    if (mode === "cancel") return;
+    this.closeCurrentClip(recording);
+    if (mode === "pause" && recording.failure === undefined) {
+      recording.manifest.status = "paused";
+    } else if (mode === "finish" && recording.failure === undefined) {
+      recording.manifest.status = "completed";
+    } else {
+      recording.manifest.status = "interrupted";
+      recording.manifest.endedAt ??= new Date().toISOString();
+      if (recording.failure !== undefined) recording.manifest.interruptionReason = recording.failure.message;
+    }
+    void this.queueManifestWrite(recording, true).catch(() => undefined);
+    await this.waitForClosure(recording, recording.manifestWrite, deadline, "final manifest write");
+    if (recording.manifestWriteFailure !== undefined) {
+      throw new CaptureClosureError("failed", recording.manifest.sessionId, "manifest write failed", {
+        cause: recording.manifestWriteFailure,
+      });
+    }
+    if (recording.chunks.size !== 0 || recording.rotationTask !== undefined) {
+      throw new CaptureClosureError("uncertain", recording.manifest.sessionId, "capture tasks remained active after closure");
+    }
+  }
+
+  private async waitForClosure<T>(
+    recording: ActiveRecording,
+    task: Promise<T>,
+    deadline: number,
+    description: string,
+  ): Promise<T> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new CaptureClosureError("uncertain", recording.manifest.sessionId, `timed out waiting for ${description}`);
+    }
     let timer: NodeJS.Timeout | undefined;
     try {
-      await Promise.race([
-        Promise.all(chunks.map((chunk) => chunk.finished)),
+      return await Promise.race([
+        task,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(
-            () => reject(new Error("La finalización de los fragmentos de audio superó 30 segundos.")),
-            CHUNK_FINALIZATION_TIMEOUT_MS,
-          );
+          timer = setTimeout(() => reject(new CaptureClosureError(
+            "uncertain",
+            recording.manifest.sessionId,
+            `timed out waiting for ${description}`,
+          )), remaining);
         }),
       ]);
     } finally {
@@ -602,15 +845,41 @@ export class VoiceCaptureManager {
     }
   }
 
+  private failClosure(recording: ActiveRecording, cause: unknown, message: string): CaptureClosureError {
+    const error = cause instanceof CaptureClosureError
+      ? cause
+      : new CaptureClosureError("failed", recording.manifest.sessionId, message, { cause });
+    recording.closeState = error.closureState;
+    recording.closeError = error;
+    recording.acceptingAudio = false;
+    clearInterval(recording.rotationTimer);
+    return error;
+  }
+
   private sessionOffset(recording: ActiveRecording, now = Date.now()): number {
     return Math.max(0, now - Date.parse(recording.manifest.startedAt));
   }
 
-  private queueManifestWrite(recording: ActiveRecording): Promise<void> {
+  private queueManifestWrite(recording: ActiveRecording, closeWork = false): Promise<void> {
+    if (recording.closeState === "closing" && !closeWork) {
+      return Promise.reject(new CaptureClosureError(
+        "failed",
+        recording.manifest.sessionId,
+        "new manifest writes are rejected while capture is closing",
+      ));
+    }
+    if (recording.closeState === "closed" || recording.closeState === "failed" || recording.closeState === "uncertain") {
+      return Promise.reject(recording.closeError ?? new CaptureClosureError(
+        recording.closeState === "closed" ? "failed" : recording.closeState,
+        recording.manifest.sessionId,
+        "manifest writes are not accepted after capture closure",
+      ));
+    }
     const snapshot = structuredClone(recording.manifest);
     recording.manifestWrite = recording.manifestWrite.catch(() => undefined).then(() =>
-      writeJsonAtomically(recording.manifestPath, snapshot),
+      (this.adapters.writeManifest ?? writeJsonAtomically)(recording.manifestPath, snapshot),
     );
+    void recording.manifestWrite.catch((error) => { recording.manifestWriteFailure ??= error; });
     return recording.manifestWrite;
   }
 

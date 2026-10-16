@@ -28,7 +28,7 @@ import {
   CampaignNotFoundError,
 } from "../sessions/session-repository.ts";
 import type { SessionService } from "../sessions/session-service.ts";
-import { finalizeSessionSafely } from "../sessions/session-finalization.ts";
+import type { SessionLifecycleCoordinator } from "../sessions/session-lifecycle-coordinator.ts";
 import {
   campaignDeleteButtonId,
   SessionDeletionError,
@@ -36,7 +36,6 @@ import {
   sessionReprocessButtonId,
   type SessionAdministration,
 } from "../sessions/session-administration.ts";
-import type { VoiceCaptureManager } from "../recording/voice-capture-manager.ts";
 import type { AudioRetentionManager } from "../storage/audio-retention-manager.ts";
 import { createTutorialReply } from "./dotty-tutorial.ts";
 
@@ -301,7 +300,7 @@ export async function handleDottyCommand(
   interaction: ChatInputCommandInteraction,
   campaigns: CampaignService,
   sessions: SessionService,
-  recordings: VoiceCaptureManager,
+  lifecycle: SessionLifecycleCoordinator,
   administration: SessionAdministration,
   diagnostics: DottyDiagnostics,
   audioRetention: AudioRetentionManager,
@@ -823,8 +822,7 @@ export async function handleDottyCommand(
     await handleSessionCommand(
       interaction,
       campaigns,
-      sessions,
-      recordings,
+      lifecycle,
       subcommand,
       interaction.guildId,
       interaction.guild,
@@ -928,8 +926,7 @@ function logChannelOption(option: import("discord.js").SlashCommandChannelOption
 async function handleSessionCommand(
   interaction: ChatInputCommandInteraction,
   campaigns: CampaignService,
-  sessions: SessionService,
-  recordings: VoiceCaptureManager,
+  lifecycle: SessionLifecycleCoordinator,
   subcommand: string,
   discordGuildId: string,
   guild: Guild,
@@ -973,32 +970,19 @@ async function handleSessionCommand(
               campaignName,
               destination,
             );
-      session = await sessions.start({
-            discordGuildId,
-            campaignName,
-            voiceChannelId: voiceChannel.id,
-            logChannelId,
-            occurredAt: new Date(),
-          });
-      try {
-        await recordings.start(guild, session);
-      } catch (error) {
-        await sessions.fail(discordGuildId, campaignName, new Date());
-        throw error;
-      }
-    } else if (subcommand === "pausar") {
-      session = await sessions.pause(discordGuildId, campaignName);
-      await recordings.pause(discordGuildId);
-    } else if (subcommand === "reanudar") {
-      session = await sessions.resume(discordGuildId, campaignName);
-      await recordings.resume(discordGuildId);
-    } else {
-      session = await finalizeSessionSafely(
-        sessions,
-        recordings,
+      session = await lifecycle.start(guild, {
         discordGuildId,
         campaignName,
-      );
+        voiceChannelId: voiceChannel.id,
+        logChannelId,
+        occurredAt: new Date(),
+      });
+    } else if (subcommand === "pausar") {
+      session = await lifecycle.pause(discordGuildId, campaignName);
+    } else if (subcommand === "reanudar") {
+      session = await lifecycle.resume(discordGuildId, campaignName);
+    } else {
+      session = await lifecycle.finish(discordGuildId, campaignName);
     }
 
     const action = {

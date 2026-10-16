@@ -29,6 +29,8 @@ import { SessionService } from "./sessions/session-service.ts";
 import { ReprocessIntentStore } from "./sessions/reprocess-intent-store.ts";
 import { ReprocessIntentEligibility } from "./sessions/reprocess-intent-eligibility.ts";
 import { SessionFileCoordinator } from "./sessions/session-file-coordinator.ts";
+import { CampaignFileCoordinator } from "./sessions/campaign-file-coordinator.ts";
+import { SessionLifecycleCoordinator } from "./sessions/session-lifecycle-coordinator.ts";
 import {
   handleCampaignDeleteButton,
   handleSessionDeleteButton,
@@ -45,6 +47,7 @@ import { NarrativeGenerator } from "./narrative/narrative-generator.ts";
 import { NarrativePublicationService } from "./narrative/narrative-publication.ts";
 import { NarrativeManager } from "./narrative/narrative-manager.ts";
 import { EditorialLearningService } from "./editorial/editorial-learning-service.ts";
+import { runShutdownActions } from "./shutdown.ts";
 
 const environment = readEnvironment();
 const logger = createLogger(environment.DOTTY_LOG_LEVEL);
@@ -55,8 +58,9 @@ const editorialLearning = new EditorialLearningService(database);
 await editorialLearning.ensureCriticalRules();
 const campaigns = new CampaignService(new PrismaCampaignRepository(database));
 const sessionRepository = new PrismaSessionRepository(database);
-const sessions = new SessionService(sessionRepository);
+const campaignCoordinator = new CampaignFileCoordinator(resolve(environment.DOTTY_DATA_DIR, "campaign-locks"));
 const sessionCoordinator = new SessionFileCoordinator(resolve(environment.DOTTY_DATA_DIR, "session-locks"));
+const sessions = new SessionService(sessionRepository, campaigns, campaignCoordinator, sessionCoordinator);
 const reprocessIntents = new ReprocessIntentStore(
   resolve(environment.DOTTY_DATA_DIR, "reprocess-intents"),
   sessionCoordinator,
@@ -75,6 +79,7 @@ const recordings = new VoiceCaptureManager(environment.DOTTY_DATA_DIR, logger, {
   maxMs: environment.RECORDING_CLIP_MAX_MINUTES * 60_000,
   overlapMs: environment.RECORDING_CLIP_OVERLAP_SECONDS * 1_000,
 });
+const sessionLifecycle = new SessionLifecycleCoordinator(sessions, sessionCoordinator, recordings);
 const transcriberSecret = resolveTranscriberSecret(
   environment.DOTTY_DATA_DIR,
   environment.TRANSCRIBER_SHARED_SECRET,
@@ -150,6 +155,7 @@ const sessionAdministration = new SessionAdministration(
   logger,
   reprocessIntents,
   sessionCoordinator,
+  campaignCoordinator,
 );
 const audioRetention = new AudioRetentionManager(
   campaigns,
@@ -195,7 +201,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         interaction,
         campaigns,
         sessions,
-        recordings,
+        sessionLifecycle,
         sessionAdministration,
         diagnostics,
         audioRetention,
@@ -315,7 +321,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       interaction,
       campaigns,
       sessions,
-      recordings,
+      sessionLifecycle,
       sessionAdministration,
       diagnostics,
       audioRetention,
@@ -352,15 +358,47 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   clearInterval(stopRequestTimer);
   logger.info({ signal }, "Cerrando Dotty");
-  transcriptions.stop();
-  transcriptionReports.stop();
-  publisher.stop();
-  audioRetention.stop();
-  await recordings.shutdown();
-  await automaticBackups.stop();
-  client.destroy();
-  await database.$disconnect();
-  await rm(botStatusPath, { force: true }).catch(() => undefined);
+  let lifecycleReport: Awaited<ReturnType<typeof sessionLifecycle.shutdown>> | undefined;
+  const failures = await runShutdownActions([
+    { resource: "transcriptions", run: () => transcriptions.stop() },
+    { resource: "transcriptionReports", run: () => transcriptionReports.stop() },
+    { resource: "publisher", run: () => publisher.stop() },
+    { resource: "audioRetention", run: () => audioRetention.stop() },
+    { resource: "automaticBackups", run: () => automaticBackups.stop() },
+    { resource: "sessionLifecycle", run: async () => { lifecycleReport = await sessionLifecycle.shutdown(); } },
+    { resource: "discord", run: () => client.destroy() },
+    { resource: "prisma", run: () => database.$disconnect() },
+  ], (failure, error) => {
+    logger.error({ signal, resource: failure.resource, error }, "No se pudo cerrar un recurso durante el apagado");
+  });
+
+  const clean = lifecycleReport?.clean === true && failures.length === 0;
+  if (clean) {
+    failures.push(...await runShutdownActions([
+      { resource: "botStatus", run: () => rm(botStatusPath, { force: true }) },
+    ], (failure, error) => {
+      logger.error({ signal, resource: failure.resource, error }, "No se pudo limpiar el estado del bot");
+    }));
+  }
+  if (!clean || failures.length > 0) {
+    const report = {
+      status: "shutdown-incomplete",
+      pid: process.pid,
+      signal,
+      completedAt: new Date().toISOString(),
+      lifecycle: lifecycleReport ?? null,
+      failures,
+    };
+    const reportWriteFailures = await runShutdownActions([
+      { resource: "botStatus", run: () => writeFile(botStatusPath, JSON.stringify(report, null, 2), "utf8") },
+    ], (failure, error) => {
+      logger.error({ signal, resource: failure.resource, error }, "No se pudo persistir el diagnóstico de apagado");
+    });
+    failures.push(...reportWriteFailures);
+    logger.error(report, "Apagado incompleto; alguna captura puede seguir activa o incierta");
+  } else {
+    logger.info({ signal, captures: lifecycleReport?.captures }, "Apagado limpio de Dotty");
+  }
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));

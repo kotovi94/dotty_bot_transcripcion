@@ -83,6 +83,7 @@ export interface SessionRepository {
     sequenceNumber: number,
   ): Promise<ManagedSession | null>;
   findById(sessionId: string): Promise<ManagedSession | null>;
+  findActive(discordGuildId: string, campaignName: string): Promise<ManagedSession | null>;
   deleteById(sessionId: string): Promise<void>;
   listByCampaignId(campaignId: string): Promise<readonly ManagedSession[]>;
 }
@@ -265,6 +266,26 @@ export class PrismaSessionRepository implements SessionRepository {
       include: {
         campaign: { include: { server: { select: { discordGuildId: true } } } },
       },
+    });
+    return row === null ? null : toManagedSession(row);
+  }
+
+  async findActive(
+    discordGuildId: string,
+    campaignName: string,
+  ): Promise<ManagedSession | null> {
+    const row = await this.database.session.findFirst({
+      where: {
+        campaign: {
+          normalizedName: normalizeCampaignName(campaignName),
+          server: { discordGuildId },
+        },
+        status: { in: [...activeStatuses] },
+      },
+      include: {
+        campaign: { include: { server: { select: { discordGuildId: true } } } },
+      },
+      orderBy: { sequenceNumber: "desc" },
     });
     return row === null ? null : toManagedSession(row);
   }

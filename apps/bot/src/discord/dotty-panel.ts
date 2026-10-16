@@ -27,13 +27,12 @@ import { ActiveRecordingBackupError, type BackupManager } from "../backup/backup
 import { InvalidStartingSessionNumberError } from "../campaigns/campaign-repository.ts";
 import { InvalidSessionTransitionError } from "../domain/session.ts";
 import { formatBytes, type DottyDiagnostics } from "../diagnostics/dotty-diagnostics.ts";
-import type { VoiceCaptureManager } from "../recording/voice-capture-manager.ts";
 import {
   ActiveSessionExistsError,
   ActiveSessionNotFoundError,
 } from "../sessions/session-repository.ts";
 import type { SessionService } from "../sessions/session-service.ts";
-import { finalizeSessionSafely } from "../sessions/session-finalization.ts";
+import type { SessionLifecycleCoordinator } from "../sessions/session-lifecycle-coordinator.ts";
 import {
   campaignDeleteButtonId,
   SessionDeletionError,
@@ -92,7 +91,7 @@ export async function handleDottyPanelInteraction(
   interaction: PanelComponentInteraction,
   campaigns: CampaignService,
   sessions: SessionService,
-  recordings: VoiceCaptureManager,
+  lifecycle: SessionLifecycleCoordinator,
   administration: SessionAdministration,
   diagnostics: DottyDiagnostics,
   audioRetention: AudioRetentionManager,
@@ -961,19 +960,13 @@ export async function handleDottyPanelInteraction(
       if (campaign.defaultVoiceChannelId === null) throw new PanelError("La campaña no tiene canal de voz configurado.");
       const voiceChannel = interaction.guild.channels.resolve(campaign.defaultVoiceChannelId);
       if (voiceChannel === null || !voiceChannel.isVoiceBased()) throw new PanelError("El canal de voz configurado ya no existe.");
-      let session = await sessions.start({
+      const session = await lifecycle.start(interaction.guild, {
         discordGuildId: interaction.guildId,
         campaignName: campaign.name,
         voiceChannelId: voiceChannel.id,
         logChannelId: campaign.defaultLogChannelId,
         occurredAt: new Date(),
       });
-      try {
-        await recordings.start(interaction.guild, session);
-      } catch (error) {
-        await sessions.fail(interaction.guildId, campaign.name, new Date());
-        throw error;
-      }
       await notifyVoiceChannel(interaction.guild, session.voiceChannelId, session.sequenceNumber, session.campaignName, "iniciar", interaction.user.globalName ?? interaction.user.username);
       await interaction.editReply({
         content: `🔴 **Grabación activa**\nSesión **${session.sequenceNumber}** de **${escapeMarkdown(session.campaignName)}**. Dotty entró al canal después de tu confirmación y está guardando las voces por hablante.`,
@@ -1012,18 +1005,11 @@ export async function handleDottyPanelInteraction(
     try {
       let session;
       if (operation === "pause") {
-        session = await sessions.pause(interaction.guildId, campaign.name);
-        await recordings.pause(interaction.guildId);
+        session = await lifecycle.pause(interaction.guildId, campaign.name);
       } else if (operation === "resume") {
-        session = await sessions.resume(interaction.guildId, campaign.name);
-        await recordings.resume(interaction.guildId);
+        session = await lifecycle.resume(interaction.guildId, campaign.name);
       } else {
-        session = await finalizeSessionSafely(
-          sessions,
-          recordings,
-          interaction.guildId,
-          campaign.name,
-        );
+        session = await lifecycle.finish(interaction.guildId, campaign.name);
       }
       const actionName = operation === "pause" ? "pausada" : operation === "resume" ? "reanudada" : "finalizada";
       const voiceAction = operation === "pause" ? "pausar" : operation === "resume" ? "reanudar" : "finalizar";
