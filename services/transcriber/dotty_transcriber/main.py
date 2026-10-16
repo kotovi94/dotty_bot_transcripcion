@@ -96,6 +96,7 @@ def health() -> dict[str, Any]:
         "configured_device": settings.device,
         "active_device": engine.active_device,
         "compute_type": settings.compute_type,
+        **engine.runtime_status,
         "diagnostics_enabled": settings.diagnostics_enabled,
         "queue": store.metrics(),
         "work": store.current_work(),
@@ -231,7 +232,12 @@ def retry_session_jobs(session_id: str) -> dict[str, Any]:
 
 def _worker_loop() -> None:
     while not stop_event.is_set():
-        job = store.claim_next()
+        try:
+            job = store.claim_next()
+        except Exception:
+            logger.exception("Could not claim job; worker will retry")
+            stop_event.wait(1)
+            continue
         if job is None:
             stop_event.wait(0.5)
             continue

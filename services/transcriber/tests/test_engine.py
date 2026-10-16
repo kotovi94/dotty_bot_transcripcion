@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 
 from dotty_transcriber.config import Settings
@@ -38,6 +39,49 @@ class EmptyVadModel:
         )
 
 
+class CudaFailureModel:
+    def transcribe(self, _audio: str, **_options):
+        raise RuntimeError("CUDA out of memory")
+
+
+def test_cuda_failure_retries_once_on_cpu(tmp_path: Path, monkeypatch) -> None:
+    settings = Settings(
+        data_dir=tmp_path,
+        recordings_dir=tmp_path,
+        database_path=tmp_path / "queue.db",
+        secret="secret",
+        model="small",
+        device="cuda",
+        compute_type="float16",
+        language="es",
+        initial_prompt="",
+        beam_size=5,
+        patience=1.0,
+        repetition_penalty=1.05,
+        no_repeat_ngram_size=0,
+        vad_threshold=0.45,
+        vad_min_silence_ms=400,
+        vad_speech_pad_ms=250,
+    )
+    engine = WhisperEngine(settings)
+    gpu_model = CudaFailureModel()
+    cpu_model = FakeModel()
+    monkeypatch.setattr(
+        engine,
+        "_get_model",
+        lambda: gpu_model if engine.active_device == "cuda" else cpu_model,
+    )
+
+    result = engine.transcribe(tmp_path / "audio.wav", "es")
+
+    assert engine.active_device == "cpu"
+    assert engine._active_compute_type == "int8"
+    assert engine.runtime_status["fallback_reason"] == "CUDA out of memory"
+    assert engine.runtime_status["active_compute_type"] == "int8"
+    assert result["device"] == "cpu"
+    assert result["status"] == "transcribed"
+
+
 def test_quality_options_and_confidence_are_preserved(tmp_path: Path) -> None:
     settings = Settings(
         data_dir=tmp_path,
@@ -68,6 +112,12 @@ def test_quality_options_and_confidence_are_preserved(tmp_path: Path) -> None:
         lambda ratio, processed, duration: progress.append((ratio, processed, duration)),
     )
     assert model.options["beam_size"] == 5
+    assert model.options["vad_filter"] is True
+    disabled_model = FakeModel()
+    disabled_engine = WhisperEngine(replace(settings, vad_enabled=False))
+    assert disabled_engine.runtime_status["model_loaded"] is False
+    disabled_engine._transcribe_with_model(disabled_model, tmp_path / "audio.wav", "es", "", "")
+    assert disabled_model.options["vad_filter"] is False
     assert model.options["no_repeat_ngram_size"] == 0
     assert model.options["hotwords"] == "Barovia"
     assert model.options["vad_parameters"]["min_silence_duration_ms"] == 400

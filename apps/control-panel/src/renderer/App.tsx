@@ -122,6 +122,16 @@ function getNarrativeStatusLabel(state: TranscriptSummary["narrativeState"]) {
   }
 }
 
+function stageStatusLabel(status: NonNullable<TranscriptSummary["processing"]>["stages"][number]["status"]): string {
+  if (status === "completed") return "COMPLETADO";
+  if (status === "running") return "PROCESANDO";
+  if (status === "pending") return "PENDIENTE";
+  if (status === "warning") return "AVISO";
+  if (status === "blocked") return "BLOQUEADO";
+  if (status === "error") return "ERROR";
+  return "DESCONOCIDO";
+}
+
 export function App() {
   const [page, setPage] = useState<Page>("dashboard");
   const [state, setState] = useState<DottyState>(initialState);
@@ -132,7 +142,8 @@ export function App() {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [readerMode, setReaderMode] = useState<"narrative" | "transcript">("narrative");
-  const [narrativeBusy, setNarrativeBusy] = useState<"generate" | "publish" | null>(null);
+  const [narrativeBusy, setNarrativeBusy] = useState<"generate" | "verify" | "approve" | "publish" | null>(null);
+  const [reviewSceneBusy, setReviewSceneBusy] = useState<string | null>(null);
   const [logKind, setLogKind] = useState<LogKind>("bot");
   const [logs, setLogs] = useState("Cargando actividad...");
   const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
@@ -221,6 +232,24 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [page, logKind]);
 
+  useEffect(() => {
+    if (!selected?.sessionId || (page !== "processing" && narrativeBusy !== "generate")) return;
+    let active = true;
+    const refreshProcessing = async () => {
+      const processing = await window.dotty.getSessionProcessingStatus(selected.sessionId);
+      if (!active) return;
+      setSelected((current) => current?.sessionId === selected.sessionId
+        ? { ...current, processing }
+        : current);
+      setSessionDetails((current) => current?.id === selected.sessionId
+        ? { ...current, processing }
+        : current);
+    };
+    void refreshProcessing();
+    const timer = window.setInterval(() => void refreshProcessing(), 2_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [page, narrativeBusy, selected?.sessionId]);
+
   const runOperation = async (kind: Exclude<OperationKind, "disconnect">) => {
     if (state.operation) return;
     if ((kind === "stop" || kind === "restart") && (working || state.bot.connected) && !window.confirm("Hay una sesión o servicio activo. ¿Quieres continuar?")) return;
@@ -260,12 +289,13 @@ export function App() {
       ? await window.dotty.saveNarrative(selected.sessionId, draft)
       : await window.dotty.saveTranscript(selected.sessionId, draft);
     if (result.saved) {
-      setSelected(readerMode === "narrative"
-        ? { ...selected, narrativeContent: draft, updatedAt: new Date().toISOString() }
-        : { ...selected, content: draft, updatedAt: new Date().toISOString() });
+      const refreshed = await window.dotty.readTranscript(selected.sessionId);
+      setSelected(refreshed);
+      setDraft(readerMode === "narrative" ? refreshed.narrativeContent ?? "" : refreshed.content);
       setEditing(false);
       const backupNotice = result.backupName ? ` Respaldo: ${result.backupName}` : "";
-      setNotice(`${readerMode === "narrative" ? "Guion" : "Transcripción"} guardado.${backupNotice}`);
+      const warningNotice = result.warning ? ` ${result.warning}` : "";
+      setNotice(`${readerMode === "narrative" ? "Guion" : "Transcripción"} guardado.${backupNotice}${warningNotice}`);
       void loadTranscripts();
     }
   };
@@ -349,12 +379,58 @@ export function App() {
     }
   };
 
+  const verifyNarrative = async () => {
+    if (!selected || narrativeBusy !== null) return;
+    setNarrativeBusy("verify");
+    try {
+      const result = await window.dotty.verifyNarrative(selected.sessionId);
+      setNotice(result.message);
+      const detail = await window.dotty.readTranscript(selected.sessionId);
+      setSelected(detail);
+      await loadTranscripts();
+    } finally {
+      setNarrativeBusy(null);
+    }
+  };
+
+  const approveNarrativeScene = async (sceneId: string) => {
+    if (!selected || narrativeBusy !== null || reviewSceneBusy !== null) return;
+    setReviewSceneBusy(sceneId);
+    try {
+      const result = await window.dotty.approveNarrativeScene(selected.sessionId, sceneId);
+      setNotice(result.message);
+      const detail = await window.dotty.readTranscript(selected.sessionId);
+      setSelected(detail);
+      await loadTranscripts();
+    } finally {
+      setReviewSceneBusy(null);
+    }
+  };
+
+  const approveNarrative = async () => {
+    if (!selected || narrativeBusy !== null) return;
+    setNarrativeBusy("approve");
+    try {
+      const result = await window.dotty.approveNarrative(selected.sessionId);
+      setNotice(result.message);
+      const detail = await window.dotty.readTranscript(selected.sessionId);
+      setSelected(detail);
+      await loadTranscripts();
+    } finally {
+      setNarrativeBusy(null);
+    }
+  };
+
   const publishNarrative = async () => {
     if (!selected || narrativeBusy !== null) return;
     setNarrativeBusy("publish");
     try {
       if (selected.narrativeContent === null) {
         setNotice("No hay un guion guardado. Genera o pega el guion y guárdalo antes de publicar.");
+        return;
+      }
+      if (selected.narrativeReview?.state !== "APPROVED") {
+        setNotice("El guion debe completar la revisión y aprobación antes de publicarse.");
         return;
       }
 
@@ -403,8 +479,10 @@ export function App() {
 
   const speakers = useMemo(() => {
     if (!selected) return [];
-    const matches = Array.from(selected.content.matchAll(/(?:\n\s*\d{1,2}:\d{2}:\d{2}\s*\n\s*)([A-Z0-9 _.-]+)/g));
-    return Array.from(new Set(matches.map((match) => match[1]?.trim()).filter((value): value is string => Boolean(value)))).sort();
+    const sectionStart = selected.content.search(/^##\s+Transcripci[oó]n\s*$/imu);
+    const section = sectionStart >= 0 ? selected.content.slice(sectionStart) : selected.content;
+    const matches = Array.from(section.matchAll(/^\[\d{1,2}:\d{2}:\d{2}\]\s+\*\*(.+?):\*\*/gmu));
+    return Array.from(new Set(matches.map((match) => match[1]?.trim()).filter((value): value is string => Boolean(value)))).sort((left, right) => left.localeCompare(right, "es"));
   }, [selected]);
 
   const fullyReady = state.bot.connected && state.transcriber.available;
@@ -418,6 +496,16 @@ export function App() {
     : systemOperational ? "OPERATIVO" : partiallyReady ? "ERROR" : "APAGADO";
 
   const processingStages = useMemo(() => {
+    if (selected?.processing?.stages?.length) {
+      return selected.processing.stages.map((stage) => ({
+        label: stage.label,
+        status: stageStatusLabel(stage.status),
+        details: stage.details,
+        errors: stage.errors ?? 0,
+        warnings: stage.warnings ?? 0,
+        artifact: stage.artifact,
+      }));
+    }
     const transcribeStatus = working ? "PROCESANDO" : state.transcriber.available ? "COMPLETADO" : "PENDIENTE";
     const logStatus = selected && selected.content ? "COMPLETADO" : transcripts.some((entry) => Boolean(entry.title)) ? "PENDIENTE" : "DESCONOCIDO";
     const narrativeStatus = selected ? (() => {
@@ -429,11 +517,11 @@ export function App() {
     const publicationStatus = selected?.canOpenDiscord ? "COMPLETADO" : selected?.narrativeContent ? "PENDIENTE" : "DESCONOCIDO";
 
     return [
-      { label: "Grabación", status: state.bot.connected ? "COMPLETADO" : state.bot.running ? "PROCESANDO" : "DESCONOCIDO" },
-      { label: "Transcripción", status: transcribeStatus },
-      { label: "Bitácora", status: logStatus },
-      { label: "Narrativa", status: narrativeStatus },
-      { label: "Publicación", status: publicationStatus },
+      { label: "Grabación", status: state.bot.connected ? "COMPLETADO" : state.bot.running ? "PROCESANDO" : "DESCONOCIDO", details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
+      { label: "Transcripción", status: transcribeStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
+      { label: "Bitácora", status: logStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
+      { label: "Narrativa", status: narrativeStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
+      { label: "Publicación", status: publicationStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
     ];
   }, [selected, state.bot.connected, state.bot.running, state.transcriber.available, transcripts, working]);
 
@@ -586,7 +674,11 @@ export function App() {
                 onDecideEditorialRule={(ruleId, decision, scope) => void decideEditorialRule(ruleId, decision, scope)}
                 onRollbackEditorialRule={(ruleId) => void rollbackEditorialRule(ruleId)}
                 onGenerateNarrative={() => void generateNarrative()}
+                onVerifyNarrative={() => void verifyNarrative()}
+                onApproveNarrative={() => void approveNarrative()}
+                onApproveNarrativeScene={(sceneId) => void approveNarrativeScene(sceneId)}
                 onPublishNarrative={() => void publishNarrative()}
+                reviewSceneBusy={reviewSceneBusy}
                 onSwitchReaderMode={switchReaderMode}
                 onSaveCurrentDocument={() => void saveCurrentDocument()}
                 onOpenTranscriptFolder={() => void window.dotty.openTranscriptFolder(selected?.sessionId ?? "")}
@@ -604,14 +696,15 @@ export function App() {
 
         {page === "processing" && (
           <section className="page-content processing-page">
-            <div className="panel compact-panel process-summary">
-              <div className="panel-heading"><div><span className="eyebrow">ESTADO DEL FLUJO</span><h3>Procesamiento en curso</h3></div><Activity size={18} /></div>
-              <div className="stage-list dense">
-                {processingStages.map((stage) => (
-                  <div key={stage.label} className="stage-row">
-                    <span>{stage.label}</span>
-                    <strong className={`badge ${stage.status.toLowerCase()}`}>{stage.status}</strong>
-                  </div>
+            <div className="panel compact-panel process-summary process-map">
+              <div className="panel-heading"><div><span className="eyebrow">MAPA OPERATIVO</span><h3>{selected?.title ?? "Procesamiento del bot"}</h3><p>{selected ? `Sesión ${selected.sequenceNumber ?? selected.sessionId} · ${processingStages.length} controles visibles` : "Selecciona una sesión para inspeccionar cada etapa con datos reales."}</p></div><Activity size={18} /></div>
+              <div className="process-stage-grid">
+                {processingStages.map((stage, index) => (
+                  <article key={stage.label} className={`process-stage-card ${stage.status.toLowerCase()}`}>
+                    <div className="process-stage-index">{String(index + 1).padStart(2, "0")}</div>
+                    <div className="process-stage-copy"><strong>{stage.label}</strong><span>{stage.details}</span>{stage.artifact && <code>{stage.artifact}</code>}</div>
+                    <div className="process-stage-state"><strong className={`badge ${stage.status.toLowerCase()}`}>{stage.status}</strong>{(stage.errors > 0 || stage.warnings > 0) && <small>{stage.errors > 0 ? `${stage.errors} errores` : ""}{stage.errors > 0 && stage.warnings > 0 ? " · " : ""}{stage.warnings > 0 ? `${stage.warnings} avisos` : ""}</small>}</div>
+                  </article>
                 ))}
               </div>
             </div>

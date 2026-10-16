@@ -486,7 +486,7 @@ export async function handleDottyPanelInteraction(
         : [
             "**Respaldos locales más recientes**",
             ...available.map((backup) =>
-              `• ${backup.createdAt.toLocaleString("es-CL")} · **${formatBytes(backup.totalBytes)}** · ${backup.fileCount} archivos`,
+              `• ${backup.scope === "session" ? "Sesión" : backup.scope === "archives" ? "Archivo histórico" : "Completo"} · ${backup.createdAt.toLocaleString("es-CL")} · **${formatBytes(backup.totalBytes)}** · ${backup.fileCount} archivos`,
             ),
             "",
             "Los respaldos se conservan hasta que los elimines manualmente desde el computador.",
@@ -1356,12 +1356,16 @@ async function createSessionManagementMessage(
   narratives: NarrativeManager,
   requestedBy: string,
 ): Promise<InteractionUpdateOptions> {
-  const narrative = await narratives.status(session.id);
+  const [narrative, review] = await Promise.all([
+    narratives.status(session.id),
+    narratives.reviewStatus(session.id),
+  ]);
+  const approved = review?.state === "APPROVED";
   const narrativeLabel = {
     missing: "sin generar",
     queued: "en cola",
     generating: `${narrative.phase} · ${Math.round(narrative.progress * 100)} %`,
-    ready: "listo para revisar o publicar",
+    ready: approved ? "aprobado y listo para publicar" : "generado; pendiente de revisión en la aplicación",
     failed: `con error${narrative.error ? `: ${narrative.error}` : ""}`,
   }[narrative.state];
   const generating = narrative.state === "queued" || narrative.state === "generating";
@@ -1378,7 +1382,7 @@ async function createSessionManagementMessage(
       .setLabel("Publicar")
       .setEmoji("📤")
       .setStyle(ButtonStyle.Success)
-      .setDisabled(narrative.state !== "ready"),
+      .setDisabled(narrative.state !== "ready" || !approved),
     new ButtonBuilder()
       .setCustomId(`${panelPrefix}session-correct:${session.id}`)
       .setLabel("Corregir texto")

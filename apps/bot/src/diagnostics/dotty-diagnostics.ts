@@ -237,8 +237,15 @@ export class DottyDiagnostics {
   ): Promise<void> {
     const directory = join(this.dataDirectory, ".diagnostics", safeSessionId);
     await fs.mkdir(directory, { recursive: true });
+    const activityPath = join(directory, "activity.bot.jsonl");
+    const rotatedPath = `${activityPath}.1`;
+    const activitySize = await fs.stat(activityPath).then((value) => value.size).catch(() => 0);
+    if (activitySize >= 25 * 1024 * 1024) {
+      await fs.rm(rotatedPath, { force: true });
+      await fs.rename(activityPath, rotatedPath);
+    }
     await fs.appendFile(
-      join(directory, "activity.bot.jsonl"),
+      activityPath,
       `${JSON.stringify(event)}\n`,
       "utf8",
     );

@@ -6,6 +6,7 @@ import { readEnvironment } from "../src/config/environment.ts";
 import { NarrativeGenerator } from "../src/narrative/narrative-generator.ts";
 import { NarrativePublicationService } from "../src/narrative/narrative-publication.ts";
 import {
+  approveNarrativeScene,
   approveNarrativeReview,
   readNarrativeReview,
   refreshNarrativeReview,
@@ -14,7 +15,7 @@ import { resolveTranscriberSecret } from "../src/transcription/transcription-dis
 import { createDatabaseClient } from "../src/database/client.ts";
 import { EditorialLearningService } from "../src/editorial/editorial-learning-service.ts";
 
-const [action, sessionId] = process.argv.slice(2);
+const [action, sessionId, sceneId] = process.argv.slice(2);
 if (!/^[a-zA-Z0-9_-]+$/u.test(sessionId ?? "")) {
   throw new Error("Indica una sesión válida.");
 }
@@ -60,6 +61,9 @@ if (action === "generate") {
 } else if (action === "approve") {
   const review = await approveNarrativeReview(exportDirectory, sessionId!, "panel/manual");
   console.log(JSON.stringify({ ok: true, action, sessionId, review }));
+} else if (action === "approve-scene") {
+  const review = await approveNarrativeScene(exportDirectory, sessionId!, sceneId ?? "", "panel/manual");
+  console.log(JSON.stringify({ ok: true, action, sessionId, sceneId, review }));
 } else if (action === "publish") {
   const review = await readNarrativeReview(exportDirectory, sessionId!);
   if (review === null) {
@@ -69,7 +73,7 @@ if (action === "generate") {
     throw new Error("El guion tiene escenas o errores editoriales pendientes. Revísalos antes de publicar.");
   }
   if (review.state === "READY_FOR_REVIEW") {
-    await approveNarrativeReview(exportDirectory, sessionId!, "publish-action");
+    throw new Error("El guion está verificado, pero todavía necesita una aprobación humana explícita antes de publicarse.");
   }
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -82,5 +86,5 @@ if (action === "generate") {
     client.destroy();
   }
 } else {
-  throw new Error("Acción narrativa desconocida. Usa generate, status, review, approve o publish.");
+  throw new Error("Acción narrativa desconocida. Usa generate, status, review, approve-scene, approve o publish.");
 }

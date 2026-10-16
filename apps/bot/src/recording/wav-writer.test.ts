@@ -1,20 +1,18 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { finished } from "node:stream/promises";
 import { describe, it } from "node:test";
 
 import { WavFileWriter } from "./wav-writer.ts";
 
-const databaseUrl = process.env.TEST_DATABASE_URL;
-if (databaseUrl === undefined) {
-  throw new Error("TEST_DATABASE_URL must be set by the test runner.");
-}
-const databasePath = databaseUrl.slice("file:".length);
-
 describe("WavFileWriter", () => {
-  it("writes a valid PCM WAV header with final sizes", async () => {
-    const path = join(dirname(databasePath), "sample.wav");
+  it("writes a valid PCM WAV header with final sizes", async (test) => {
+    const directory = await mkdtemp(join(tmpdir(), "dotty-wav-test-"));
+    test.after(() => rm(directory, { recursive: true, force: true }));
+    const path = join(directory, "sample.wav");
     const pcm = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]);
     const writer = new WavFileWriter(path);
     writer.end(pcm);

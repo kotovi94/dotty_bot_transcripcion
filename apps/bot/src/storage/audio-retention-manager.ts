@@ -58,10 +58,7 @@ export class AudioRetentionManager {
       exportBytes += await directorySize(join(this.exportsRoot, manifest.sessionId));
       if (
         wavFiles.length > 0 &&
-        campaign?.audioRetentionDays !== null &&
-        campaign?.audioRetentionDays !== undefined &&
-        isExpired(manifest, campaign.audioRetentionDays) &&
-        (await exists(join(entry.directory, ".transcription-published")))
+        await isEligibleForCleanup(manifest, campaign?.audioRetentionDays, entry.directory)
       ) {
         eligibleForCleanup += 1;
       }
@@ -85,12 +82,7 @@ export class AudioRetentionManager {
         const manifest = await readManifest(entry.directory);
         if (manifest?.status !== "completed" || manifest.endedAt === null) continue;
         const campaign = await this.campaigns.findById(manifest.campaignId);
-        if (
-          campaign?.audioRetentionDays === null ||
-          campaign?.audioRetentionDays === undefined ||
-          !isExpired(manifest, campaign.audioRetentionDays) ||
-          !(await exists(join(entry.directory, ".transcription-published")))
-        ) continue;
+        if (!(await isEligibleForCleanup(manifest, campaign?.audioRetentionDays, entry.directory))) continue;
         const files = await findWavFiles(entry.directory);
         let removed = 0;
         for (const file of files) {
@@ -146,6 +138,19 @@ async function findWavFiles(directory: string): Promise<string[]> {
     }
   }
   return files;
+}
+
+async function isEligibleForCleanup(
+  manifest: RecordingManifest,
+  retentionDays: number | null | undefined,
+  directory: string,
+): Promise<boolean> {
+  // Prepared transcripts still need their source audio for human review.
+  return manifest.status === "completed"
+    && retentionDays !== null
+    && retentionDays !== undefined
+    && isExpired(manifest, retentionDays)
+    && await exists(join(directory, ".transcription-published"));
 }
 
 function isExpired(manifest: RecordingManifest, retentionDays: number): boolean {

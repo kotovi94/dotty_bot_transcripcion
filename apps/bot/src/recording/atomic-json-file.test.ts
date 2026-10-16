@@ -1,18 +1,15 @@
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { writeJsonAtomically } from "./atomic-json-file.ts";
 
-const databaseUrl = process.env.TEST_DATABASE_URL;
-if (databaseUrl === undefined) {
-  throw new Error("TEST_DATABASE_URL must be set by the test runner.");
-}
-const testDirectory = dirname(databaseUrl.slice("file:".length));
-
 describe("writeJsonAtomically", () => {
-  it("replaces an existing manifest on Windows", async () => {
+  it("replaces an existing manifest on Windows", async (test) => {
+    const testDirectory = await fs.mkdtemp(join(tmpdir(), "dotty-atomic-test-"));
+    test.after(() => fs.rm(testDirectory, { recursive: true, force: true }));
     const path = join(testDirectory, "manifest-overwrite.json");
 
     await writeJsonAtomically(path, { status: "recording", chunks: [] });

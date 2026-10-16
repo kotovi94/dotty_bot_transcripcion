@@ -11,7 +11,14 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -35,18 +42,26 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: Test desktop file editing without Electron or services
+        run: node --import tsx --test apps/control-panel/scripts/transcript-edits.test.ts
+
+      - name: Test direct shutdown guard on isolated Windows fixtures
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tools/tests/stop-dotty.test.ps1
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Validate transcription diagnostics Python
+      - name: Validate lightweight transcription tests without model downloads
         run: |
-          python -m pip install pytest==8.4.1
+          python -m pip install pytest==8.4.1 python-dotenv==1.1.1
           python -m py_compile \
             services/transcriber/dotty_transcriber/config.py \
             services/transcriber/dotty_transcriber/error_codes.py \
             services/transcriber/dotty_transcriber/diagnostics.py \
             services/transcriber/dotty_transcriber/main.py
           cd services/transcriber
-          python -m pytest tests/test_diagnostics.py -q
+          python -m pytest tests -q -p no:cacheprovider

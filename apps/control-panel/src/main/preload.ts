@@ -37,6 +37,12 @@ const api: DottyDesktopApi = {
     ipcRenderer.invoke("dotty:save-narrative", sessionId, content),
   generateNarrative: (sessionId: string) =>
     ipcRenderer.invoke("dotty:generate-narrative", sessionId),
+  verifyNarrative: (sessionId: string) =>
+    ipcRenderer.invoke("dotty:verify-narrative", sessionId),
+  approveNarrativeScene: (sessionId: string, sceneId: string) =>
+    ipcRenderer.invoke("dotty:approve-narrative-scene", sessionId, sceneId),
+  approveNarrative: (sessionId: string) =>
+    ipcRenderer.invoke("dotty:approve-narrative", sessionId),
   publishNarrative: (sessionId: string) =>
     ipcRenderer.invoke("dotty:publish-narrative", sessionId),
   openTranscript: (sessionId: string) =>

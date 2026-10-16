@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "backup": "tsx scripts/backup.ts",
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "commands:deploy": "tsx src/discord/deploy-commands.ts",
@@ -26,6 +27,7 @@
     "@discordjs/voice": "^0.19.2",
     "@prisma/adapter-better-sqlite3": "^7.9.1",
     "@prisma/client": "^7.9.1",
+    "better-sqlite3": "^12.6.0",
     "discord.js": "^14.27.0",
     "dotenv": "^17.4.2",
     "opusscript": "0.0.8",

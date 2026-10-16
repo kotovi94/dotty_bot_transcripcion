@@ -58,6 +58,8 @@ interface TimedRecognizedWord extends RecognizedWord {
 
 export interface TranscriptLine {
   readonly utteranceId: string;
+  readonly sourceClipIndex?: number;
+  readonly sourceOverlapMs?: number;
   readonly startMs: number;
   readonly endMs: number;
   readonly speakerUserId: string;
@@ -138,9 +140,11 @@ export class TranscriptionPublisher {
   private async publishDirectory(directory: string): Promise<void> {
     const publishedMarker = join(directory, ".transcription-published");
     const readyMarker = join(directory, ".transcription-ready");
+    const failedMarker = join(directory, ".transcription-failed");
     if (
       await exists(publishedMarker) ||
       await exists(readyMarker) ||
+      await exists(failedMarker) ||
       !(await exists(join(directory, ".transcription-enqueued")))
     ) return;
     const manifest = JSON.parse(
@@ -190,7 +194,7 @@ export class TranscriptionPublisher {
         }
         await writeAtomically(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
         await writeAtomically(
-          join(directory, ".transcription-failed"),
+          failedMarker,
           `${new Date().toISOString()} - Transcription failed: ${failedJobs.map((j) => j.error).join("; ")}\n`,
         );
         return;
@@ -245,6 +249,11 @@ export class TranscriptionPublisher {
     const compiledLines = payload.jobs
       .flatMap((job) =>
         (job.result?.segments ?? []).flatMap((segment, segmentIndex) => {
+          const sourceChunk = manifest.chunks.find((chunk) => job.id === `${manifest.sessionId}:${chunk.id}`);
+          const provenance = sourceChunk === undefined ? {} : {
+            sourceClipIndex: sourceChunk.clipIndex ?? 1,
+            sourceOverlapMs: sourceChunk.overlapMs ?? 0,
+          };
           const clippingDuration = Math.max(0, segment.end_ms - segment.start_ms);
           const assessment = classifyTranscriptSegment({
             text: segment.text,
@@ -281,6 +290,7 @@ export class TranscriptionPublisher {
             );
             return [{
               utteranceId: `${job.id}:${segmentIndex}:unintelligible`,
+              ...provenance,
               startMs: job.start_offset_ms + segment.start_ms,
               endMs: job.start_offset_ms + segment.end_ms,
               speakerUserId: job.speaker_user_id,
@@ -301,6 +311,7 @@ export class TranscriptionPublisher {
           }
           return splitTranscriptionSegment(segment).map((sentence) => ({
             utteranceId: `${job.id}:${segmentIndex}`,
+            ...provenance,
             startMs: job.start_offset_ms + sentence.start_ms,
             endMs: job.start_offset_ms + sentence.end_ms,
             speakerUserId: job.speaker_user_id,
@@ -472,6 +483,8 @@ export function deduplicateOverlapLines(lines: readonly TranscriptLine[]): Trans
     const normalized = normalizeForDeduplication(line.text);
     const duplicate = result.slice(-12).some((previous) => {
       if (previous.speakerUserId !== line.speakerUserId) return false;
+      if (!(line.sourceOverlapMs && previous.sourceClipIndex !== undefined
+        && line.sourceClipIndex !== undefined && previous.sourceClipIndex !== line.sourceClipIndex)) return false;
       const overlapsInTime = line.startMs <= previous.endMs + 250 && previous.startMs <= line.endMs + 250;
       return overlapsInTime && normalized !== "" && normalized === normalizeForDeduplication(previous.text);
     });

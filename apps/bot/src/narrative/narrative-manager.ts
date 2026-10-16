@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 
 import { NarrativeGenerator, type NarrativeStatus } from "./narrative-generator.ts";
 import { NarrativePublicationService } from "./narrative-publication.ts";
+import type { NarrativeReviewManifest } from "./narrative-review.ts";
 
 export class NarrativeManager {
   private readonly active = new Map<string, Promise<void>>();
@@ -14,6 +15,10 @@ export class NarrativeManager {
 
   status(sessionId: string): Promise<NarrativeStatus> {
     return this.generator.getStatus(sessionId);
+  }
+
+  reviewStatus(sessionId: string): Promise<NarrativeReviewManifest | null> {
+    return this.generator.getReviewStatus(sessionId);
   }
 
   async start(sessionId: string): Promise<{ started: boolean; status: NarrativeStatus }> {

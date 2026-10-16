@@ -21,7 +21,12 @@ export class WavFileWriter extends Writable {
   ) {
     super();
     this.fileDescriptor = openSync(path, "wx");
-    writeSync(this.fileDescriptor, createWavHeader(0, sampleRate, channels, bitsPerSample));
+    try {
+      writeSync(this.fileDescriptor, createWavHeader(0, sampleRate, channels, bitsPerSample));
+    } catch (error) {
+      this.closeFile();
+      throw error;
+    }
   }
 
   override _write(

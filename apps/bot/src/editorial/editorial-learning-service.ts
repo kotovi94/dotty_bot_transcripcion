@@ -107,7 +107,7 @@ export class EditorialLearningService {
     await this.ensureCriticalRules();
     const session = await this.database.session.findUnique({ where: { id: sessionId } });
     if (!session) throw new Error("La sesión no existe.");
-    const records = await this.database.editorialRule.findMany({ where: { OR: [{ scope: "global" }, { campaignId: session.campaignId }, { sessionId }] }, orderBy: [{ status: "asc" }, { priority: "desc" }, { updatedAt: "desc" }] });
+    const records = await this.database.editorialRule.findMany({ where: { OR: [{ scope: "global" }, { scope: "campaign", campaignId: session.campaignId }, { scope: "session", sessionId, campaignId: session.campaignId }] }, orderBy: [{ status: "asc" }, { priority: "desc" }, { updatedAt: "desc" }] });
     const feedback = await this.database.editorialFeedback.findMany({ where: { campaignId: session.campaignId }, select: { diffJson: true } });
     const allChanges = feedback.flatMap((item) => safeDiff(item.diffJson).changes);
     const categoryCounts: Record<string, number> = {};
@@ -121,10 +121,22 @@ export class EditorialLearningService {
 
   async retrieve(context: RetrievalContext): Promise<{ rules: EditorialRuleView[]; examples: Array<{ input: string; output: string; category: string }>; prompt: string }> {
     await this.ensureCriticalRules();
-    const records = await this.database.editorialRule.findMany({ where: { status: "approved", OR: [{ scope: "global" }, { ownerId: context.ownerId ?? "__none__" }, { campaignId: context.campaignId }, { sessionId: context.sessionId }] } });
+    const records = await this.database.editorialRule.findMany({ where: { status: "approved", OR: [
+      { scope: "global" },
+      ...(context.ownerId ? [{ scope: "user", ownerId: context.ownerId }] : []),
+      { scope: "campaign", campaignId: context.campaignId },
+      { scope: "session", campaignId: context.campaignId, sessionId: context.sessionId },
+    ] } });
     const query = normalizeEditorialText(context.query ?? "");
     const ranked = records.map((rule) => ({ rule, rank: scopeWeight(rule.scope) + rule.priority + relevance(query, rule.normalizedText) * 100 })).sort((a, b) => b.rank - a.rank).slice(0, EDITORIAL_CONFIG.retrieval.maxRules).map(({ rule }) => rule);
-    const examples = await this.database.editorialExample.findMany({ where: { approved: true, OR: [{ scope: "global" }, { ownerId: context.ownerId ?? "__none__" }, { campaignId: context.campaignId }] }, orderBy: { updatedAt: "desc" }, take: EDITORIAL_CONFIG.retrieval.maxExamples });
+    // Derive examples from currently applicable approved rules. Legacy example
+    // rows have no rule/session relationship and cannot support safe revocation.
+    const feedbackIds = [...new Set(records.map((rule) => metadata(rule.metadataJson).feedbackId)
+      .filter((id): id is string => typeof id === "string"))];
+    const feedback = await this.database.editorialFeedback.findMany({ where: { id: { in: feedbackIds } } });
+    const examples = feedback.filter((item) => item.generatedVersion !== item.editedVersion)
+      .slice(0, EDITORIAL_CONFIG.retrieval.maxExamples)
+      .map((item) => ({ input: item.generatedVersion.slice(0, 8_000), output: item.editedVersion.slice(0, 8_000), category: records.find((rule) => metadata(rule.metadataJson).feedbackId === item.id)?.category ?? "editorial" }));
     const prompt = renderPrompt(ranked.map(view), examples);
     await this.recordMetric("rules_retrieved", ranked.length, context.campaignId, context.sessionId, { examples: examples.length }).catch(() => undefined);
     return { rules: ranked.map(view), examples: examples.map((example) => ({ input: example.input, output: example.output, category: example.category })), prompt };
@@ -145,8 +157,8 @@ export class EditorialLearningService {
     if (!exists) await this.database.editorialExample.create({ data: { scope: rule.scope, ownerId: rule.ownerId, campaignId: rule.campaignId, category: rule.category, input: feedback.generatedVersion.slice(0, 8_000), output: feedback.editedVersion.slice(0, 8_000), normalizedText, approved: true } });
   }
 
-  private async deprecateConflicts(approved: { id: string; category: string; normalizedText: string; campaignId: string | null; scope: string }): Promise<void> {
-    const others = await this.database.editorialRule.findMany({ where: { id: { not: approved.id }, status: "approved", category: approved.category, OR: [{ scope: "global" }, { campaignId: approved.campaignId ?? "__none__" }] } });
+  private async deprecateConflicts(approved: { id: string; category: string; normalizedText: string; campaignId: string | null; scope: string; sessionId: string | null; ownerId: string | null }): Promise<void> {
+    const others = await this.database.editorialRule.findMany({ where: { id: { not: approved.id }, status: "approved", category: approved.category, scope: approved.scope, campaignId: approved.campaignId, sessionId: approved.sessionId, ownerId: approved.ownerId } });
     for (const other of others) {
       if (!conflicts(approved.normalizedText, other.normalizedText)) continue;
       const updated = await this.database.editorialRule.update({ where: { id: other.id }, data: { status: "deprecated", version: other.version + 1 } });

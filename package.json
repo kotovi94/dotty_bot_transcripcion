@@ -9,6 +9,7 @@
     "packages/*"
   ],
   "scripts": {
+    "backup": "npm run backup -w @dotty/bot",
     "dev": "npm run dev -w @dotty/bot",
     "test": "npm run test -w @dotty/bot",
     "typecheck": "npm run typecheck --workspaces --if-present",

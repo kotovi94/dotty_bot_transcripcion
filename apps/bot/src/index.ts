@@ -1,11 +1,12 @@
 import { resolve } from "node:path";
-import { rm, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 
 import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 
 import { PrismaCampaignRepository } from "./campaigns/campaign-repository.ts";
 import { CampaignService } from "./campaigns/campaign-service.ts";
 import { BackupManager } from "./backup/backup-manager.ts";
+import { AutomaticBackups } from "./backup/automatic-backups.ts";
 import { readEnvironment } from "./config/environment.ts";
 import { createDatabaseClient } from "./database/client.ts";
 import { DottyDiagnostics } from "./diagnostics/dotty-diagnostics.ts";
@@ -145,7 +146,9 @@ const audioRetention = new AudioRetentionManager(
   resolve(environment.DOTTY_DATA_DIR, "exports"),
   logger,
 );
-const backups = new BackupManager(environment.DOTTY_DATA_DIR);
+const backups = new BackupManager(environment.DOTTY_DATA_DIR, environment.DATABASE_URL);
+const automaticBackups = new AutomaticBackups(environment.DOTTY_DATA_DIR, backups, logger);
+automaticBackups.start();
 transcriptions.start();
 if (environment.DOTTY_DIAGNOSTICS_ENABLED) transcriptionReports.start();
 audioRetention.start();
@@ -319,15 +322,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 let shuttingDown = false;
+const stopRequestPath = resolve(environment.DOTTY_DATA_DIR, "dotty.stop-request.json");
+const stopRequestTimer = setInterval(() => {
+  void readFile(stopRequestPath, "utf8").then(async (content) => {
+    const request = JSON.parse(content) as { pid?: number };
+    if (request.pid !== process.pid) return;
+    await shutdown("local-stop-request");
+    await rm(stopRequestPath, { force: true });
+  }).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") logger.error({ error }, "No se pudo completar la solicitud de apagado");
+  });
+}, 500);
+stopRequestTimer.unref();
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(stopRequestTimer);
   logger.info({ signal }, "Cerrando Dotty");
   transcriptions.stop();
   transcriptionReports.stop();
   publisher.stop();
   audioRetention.stop();
   await recordings.shutdown();
+  await automaticBackups.stop();
   client.destroy();
   await database.$disconnect();
   await rm(botStatusPath, { force: true }).catch(() => undefined);

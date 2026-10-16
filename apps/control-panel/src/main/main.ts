@@ -192,6 +192,15 @@ function registerIpc(): void {
   ipcMain.handle("dotty:generate-narrative", (_event, sessionId: string) =>
     supervisor.generateNarrative(String(sessionId)),
   );
+  ipcMain.handle("dotty:verify-narrative", (_event, sessionId: string) =>
+    supervisor.verifyNarrative(String(sessionId)),
+  );
+  ipcMain.handle("dotty:approve-narrative-scene", (_event, sessionId: string, sceneId: string) =>
+    supervisor.approveNarrativeScene(String(sessionId), String(sceneId)),
+  );
+  ipcMain.handle("dotty:approve-narrative", (_event, sessionId: string) =>
+    supervisor.approveNarrative(String(sessionId)),
+  );
   ipcMain.handle("dotty:publish-narrative", (_event, sessionId: string) =>
     supervisor.publishNarrative(String(sessionId)),
   );

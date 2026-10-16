@@ -24,12 +24,18 @@ function line(id: string, startMs: number, endMs: number, text: string): Transcr
 describe("overlap transcript compilation", () => {
   it("removes the repeated boundary sentence and keeps global timestamps", () => {
     const result = deduplicateOverlapLines([
-      line("old", 3_599_000, 3_601_200, "Hay algo detrás de esa puerta."),
-      line("overlap", 3_599_050, 3_601_250, "Hay algo detras de esa puerta"),
+      { ...line("old", 3_599_000, 3_601_200, "Hay algo detrás de esa puerta."), sourceClipIndex: 1, sourceOverlapMs: 0 },
+      { ...line("overlap", 3_599_050, 3_601_250, "Hay algo detras de esa puerta"), sourceClipIndex: 2, sourceOverlapMs: 1_500 },
       line("next", 3_604_000, 3_605_000, "Entonces la derribo."),
     ]);
     assert.equal(result.length, 2);
     assert.deepEqual(result.map((item) => item.startMs), [3_599_000, 3_604_000]);
+  });
+
+  it("preserves nearby legitimate repetitions within one clip and legacy text without provenance", () => {
+    const repeated = [line("one", 1_000, 1_100, "Sí."), line("two", 1_200, 1_300, "Sí.")];
+    assert.equal(deduplicateOverlapLines(repeated).length, 2);
+    assert.equal(deduplicateOverlapLines(repeated.map((item) => ({ ...item, sourceClipIndex: 1, sourceOverlapMs: 1_500 }))).length, 2);
   });
 
   it("does not remove a repeated phrase at a different time", () => {

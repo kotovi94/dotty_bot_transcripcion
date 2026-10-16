@@ -40,6 +40,8 @@ export interface AudioChunkManifest {
   readonly bytes: number;
   readonly sha256: string;
   readonly overlapMs: number;
+  readonly pcmDurationMs?: number;
+  readonly timingSource?: "receive_clock" | "file_birthtime_estimate";
 }
 
 export interface RecordingManifest {
@@ -54,6 +56,8 @@ export interface RecordingManifest {
   readonly startedAt: string;
   status: "recording" | "paused" | "finalizing" | "completed" | "interrupted";
   endedAt: string | null;
+  interruptionReason?: string;
+  recoveredAt?: string;
   clips: RecordingClip[];
   chunks: AudioChunkManifest[];
   publication?: {
@@ -88,6 +92,8 @@ interface ActiveRecording {
   rotationInProgress: boolean;
   manifestWrite: Promise<void>;
   rotationTimer: NodeJS.Timeout;
+  failure?: Error;
+  interruption?: Promise<void>;
 }
 
 interface SegmentWriter {
@@ -116,6 +122,11 @@ export class VoiceCaptureManager {
       maxMs: 65 * 60_000,
       overlapMs: 1_500,
     },
+    private readonly adapters: {
+      connect?: typeof joinVoiceChannel;
+      decoder?: () => prism.opus.Decoder;
+      writer?: (path: string) => WavFileWriter;
+    } = {},
   ) {
     if (!(rotation.searchStartMs <= rotation.targetMs && rotation.targetMs <= rotation.maxMs)) {
       throw new Error("Recording clip thresholds must satisfy searchStart <= target <= max.");
@@ -138,7 +149,7 @@ export class VoiceCaptureManager {
       } catch {
         continue;
       }
-      if (!["recording", "paused", "finalizing"].includes(manifest.status)) continue;
+      if (!["recording", "paused", "finalizing", "interrupted"].includes(manifest.status)) continue;
 
       for (const filePath of await findWavFiles(directory)) {
         const stats = await fs.stat(filePath);
@@ -176,17 +187,22 @@ export class VoiceCaptureManager {
             bytes: stats.size,
             sha256: await hashFile(filePath),
             overlapMs: 0,
+            pcmDurationMs: durationMs,
+            timingSource: "file_birthtime_estimate",
           });
         }
       }
       const now = new Date().toISOString();
+      const endedAt = manifest.endedAt ?? now;
       for (const clip of manifest.clips ?? []) {
         if (clip.transcriptionStatus === "recording") clip.transcriptionStatus = "pending";
-        clip.endTimestamp ??= now;
+        clip.endTimestamp ??= endedAt;
         clip.durationSeconds ??= Math.max(0, (Date.parse(clip.endTimestamp) - Date.parse(clip.startTimestamp)) / 1_000);
       }
       manifest.status = "completed";
-      manifest.endedAt = now;
+      manifest.endedAt = endedAt;
+      manifest.interruptionReason ??= "Recording interrupted before normal finalization";
+      manifest.recoveredAt = now;
       await writeJsonAtomically(manifestPath, manifest);
       recovered.push(manifest.sessionId);
     }
@@ -221,7 +237,7 @@ export class VoiceCaptureManager {
     };
     await writeJsonAtomically(manifestPath, manifest);
 
-    const connection = joinVoiceChannel({
+    const connection = (this.adapters.connect ?? joinVoiceChannel)({
       channelId: session.voiceChannelId,
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator as DiscordGatewayAdapterCreator,
@@ -249,10 +265,18 @@ export class VoiceCaptureManager {
       currentClip: firstClip,
       rotationInProgress: false,
       manifestWrite: Promise.resolve(),
-      rotationTimer: setInterval(() => void this.maybeRotate(recording), 1_000),
+      rotationTimer: setInterval(() => this.scheduleRotation(recording), 1_000),
     });
     recording.rotationTimer.unref();
     this.active.set(guild.id, recording);
+    connection.on("error", (error) => this.interrupt(recording, error));
+    connection.on("stateChange", (_previous, next) => {
+      if (!recording.acceptingAudio && recording.manifest.status !== "paused") return;
+      if (next.status === VoiceConnectionStatus.Disconnected || next.status === VoiceConnectionStatus.Destroyed) {
+        // Stop conservatively: automatic reconnection cannot restore missing audio.
+        this.interrupt(recording, new Error(`Voice connection ${next.status}; recording interrupted`));
+      }
+    });
     connection.receiver.speaking.on("start", (userId) => {
       if (!recording.acceptingAudio || recording.chunks.has(userId)) return;
       const member = guild.members.cache.get(userId);
@@ -262,6 +286,7 @@ export class VoiceCaptureManager {
         this.startChunk(recording, userId, member?.displayName ?? userId);
       } catch (error) {
         this.logger.error({ error, userId }, "No se pudo iniciar el flujo de audio");
+        this.interrupt(recording, error);
       }
     });
     connection.receiver.speaking.on("end", (userId) => {
@@ -274,6 +299,7 @@ export class VoiceCaptureManager {
     const recording = this.requireActive(discordGuildId);
     recording.acceptingAudio = false;
     await this.stopChunks(recording);
+    if (recording.failure) throw recording.failure;
     await this.closeCurrentClip(recording);
     recording.manifest.status = "paused";
     await this.queueManifestWrite(recording);
@@ -281,6 +307,7 @@ export class VoiceCaptureManager {
 
   async resume(discordGuildId: string): Promise<void> {
     const recording = this.requireActive(discordGuildId);
+    if (recording.failure) throw recording.failure;
     this.openNextClip(recording, Date.now());
     recording.acceptingAudio = true;
     recording.manifest.status = "recording";
@@ -289,6 +316,11 @@ export class VoiceCaptureManager {
 
   async finish(discordGuildId: string): Promise<void> {
     const recording = this.requireActive(discordGuildId);
+    if (recording.interruption) {
+      await recording.interruption;
+      this.active.delete(discordGuildId);
+      throw recording.failure;
+    }
     this.logger.info({ sessionId: recording.manifest.sessionId }, "[Session] Finalizing");
     recording.acceptingAudio = false;
     clearInterval(recording.rotationTimer);
@@ -300,6 +332,7 @@ export class VoiceCaptureManager {
     recording.connection.destroy();
     await finalizingWrite;
     await this.stopChunks(recording);
+    if (recording.failure) throw recording.failure;
     await this.closeCurrentClip(recording);
     recording.manifest.status = "completed";
     await this.queueManifestWrite(recording);
@@ -319,8 +352,14 @@ export class VoiceCaptureManager {
   async shutdown(): Promise<void> {
     await Promise.all([...this.active.keys()].map(async (guildId) => {
       const recording = this.requireActive(guildId);
+      if (recording.interruption) {
+        await recording.interruption;
+        this.active.delete(guildId);
+        return;
+      }
       recording.acceptingAudio = false;
       clearInterval(recording.rotationTimer);
+      recording.manifest.status = "finalizing";
       recording.connection.destroy();
       try {
         await this.stopChunks(recording);
@@ -341,7 +380,7 @@ export class VoiceCaptureManager {
     const subscription = recording.connection.receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 1_000 },
     });
-    const decoder = new prism.opus.Decoder({ rate: 48_000, channels: 1, frameSize: 960 });
+    const decoder = this.adapters.decoder?.() ?? new prism.opus.Decoder({ rate: 48_000, channels: 1, frameSize: 960 });
     const pending: Promise<void>[] = [];
     const tail: Buffer[] = [];
     let tailBytes = 0;
@@ -362,6 +401,8 @@ export class VoiceCaptureManager {
           bytes: stats.size,
           sha256: await hashFile(segment.filePath),
           overlapMs: segment.overlapMs,
+          pcmDurationMs: Math.round(Math.max(0, stats.size - 44) / PCM_BYTES_PER_MS),
+          timingSource: "receive_clock",
         });
         await this.queueManifestWrite(recording);
       });
@@ -380,7 +421,7 @@ export class VoiceCaptureManager {
         while (tailBytes > maximum && tail.length > 0) tailBytes -= tail.shift()?.length ?? 0;
       }
     });
-    subscription.on("error", (error) => this.logger.warn({ error, userId }, "Fallo en flujo de voz de Discord"));
+    subscription.on("error", (error) => this.interrupt(recording, error));
     subscription.pipe(decoder);
 
     let resolveFinished!: () => void;
@@ -404,7 +445,7 @@ export class VoiceCaptureManager {
         rejectFinished(error);
       }).finally(() => {
         recording.chunks.delete(userId);
-        void this.maybeRotate(recording);
+        this.scheduleRotation(recording);
       });
     };
     decoder.once("end", closeChunk);
@@ -412,6 +453,7 @@ export class VoiceCaptureManager {
     decoder.once("close", closeChunk);
     decoder.on("error", (error) => {
       this.logger.warn({ error, userId }, "Fallo al decodificar audio Opus");
+      this.interrupt(recording, error);
       closeChunk();
     });
 
@@ -452,13 +494,15 @@ export class VoiceCaptureManager {
     const directory = join(recording.directory, clip.audioDirectory);
     mkdirSync(directory, { recursive: true });
     const filePath = join(directory, `${userId}-${id}.wav`);
+    const writer = this.adapters.writer?.(filePath) ?? new WavFileWriter(filePath);
+    writer.on("error", (error) => this.interrupt(recording, error));
     return {
       id,
       clipIndex: clip.clipIndex,
       filePath,
       startedOffsetMs,
       overlapMs,
-      writer: new WavFileWriter(filePath),
+      writer,
       endedOffsetMs: startedOffsetMs,
     };
   }
@@ -471,6 +515,28 @@ export class VoiceCaptureManager {
     if (decision === "none") return;
     if (decision === "silence") this.logger.info({ clipIndex: clip.clipIndex }, "[Recording] silence detected near rotation threshold");
     await this.rotate(recording, decision === "forced" ? "maximum duration" : "silence");
+  }
+
+  private scheduleRotation(recording: ActiveRecording): void {
+    void this.maybeRotate(recording).catch((error) => this.interrupt(recording, error));
+  }
+
+  private interrupt(recording: ActiveRecording, cause: unknown): void {
+    if (recording.failure) return;
+    recording.failure = cause instanceof Error ? cause : new Error(String(cause));
+    recording.acceptingAudio = false;
+    clearInterval(recording.rotationTimer);
+    recording.manifest.status = "interrupted";
+    recording.manifest.endedAt = new Date().toISOString();
+    recording.manifest.interruptionReason = recording.failure.message;
+    this.logger.error({ error: recording.failure, sessionId: recording.manifest.sessionId }, "Captura interrumpida; se conserva el audio para recuperación");
+    recording.interruption = (async () => {
+      if (recording.connection.state.status !== VoiceConnectionStatus.Destroyed) recording.connection.destroy();
+      await this.stopChunks(recording).catch(() => undefined);
+      await this.closeCurrentClip(recording);
+      await this.queueManifestWrite(recording);
+    })();
+    void recording.interruption.catch((error) => this.logger.error({ error }, "No se pudo persistir la interrupción de captura"));
   }
 
   private async rotate(recording: ActiveRecording, reason: string): Promise<void> {

@@ -100,6 +100,14 @@ class JobStore:
             connection.execute(
                 "ALTER TABLE transcription_job ADD COLUMN claim_token TEXT"
             )
+        # Exhausted jobs must be visible/retryable, including queues written by
+        # older versions that left an exhausted job in queued after a crash.
+        connection.execute(
+            "UPDATE transcription_job SET status='failed', phase='failed', claim_token=NULL, "
+            "error='Interrupted after maximum attempts; manual retry required', updated_at=? "
+            "WHERE status IN ('processing','queued') AND attempts >= max_attempts",
+            (_now(),),
+        )
         connection.execute(
             "UPDATE transcription_job SET status='queued', phase='queued', progress=0, "
             "processed_audio_seconds=0, claim_token=NULL, updated_at=? WHERE status='processing'",

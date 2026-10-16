@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, promises as fs } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import Database from "better-sqlite3";
 
 interface BackupFileEntry {
   readonly path: string;
@@ -13,6 +14,8 @@ interface BackupManifest {
   readonly createdAt: string;
   readonly files: readonly BackupFileEntry[];
   readonly totalBytes: number;
+  readonly sessionId?: string;
+  readonly reason?: string;
 }
 
 export interface BackupSummary {
@@ -21,6 +24,7 @@ export interface BackupSummary {
   readonly createdAt: Date;
   readonly fileCount: number;
   readonly totalBytes: number;
+  readonly scope?: "full" | "session" | "archives";
 }
 
 export class ActiveRecordingBackupError extends Error {
@@ -36,14 +40,17 @@ export class BackupManager {
   private readonly exportsRoot: string;
   private readonly databasePath: string;
 
-  constructor(private readonly dataRoot: string) {
+  constructor(private readonly dataRoot: string, databaseUrl?: string) {
     this.backupsRoot = join(dataRoot, "backups");
     this.recordingsRoot = join(dataRoot, "recordings");
     this.exportsRoot = join(dataRoot, "exports");
-    this.databasePath = join(dataRoot, "dotty.db");
+    if (databaseUrl !== undefined && !databaseUrl.startsWith("file:")) throw new Error("Backup requires a SQLite file URL");
+    this.databasePath = databaseUrl === undefined ? join(dataRoot, "dotty.db") : resolve(databaseUrl.slice(5).split("?")[0]!);
   }
 
-  async create(): Promise<BackupSummary> {
+  async create(options: { sessionId?: string; reason?: string } = {}): Promise<BackupSummary> {
+    if (options.sessionId !== undefined && (!/^[a-zA-Z0-9_-]+$/.test(options.sessionId))) throw new Error("Invalid backup session ID");
+    if (options.sessionId !== undefined) await fs.access(join(this.recordingsRoot, options.sessionId, "manifest.json"));
     if (await this.hasActiveRecording()) throw new ActiveRecordingBackupError();
 
     await fs.mkdir(this.backupsRoot, { recursive: true });
@@ -55,9 +62,22 @@ export class BackupManager {
 
     await fs.mkdir(temporaryPath, { recursive: false });
     try {
-      await this.copyIfPresent(this.databasePath, join(temporaryPath, "dotty.db"));
-      await this.copyIfPresent(this.recordingsRoot, join(temporaryPath, "recordings"));
-      await this.copyIfPresent(this.exportsRoot, join(temporaryPath, "exports"));
+      await this.snapshotDatabase(this.databasePath, join(temporaryPath, "dotty.db"));
+      const queuePath = join(this.dataRoot, "transcriber.db");
+      if (await fs.access(queuePath).then(() => true).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return false;
+      })) await this.snapshotDatabase(queuePath, join(temporaryPath, "transcriber.db"));
+      for (const folder of ["recordings", "exports"]) {
+        const suffix = options.sessionId === undefined ? folder : join(folder, options.sessionId);
+        await this.copyIfPresent(join(this.dataRoot, suffix), join(temporaryPath, suffix));
+      }
+      const diagnosticsFolder = options.sessionId === undefined ? ".diagnostics" : join(".diagnostics", options.sessionId);
+      for (const folder of ["adaptive-vocabulary", "users", "campaigns", diagnosticsFolder, "editorial-requests",
+        ...(options.sessionId === undefined ? ["merge-backups", "recovery-backups", "repair-backups", "republication-backups"] : [])]) {
+        await this.copyIfPresent(join(this.dataRoot, folder), join(temporaryPath, folder));
+      }
+      if (await this.hasActiveRecording()) throw new ActiveRecordingBackupError();
 
       const files = await collectFiles(temporaryPath);
       const manifest: BackupManifest = {
@@ -65,6 +85,7 @@ export class BackupManager {
         createdAt: now.toISOString(),
         files,
         totalBytes: files.reduce((total, file) => total + file.bytes, 0),
+        ...options,
       };
       await fs.writeFile(
         join(temporaryPath, "backup-manifest.json"),
@@ -115,6 +136,8 @@ export class BackupManager {
     let totalBytes = 0;
     for (const expected of manifest.files) {
       const absolutePath = join(directory, ...expected.path.split("/"));
+      const within = relative(directory, absolutePath);
+      if (within.startsWith("..") || isAbsolute(within)) return { valid: false, checkedFiles: totalBytes };
       try {
         const info = await fs.stat(absolutePath);
         if (!info.isFile() || info.size !== expected.bytes) return { valid: false, checkedFiles: totalBytes };
@@ -131,9 +154,22 @@ export class BackupManager {
 
   private async copyIfPresent(source: string, destination: string): Promise<void> {
     try {
-      await fs.cp(source, destination, { recursive: true, force: false });
+      await fs.lstat(source);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return;
+    }
+    // A disappearing nested file must fail the copy, never silently validate a partial tree.
+    await fs.mkdir(resolve(destination, ".."), { recursive: true });
+    await fs.cp(source, destination, { recursive: true, force: false });
+  }
+
+  private async snapshotDatabase(source: string, destination: string): Promise<void> {
+    const database = new Database(source, { readonly: true, fileMustExist: true });
+    try {
+      await database.backup(destination);
+    } finally {
+      database.close();
     }
   }
 
@@ -196,5 +232,6 @@ function toSummary(name: string, path: string, manifest: BackupManifest): Backup
     createdAt: new Date(manifest.createdAt),
     fileCount: manifest.files.length,
     totalBytes: manifest.totalBytes,
+    scope: manifest.reason === "historical-archive-supplement" ? "archives" : manifest.sessionId ? "session" : "full",
   };
 }

@@ -71,7 +71,12 @@ class DiagnosticReporter:
 
             directory = self._session_directory(session_id)
             directory.mkdir(parents=True, exist_ok=True)
-            with (directory / "activity.transcriber.jsonl").open("a", encoding="utf-8", newline="\n") as stream:
+            activity_path = directory / "activity.transcriber.jsonl"
+            if activity_path.exists() and activity_path.stat().st_size >= 25 * 1024 * 1024:
+                rotated_path = activity_path.with_suffix(activity_path.suffix + ".1")
+                rotated_path.unlink(missing_ok=True)
+                activity_path.replace(rotated_path)
+            with activity_path.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
                 stream.write("\n")
                 stream.flush()

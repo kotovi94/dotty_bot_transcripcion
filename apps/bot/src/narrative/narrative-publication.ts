@@ -41,7 +41,29 @@ export class NarrativePublicationService {
     sessionId: string,
     discordGuildId?: string,
   ): Promise<{ threadId?: string; messageCount: number; updated: boolean }> {
+    const directory = this.sessionDirectory(sessionId);
+    const lockPath = join(directory, ".publication.lock");
+    let lock: fs.FileHandle;
+    try { lock = await fs.open(lockPath, "wx"); }
+    catch { throw new Error("Hay otra publicación en curso o un cierre pendiente de revisar para esta sesión."); }
+    try {
+      await lock.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+      return await this.publishLocked(sessionId, discordGuildId);
+    } finally {
+      await lock.close();
+      await fs.rm(lockPath, { force: true });
+    }
+  }
+
+  private async publishLocked(
+    sessionId: string,
+    discordGuildId?: string,
+  ): Promise<{ threadId?: string; messageCount: number; updated: boolean }> {
     const manifestPath = join(this.sessionDirectory(sessionId), "manifest.json");
+    const attemptPath = join(this.sessionDirectory(sessionId), ".publication-attempt.json");
+    if (await fs.access(attemptPath).then(() => true).catch(() => false)) {
+      throw new Error("La publicación anterior quedó interrumpida. Comprueba los mensajes y el registro de publicación antes de reintentar para evitar duplicados.");
+    }
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as RecordingManifest;
     if (discordGuildId !== undefined && manifest.discordGuildId !== discordGuildId) {
       throw new Error("La sesión no pertenece a este servidor.");
@@ -61,8 +83,8 @@ export class NarrativePublicationService {
     } catch {
       // La aprobación editorial explícita es la barrera definitiva de publicación.
     }
-    if (narrativeStatus.state !== undefined && narrativeStatus.state !== "ready") {
-      throw new Error("El guion no superó la revisión de calidad y no puede publicarse.");
+    if (isNarrativeGenerationActive(narrativeStatus.state)) {
+      throw new Error("El guion se está regenerando. Espera a que termine antes de publicarlo.");
     }
 
     try {
@@ -75,17 +97,22 @@ export class NarrativePublicationService {
 
     const rawScript = await fs.readFile(scriptPath, "utf8");
     const script = rawScript.trim();
+    const scriptAttachment = Buffer.from(rawScript, "utf8");
     if (script.length < 100) throw new Error("El guion todavía no está listo para publicarse.");
     await assertNarrativeApproved(exportDirectory, sessionId, rawScript);
 
     const chunks = splitMessage(script, 1_900);
     const existing = manifest.publication;
+    // Discord and local disk cannot commit atomically. Preserve an intent before
+    // the first mutation and fail closed after an ambiguous network outcome.
+    await writeFileAtomically(attemptPath, JSON.stringify({ sessionId, startedAt: new Date().toISOString(), state: "pending", publication: existing ?? null }));
 
     if (existing !== undefined) {
-      const updated = await this.updateExisting(existing, chunks, scriptPath).catch(() => null);
+      const updated = await this.updateExisting(existing, chunks, scriptAttachment, sessionId);
       if (updated !== null) {
         manifest.publication = { ...existing, messageIds: updated };
         await this.persistPublication(manifestPath, manifest);
+        await fs.rm(attemptPath);
         return {
           ...(existing.threadId === undefined ? {} : { threadId: existing.threadId }),
           messageCount: updated.length,
@@ -94,9 +121,10 @@ export class NarrativePublicationService {
       }
     }
 
-    const created = await this.createPublication(manifest, chunks, scriptPath);
+    const created = await this.createPublication(manifest, chunks, scriptAttachment);
     manifest.publication = created;
     await this.persistPublication(manifestPath, manifest);
+    await fs.rm(attemptPath);
     return {
       ...(created.threadId === undefined ? {} : { threadId: created.threadId }),
       messageCount: created.messageIds.length,
@@ -107,13 +135,14 @@ export class NarrativePublicationService {
   private async updateExisting(
     publication: NonNullable<RecordingManifest["publication"]>,
     chunks: readonly string[],
-    scriptPath: string,
-  ): Promise<string[]> {
+    scriptAttachment: Buffer,
+    sessionId: string,
+  ): Promise<string[] | null> {
     const channel = await this.client.channels.fetch(
       publication.threadId ?? publication.channelId,
-    );
+    ).catch(() => null);
     if (channel === null || !channel.isTextBased() || channel.isDMBased()) {
-      throw new Error("La publicación anterior ya no existe.");
+      return null;
     }
     if (channel.isThread() && channel.archived) {
       await channel.setArchived(false, "Actualización manual del guion");
@@ -129,7 +158,7 @@ export class NarrativePublicationService {
           await message.edit({
             content: chunk,
             attachments: [],
-            files: [{ attachment: scriptPath, name: "guion.md" }],
+            files: [{ attachment: scriptAttachment, name: "guion.md" }],
           });
         } else {
           await message.edit(chunk);
@@ -137,31 +166,25 @@ export class NarrativePublicationService {
         nextIds.push(message.id);
       } else {
         const message = index === 0
-          ? await channel.send({ content: chunk, files: [{ attachment: scriptPath, name: "guion.md" }] })
+          ? await channel.send({ content: chunk, files: [{ attachment: scriptAttachment, name: "guion.md" }] })
           : await channel.send(chunk);
         nextIds.push(message.id);
+        await this.recordProgress(sessionId, { messageId: message.id });
       }
     }
     const obsoleteIds = currentIds
       .slice(chunks.length)
       .filter((messageId) => messageId !== publication.starterMessageId);
-    if (obsoleteIds.length > 0 && "bulkDelete" in channel) {
-      const obsolete = new Set(obsoleteIds);
-      const recent = await channel.messages.fetch({ limit: 100 });
-      const existing = recent.filter((message) => obsolete.has(message.id));
-      if (existing.size > 0) await channel.bulkDelete(existing, true);
-    } else {
-      await Promise.all(obsoleteIds.map((messageId) =>
-        channel.messages.delete(messageId).catch(() => undefined),
-      ));
-    }
+    await Promise.all(obsoleteIds.map((messageId) =>
+      channel.messages.delete(messageId).catch(() => undefined),
+    ));
     return nextIds;
   }
 
   private async createPublication(
     manifest: RecordingManifest,
     chunks: readonly string[],
-    scriptPath: string,
+    scriptAttachment: Buffer,
   ): Promise<NonNullable<RecordingManifest["publication"]>> {
     const title = manifest.campaignName ?? "Campaña";
     const voiceChannel = await this.client.channels.fetch(manifest.voiceChannelId);
@@ -180,13 +203,18 @@ export class NarrativePublicationService {
           autoArchiveDuration: 10080,
           message: {
             content: chunks[0] ?? "*(Guion vacío)*",
-            files: [{ attachment: scriptPath, name: "guion.md" }],
+            files: [{ attachment: scriptAttachment, name: "guion.md" }],
           },
           ...(preferredTag === undefined ? {} : { appliedTags: [preferredTag.id] }),
           reason: `Publicación narrativa manual de la sesión ${manifest.sequenceNumber}`,
         });
         const messageIds = [thread.id];
-        for (const chunk of chunks.slice(1)) messageIds.push((await thread.send(chunk)).id);
+        await this.recordProgress(manifest.sessionId, { threadId: thread.id, messageId: thread.id });
+        for (const chunk of chunks.slice(1)) {
+          const message = await thread.send(chunk);
+          messageIds.push(message.id);
+          await this.recordProgress(manifest.sessionId, { messageId: message.id });
+        }
         await voiceChannel.send(`🎬 El guion narrativo quedó publicado en ${thread}.`).catch(() => undefined);
         return {
           channelId: logChannel.id,
@@ -197,11 +225,13 @@ export class NarrativePublicationService {
       }
       if (logChannel?.type === ChannelType.GuildText) {
         const starter = await logChannel.send(`🎬 **${title} — Sesión ${manifest.sequenceNumber}**`);
+        await this.recordProgress(manifest.sessionId, { starterMessageId: starter.id, channelId: logChannel.id });
         const thread = await starter.startThread({
           name: `Guion ${manifest.sequenceNumber} — ${title}`.slice(0, 100),
           autoArchiveDuration: 10080,
         });
-        const messageIds = await sendChunks(thread, chunks, scriptPath);
+        await this.recordProgress(manifest.sessionId, { threadId: thread.id });
+        const messageIds = await sendChunks(thread, chunks, scriptAttachment, (id) => this.recordProgress(manifest.sessionId, { messageId: id }));
         await voiceChannel.send(`🎬 El guion narrativo quedó publicado en ${thread}.`).catch(() => undefined);
         return {
           channelId: logChannel.id,
@@ -215,7 +245,8 @@ export class NarrativePublicationService {
     const messageIds = await sendChunks(
       voiceChannel as GuildTextBasedChannel,
       splitMessage(`🎬 **${title} — Sesión ${manifest.sequenceNumber}**\n${chunks.join("\n")}`, 1_900),
-      scriptPath,
+      scriptAttachment,
+      (id) => this.recordProgress(manifest.sessionId, { channelId: voiceChannel.id, messageId: id }),
     );
     return { channelId: voiceChannel.id, messageIds };
   }
@@ -229,6 +260,17 @@ export class NarrativePublicationService {
       join(dirname(manifestPath), ".transcription-published"),
       `${new Date().toISOString()}\n`,
     );
+  }
+
+  private async recordProgress(
+    sessionId: string,
+    progress: Record<string, string>,
+  ): Promise<void> {
+    // Initial publication IDs are recorded before another external mutation.
+    const path = join(this.sessionDirectory(sessionId), ".publication-attempt.json");
+    const attempt = JSON.parse(await fs.readFile(path, "utf8")) as { steps?: unknown[] };
+    attempt.steps = [...(attempt.steps ?? []), progress];
+    await writeFileAtomically(path, JSON.stringify(attempt));
   }
 
   private sessionDirectory(sessionId: string): string {
@@ -245,18 +287,24 @@ export class NarrativePublicationService {
 async function sendChunks(
   channel: GuildTextBasedChannel,
   chunks: readonly string[],
-  scriptPath?: string,
+  scriptAttachment?: Buffer,
+  onMessage?: (id: string) => Promise<void>,
 ): Promise<string[]> {
   const messageIds: string[] = [];
   for (const [index, chunk] of chunks.entries()) {
-    const message = index === 0 && scriptPath !== undefined
-      ? await channel.send({ content: chunk, files: [{ attachment: scriptPath, name: "guion.md" }] })
+    const message = index === 0 && scriptAttachment !== undefined
+      ? await channel.send({ content: chunk, files: [{ attachment: scriptAttachment, name: "guion.md" }] })
       : await channel.send(chunk);
     messageIds.push(message.id);
+    await onMessage?.(message.id);
   }
   return messageIds;
 }
 
 function validateSessionId(sessionId: string): void {
   if (!/^[a-zA-Z0-9_-]+$/u.test(sessionId)) throw new Error("Sesión inválida.");
+}
+
+export function isNarrativeGenerationActive(state: string | undefined): boolean {
+  return state === "queued" || state === "generating";
 }

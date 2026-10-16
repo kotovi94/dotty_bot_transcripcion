@@ -1,10 +1,12 @@
 import { promises as fs } from "node:fs";
+import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 import { writeFileAtomically } from "../recording/atomic-json-file.ts";
 import type { EditorialLearningService } from "../editorial/editorial-learning-service.ts";
 import { verifyDraft } from "../editorial/draft-verifier.ts";
+import { readNarrativeReview, type NarrativeReviewManifest } from "./narrative-review.ts";
 
 export type NarrativeState = "missing" | "queued" | "generating" | "ready" | "failed";
 
@@ -213,14 +215,32 @@ export class NarrativeGenerator {
     private readonly transcriberBaseUrl?: string,
     private readonly transcriberSecret?: string,
     private readonly editorialLearning?: Pick<EditorialLearningService, "retrieve">,
+    private readonly request: typeof fetch = fetch,
   ) {}
 
   async getStatus(sessionId: string): Promise<NarrativeStatus> {
     const exportDirectory = this.exportDirectory(sessionId);
     try {
-      return JSON.parse(
+      const parsed = JSON.parse(
         await fs.readFile(join(exportDirectory, statusFileName), "utf8"),
-      ) as NarrativeStatus;
+      ) as Partial<NarrativeStatus> & { state?: unknown };
+      const scriptExists = await fileExists(join(exportDirectory, scriptFileName));
+      const state: NarrativeState = parsed.state === "queued" || parsed.state === "generating" || parsed.state === "failed" || parsed.state === "missing"
+        ? parsed.state
+        : scriptExists ? "ready" : "missing";
+      return {
+        state,
+        sessionId,
+        model: typeof parsed.model === "string" ? parsed.model : this.model,
+        progress: typeof parsed.progress === "number" && Number.isFinite(parsed.progress)
+          ? Math.max(0, Math.min(1, parsed.progress))
+          : state === "ready" ? 1 : 0,
+        phase: typeof parsed.phase === "string" && parsed.phase.trim() !== ""
+          ? parsed.phase
+          : state === "ready" ? "Guion disponible" : "Sin generar",
+        updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
+        ...(typeof parsed.error === "string" && parsed.error.trim() !== "" ? { error: parsed.error } : {}),
+      };
     } catch {
       const exists = await fileExists(join(exportDirectory, scriptFileName));
       return {
@@ -232,6 +252,10 @@ export class NarrativeGenerator {
         updatedAt: new Date(0).toISOString(),
       };
     }
+  }
+
+  getReviewStatus(sessionId: string): Promise<NarrativeReviewManifest | null> {
+    return readNarrativeReview(this.exportDirectory(sessionId), sessionId);
   }
 
   async generate(sessionId: string): Promise<{ path: string; status: NarrativeStatus }> {
@@ -1063,9 +1087,23 @@ export class NarrativeGenerator {
 
   private async readTranscript(sessionId: string): Promise<ExportedTranscript> {
     try {
-      return JSON.parse(
+      const transcript = JSON.parse(
         await fs.readFile(join(this.exportDirectory(sessionId), "transcript.raw.json"), "utf8"),
       ) as ExportedTranscript;
+      const manual = await fs.readFile(
+        join(this.exportDirectory(sessionId), "transcript.manual.json"),
+        "utf8",
+      ).then((content) => JSON.parse(content) as { sessionId?: unknown; lines?: unknown; sourceHash?: string }).catch(() => null);
+      if (manual?.sessionId === sessionId && Array.isArray(manual.lines) && manual.lines.length > 0) {
+        if (manual.sourceHash !== undefined) {
+          const markdown = await fs.readFile(join(this.exportDirectory(sessionId), "bitacora.md"), "utf8");
+          if (createHash("sha256").update(markdown, "utf8").digest("hex") !== manual.sourceHash) {
+            throw new Error("La edición de transcripción no coincide con su fuente. Vuelve a guardar la corrección.");
+          }
+        }
+        return { ...transcript, lines: manual.lines as NonNullable<ExportedTranscript["lines"]> };
+      }
+      return transcript;
     } catch {
       throw new Error("La transcripción aún no está preparada para generar un guion.");
     }
@@ -1114,7 +1152,7 @@ export class NarrativeGenerator {
   private async ensureOllamaReady(): Promise<void> {
     let response: Response;
     try {
-      response = await fetch(new URL("/api/tags", this.ollamaBaseUrl), {
+      response = await this.request(new URL("/api/tags", this.ollamaBaseUrl), {
         signal: AbortSignal.timeout(5_000),
       });
     } catch {
@@ -1136,7 +1174,7 @@ export class NarrativeGenerator {
   ): Promise<string> {
     let response: Response;
     try {
-      response = await fetch(new URL("/api/chat", this.ollamaBaseUrl), {
+      response = await this.request(new URL("/api/chat", this.ollamaBaseUrl), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -1175,7 +1213,7 @@ export class NarrativeGenerator {
     schema: Record<string, unknown>,
     stage = "structured",
   ): Promise<T> {
-    const response = await fetch(new URL("/api/chat", this.ollamaBaseUrl), {
+    const response = await this.request(new URL("/api/chat", this.ollamaBaseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1219,18 +1257,19 @@ export class NarrativeGenerator {
   private async unloadWhisperIfIdle(): Promise<void> {
     if (!this.transcriberBaseUrl || !this.transcriberSecret) return;
     try {
-      await fetch(new URL("/v1/model/unload", this.transcriberBaseUrl), {
+      const response = await this.request(new URL("/v1/model/unload", this.transcriberBaseUrl), {
         method: "POST",
         headers: { authorization: `Bearer ${this.transcriberSecret}` },
         signal: AbortSignal.timeout(20_000),
       });
-    } catch {
-      // Ollama puede continuar con descarga parcial a CPU si Whisper no se pudo liberar.
+      if (!response.ok) throw new Error(`Transcriptor ocupado o no disponible: HTTP ${response.status}`);
+    } catch (error) {
+      throw new Error("No se pudo liberar Whisper. Espera a que termine la transcripción antes de generar el guion.", { cause: error });
     }
   }
 
   private async unloadOllama(): Promise<void> {
-    await fetch(new URL("/api/generate", this.ollamaBaseUrl), {
+    await this.request(new URL("/api/generate", this.ollamaBaseUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: this.model, keep_alive: 0 }),

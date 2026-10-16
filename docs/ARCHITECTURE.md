@@ -24,7 +24,9 @@ No conoce campanas, personajes, canales ni reglas de Discord.
 
 SQLite y Prisma almacenaran metadatos, participantes, sesiones y segmentos. Los
 audios y exportaciones permaneceran en el sistema de archivos; la base guardara
-sus rutas, hashes y estado. Los audios nunca se eliminan automaticamente.
+sus rutas, hashes y estado. La retención nula conserva el audio. Una política de
+retención explícita solo permite limpiar WAV de sesiones completadas y publicadas;
+una transcripción preparada sin publicar conserva su audio para revisión.
 
 ### Contratos compartidos (`packages/shared`)
 

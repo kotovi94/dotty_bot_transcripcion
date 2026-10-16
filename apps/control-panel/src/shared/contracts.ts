@@ -76,15 +76,40 @@ export interface SessionFiles {
   manifest?: string | null;
 }
 
-export type ProcessingStageStatus = "pending" | "running" | "completed" | "error" | "unknown";
+export type ProcessingStageStatus = "pending" | "running" | "completed" | "warning" | "blocked" | "error" | "unknown";
+
+export type ProcessingStageId =
+  | "capture"
+  | "transcription"
+  | "raw_quality"
+  | "evidence"
+  | "scenes"
+  | "audit"
+  | "assembly"
+  | "verification"
+  | "approval"
+  | "publication";
+
+export interface ProcessingStage {
+  id: ProcessingStageId;
+  label: string;
+  status: ProcessingStageStatus;
+  details: string;
+  current?: number;
+  total?: number;
+  errors?: number;
+  warnings?: number;
+  artifact?: string;
+}
 
 export interface SessionProcessingStatus {
   sessionId: string;
-  state: "idle" | "recording" | "transcribing" | "transcript_ready" | "generating_narrative" | "narrative_ready" | "publishing" | "completed" | "error" | "unknown";
+  state: "idle" | "recording" | "transcribing" | "transcript_ready" | "generating_narrative" | "review_blocked" | "awaiting_approval" | "narrative_ready" | "publishing" | "completed" | "error" | "unknown";
   audio: { status: ProcessingStageStatus; details?: string };
   transcription: { status: ProcessingStageStatus; details?: string };
   narrative: { status: ProcessingStageStatus; details?: string };
   publication: { status: ProcessingStageStatus; details?: string };
+  stages: ProcessingStage[];
   updatedAt?: string | null;
 }
 
@@ -138,6 +163,8 @@ export interface TranscriptSummary {
   narrativeProgress: number;
   narrativePhase: string;
   narrativeError: string | null;
+  narrativeReviewState: NarrativeReviewState | null;
+  narrativeReviewPendingCount: number;
   campaignName?: string | null;
   sequenceNumber?: number | null;
   startedAt?: string | null;
@@ -151,6 +178,62 @@ export interface TranscriptSummary {
 export interface TranscriptDetail extends TranscriptSummary {
   content: string;
   narrativeContent: string | null;
+  narrativeReview: NarrativeReview | null;
+}
+
+export type NarrativeReviewState = "NEEDS_REVIEW" | "READY_FOR_REVIEW" | "APPROVED";
+export type NarrativeSceneReviewStatus = "GENERATED" | "NEEDS_REVIEW" | "APPROVED";
+
+export interface NarrativeReviewIssue {
+  type?: string;
+  severity: "error" | "warning";
+  reason: string;
+  sceneText?: string;
+}
+
+export interface NarrativeSceneBlocker {
+  code: "EMPTY_SCENE" | "INVALID_SCENE_HEADER" | "MODEL_META_CONTAMINATION" | "MISSING_TRACEABILITY";
+  message: string;
+}
+
+export interface NarrativeSceneReview {
+  id: string;
+  title: string;
+  status: NarrativeSceneReviewStatus;
+  auditValid: boolean;
+  issueCount: number;
+  errorCount: number;
+  warningCount: number;
+  evidenceIds: string[];
+  blockers: NarrativeSceneBlocker[];
+  approvedAt?: string;
+  approvedBy?: string;
+  auditStatus?: string;
+  reviewReason?: string;
+  issues: NarrativeReviewIssue[];
+}
+
+export interface NarrativeReview {
+  version: 1;
+  sessionId: string;
+  sourceHash: string;
+  state: NarrativeReviewState;
+  reason: string;
+  generatedAt: string;
+  updatedAt: string;
+  mode?: "generated" | "manual";
+  verification: {
+    valid: boolean;
+    errorCount: number;
+    warningCount: number;
+    checkedAt?: string;
+  };
+  scenes: NarrativeSceneReview[];
+  approval?: {
+    approvedAt: string;
+    approvedBy: string;
+    sourceHash: string;
+  };
 }
 
 export interface OperationResult {
@@ -161,6 +244,7 @@ export interface OperationResult {
 export interface SaveResult {
   saved: boolean;
   backupName?: string;
+  warning?: string;
 }
 
 export interface NarrativeOperationResult {
@@ -271,6 +355,9 @@ export interface DottyDesktopApi {
   saveTranscript(sessionId: string, content: string): Promise<SaveResult>;
   saveNarrative(sessionId: string, content: string): Promise<SaveResult>;
   generateNarrative(sessionId: string): Promise<NarrativeOperationResult>;
+  verifyNarrative(sessionId: string): Promise<NarrativeOperationResult>;
+  approveNarrativeScene(sessionId: string, sceneId: string): Promise<NarrativeOperationResult>;
+  approveNarrative(sessionId: string): Promise<NarrativeOperationResult>;
   publishNarrative(sessionId: string): Promise<NarrativeOperationResult>;
   openTranscript(sessionId: string): Promise<void>;
   openTranscriptFolder(sessionId: string): Promise<void>;

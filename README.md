@@ -35,6 +35,9 @@ Para conectar una aplicacion de Discord, consulta
 
 Consulta [docs/ROADMAP.md](docs/ROADMAP.md) para ver los siguientes hitos.
 
+Consulta [docs/RELIABILITY.md](docs/RELIABILITY.md) para las correcciones de
+fiabilidad, pruebas aisladas y límites de validación de sesiones largas.
+
 ## Instalador guiado para Windows
 
 Para crear el instalador distribuible ejecuta:
@@ -91,6 +94,16 @@ Ejecuta `/dotty` para configurar campanas y personajes, iniciar o controlar una
 grabacion, administrar sesiones, generar y publicar guiones, revisar almacenamiento
 y crear respaldos locales verificables. Dotty no conecta la captura de voz hasta
 que una persona administradora confirma que todos fueron informados.
+
+Los respaldos automáticos están habilitados al iniciar el bot: al cerrar una
+grabación y al quedar lista su transcripción, se copia la sesión con sus audios,
+exportaciones, bases SQLite y perfiles en `data/backups`. Se verifica cada archivo
+antes de dar el respaldo por terminado. Los pendientes se reintentan después de
+un error o reinicio. No se elimina ningún respaldo automáticamente.
+
+Para crear y verificar un respaldo completo manual, ejecuta `npm run backup`
+desde la carpeta del proyecto, sin grabaciones activas. Consulta
+[docs/BACKUPS.md](docs/BACKUPS.md) para recuperar datos y conocer el alcance.
 
 La transcripcion utiliza localmente `large-v3-turbo`, vocabulario propio de cada
 campana y metricas de confianza por palabra. El JSON conserva el texto original

@@ -2,14 +2,16 @@ import { EDITORIAL_CONFIG } from "./editorial-config.ts";
 import { normalizeEditorialText } from "./semantic-diff.ts";
 
 export interface VerificationIssue { type: "unsupported" | "meta" | "format" | "rule"; severity: "warning" | "error"; fragment: string; reason: string; evidenceLevel: "explicit" | "strongly_implied" | "inferred" | "unsupported"; confidence: number; }
-export interface VerificationReport { valid: boolean; issues: VerificationIssue[]; checkedAt: string; }
+export interface VerificationReport { valid: boolean; issues: VerificationIssue[]; checkedAt: string; factualAccuracy?: "requires_human_review"; }
 
-const metaPattern = /\b(prompt|modelo de lenguaje|transcripci[oó]n|evidencia|como (?:ia|ai)|the user)\b/giu;
+const blockingMetaPattern = /\b(prompt|modelo de lenguaje|como (?:ia|ai)|the user)\b/giu;
+const sourceReferencePattern = /\b(transcripci[oó]n|evidencia)\b/giu;
 const unsupportedPattern = /\b(?:sin duda|obviamente|secretamente|aterrorizad[oa]s?|furios[oa]s?|desesperad[oa]s?|con malicia|inevitablemente)\b/giu;
 
 export function verifyDraft(draft: string, evidenceTexts: readonly string[], rules: readonly { text: string; category?: string }[] = []): VerificationReport {
   const issues: VerificationIssue[] = [];
-  for (const match of draft.matchAll(metaPattern)) issues.push(issue("meta", "error", match[0], "Contenido meta no permitido.", "unsupported"));
+  for (const match of draft.matchAll(blockingMetaPattern)) issues.push(issue("meta", "error", match[0], "Contenido meta no permitido.", "unsupported"));
+  for (const match of draft.matchAll(sourceReferencePattern)) issues.push(issue("meta", "warning", match[0], "Referencia editorial visible; conviene reformularla antes de publicar.", "unsupported"));
   for (const match of draft.matchAll(unsupportedPattern)) {
     if (!hasSupport(match[0], evidenceTexts)) issues.push(issue("unsupported", "warning", match[0], "Modificador emocional o intencional sin respaldo.", "unsupported"));
   }
@@ -22,7 +24,7 @@ export function verifyDraft(draft: string, evidenceTexts: readonly string[], rul
       if (target && normalizeEditorialText(draft).includes(normalizeEditorialText(target))) issues.push(issue("rule", "error", target, `Incumple una regla editorial aprobada: ${rule.text}`, "explicit"));
     }
   }
-  return { valid: !issues.some((entry) => entry.severity === "error"), issues, checkedAt: new Date().toISOString() };
+  return { valid: !issues.some((entry) => entry.severity === "error"), issues, checkedAt: new Date().toISOString(), factualAccuracy: "requires_human_review" };
 }
 function hasSupport(fragment: string, evidence: readonly string[]): boolean {
   const tokens = new Set(normalizeEditorialText(fragment).split(" ").filter((token) => token.length > 3));

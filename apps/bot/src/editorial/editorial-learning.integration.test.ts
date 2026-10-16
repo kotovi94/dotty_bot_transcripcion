@@ -25,6 +25,25 @@ before(async () => {
 after(async () => database.$disconnect());
 
 describe("editorial supervised learning", () => {
+  it("isolates session rules and revokes their derived examples", async () => {
+    const secondSession = await database.session.create({ data: { campaignId: campaignA, sequenceNumber: 20 } });
+    const feedback = await service.submitFeedback({ sessionId: sessionA, generatedVersion: "El dragón inventado aterriza.", editedVersion: "Ada abre una puerta sintética.", comment: "Usar tono sobrio solo en esta sesión." });
+    const rule = feedback.candidates.find((candidate) => candidate.text.includes("solo en esta sesión"))!;
+    await service.decideRule(rule.id, "approve", "session");
+    const own = await service.retrieve({ sessionId: sessionA, campaignId: campaignA });
+    assert.ok(own.rules.some((candidate) => candidate.id === rule.id));
+    assert.ok(own.examples.some((example) => example.output === "Ada abre una puerta sintética."));
+    const other = await service.retrieve({ sessionId: secondSession.id, campaignId: campaignA });
+    assert.ok(!other.rules.some((candidate) => candidate.id === rule.id));
+    assert.ok(!other.examples.some((example) => example.output === "Ada abre una puerta sintética."));
+    await service.decideRule(rule.id, "deprecate");
+    const revoked = await service.retrieve({ sessionId: sessionA, campaignId: campaignA });
+    assert.ok(!revoked.examples.some((example) => example.output === "Ada abre una puerta sintética."));
+    await service.rollbackRule(rule.id);
+    assert.ok((await service.retrieve({ sessionId: sessionA, campaignId: campaignA })).examples.some((example) => example.output === "Ada abre una puerta sintética."));
+    await service.rollbackRule(rule.id);
+    await service.decideRule(rule.id, "reject");
+  });
   it("A: creates a candidate and never approves it automatically", async () => {
     const result = await service.submitFeedback({ sessionId: sessionA, generatedVersion: "El héroe estaba furioso sin evidencia.", editedVersion: "El héroe levantó la espada.", comment: "No atribuir emociones sin evidencia explícita." });
     assert.ok(result.candidates.length > 0);
@@ -73,10 +92,17 @@ describe("editorial supervised learning", () => {
   });
 
   it("F: flags unsupported emotion and meta text independently", () => {
-    const report = verifyDraft("# Campaña\n# ESCENA 1 — Puerta\nEl guardia estaba secretamente furioso. La transcripción lo confirma.", ["El guardia abrió la puerta."]);
+    const report = verifyDraft("# Campaña\n# ESCENA 1 — Puerta\nEl guardia estaba secretamente furioso. El modelo de lenguaje lo confirma.", ["El guardia abrió la puerta."]);
     assert.equal(report.valid, false);
     assert.ok(report.issues.some((item) => item.type === "unsupported"));
     assert.ok(report.issues.some((item) => item.type === "meta"));
+  });
+
+  it("F2: reports source references without blocking a manually reviewed script", () => {
+    const report = verifyDraft("# Campaña\n# ESCENA 1 — Puerta\nNo queda establecido con claridad en la transcripción quién abre la puerta.", ["Alguien abre la puerta."]);
+    assert.equal(report.valid, true);
+    assert.ok(report.issues.some((item) => item.type === "meta" && item.severity === "warning"));
+    assert.ok(!report.issues.some((item) => item.severity === "error"));
   });
 
   it("G: restores a previous rule version", async () => {

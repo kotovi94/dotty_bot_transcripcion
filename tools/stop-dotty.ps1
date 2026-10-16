@@ -13,6 +13,35 @@ $dataDirectory = if ([System.IO.Path]::IsPathRooted($configuredDataDirectory)) {
 $stopLogPath = Join-Path $dataDirectory "shutdown.log"
 $botStatusPath = Join-Path $dataDirectory "dotty.status.json"
 
+# The script must enforce this too: .cmd callers bypass the desktop guard.
+$recordingsDirectory = Join-Path $dataDirectory "recordings"
+if (Test-Path -LiteralPath $recordingsDirectory) {
+  foreach ($sessionDirectory in Get-ChildItem -LiteralPath $recordingsDirectory -Directory) {
+    $manifestFile = Join-Path $sessionDirectory.FullName "manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestFile)) { continue }
+    $manifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
+    if ($manifest.status -in @("recording", "paused", "finalizing")) {
+      throw "Hay una grabacion activa. Finalizala desde Discord antes de apagar Dotty."
+    }
+  }
+}
+
+if (Test-Path -LiteralPath $botStatusPath) {
+  $status = Get-Content -LiteralPath $botStatusPath -Raw | ConvertFrom-Json
+  $botProcessId = [int]$status.pid
+  if (Get-Process -Id $botProcessId -ErrorAction SilentlyContinue) {
+    $requestPath = Join-Path $dataDirectory "dotty.stop-request.json"
+    @{ pid = $botProcessId } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -Encoding ASCII
+    $deadline = (Get-Date).AddSeconds(45)
+    while ((Test-Path -LiteralPath $botStatusPath) -and (Get-Date) -lt $deadline) {
+      Start-Sleep -Milliseconds 250
+    }
+    if (Test-Path -LiteralPath $botStatusPath) {
+      throw "Dotty no confirmo el cierre ordenado. No se forzara su terminacion; revisa los registros."
+    }
+  }
+}
+
 function Write-LogLine([string]$path, [string]$message) {
   Add-Content -LiteralPath $path -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $message) -Encoding UTF8
 }
@@ -38,14 +67,28 @@ foreach ($pidFile in @("dotty.pid", "transcriber.pid", "ollama.pid")) {
   if ([int]::TryParse((Get-Content -LiteralPath $path -Raw).Trim(), [ref]$processId)) {
     $servicePids += $processId
   }
-  Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
 }
 
 foreach ($processId in ($servicePids | Select-Object -Unique)) {
   if ($null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+    # Never trust a PID alone: Windows may have reused it for another program.
+    $ownedProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$processId"
+    $commandLine = [string]$ownedProcess.CommandLine
+    $executablePath = [string]$ownedProcess.ExecutablePath
+    if ($commandLine -notmatch 'dotty_transcriber\.main:app|ollama(?:\.exe)?["\s]+serve') {
+      throw "El PID $processId no corresponde a un servicio verificable de Dotty. No se terminara."
+    }
+    if (-not $executablePath.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "El PID $processId pertenece a otra instalacion. No se terminara."
+    }
     & taskkill.exe /PID $processId /T /F 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "No se pudo detener el servicio $processId." }
     $stopped += 1
   }
+}
+
+foreach ($pidFile in @("dotty.pid", "transcriber.pid", "ollama.pid")) {
+  Remove-Item -LiteralPath (Join-Path $dataDirectory $pidFile) -Force -ErrorAction SilentlyContinue
 }
 
 # El cierre forzado del arbol de procesos no permite que Node limpie su propio

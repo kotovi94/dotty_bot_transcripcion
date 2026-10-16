@@ -9,6 +9,16 @@ export const narrativeReviewFileName = "guion.revision.json";
 
 export type NarrativeReviewState = "NEEDS_REVIEW" | "READY_FOR_REVIEW" | "APPROVED";
 export type NarrativeSceneReviewStatus = "GENERATED" | "NEEDS_REVIEW" | "APPROVED";
+export type NarrativeSceneBlockerCode =
+  | "EMPTY_SCENE"
+  | "INVALID_SCENE_HEADER"
+  | "MODEL_META_CONTAMINATION"
+  | "MISSING_TRACEABILITY";
+
+export interface NarrativeSceneBlocker {
+  readonly code: NarrativeSceneBlockerCode;
+  readonly message: string;
+}
 
 export interface NarrativeSceneReview {
   readonly id: string;
@@ -19,7 +29,9 @@ export interface NarrativeSceneReview {
   readonly errorCount: number;
   readonly warningCount: number;
   readonly evidenceIds: string[];
+  readonly blockers: NarrativeSceneBlocker[];
   readonly approvedAt?: string;
+  readonly approvedBy?: string;
 }
 
 export interface NarrativeReviewManifest {
@@ -30,6 +42,7 @@ export interface NarrativeReviewManifest {
   readonly reason: string;
   readonly generatedAt: string;
   readonly updatedAt: string;
+  readonly mode?: "generated" | "manual";
   readonly verification: {
     readonly valid: boolean;
     readonly errorCount: number;
@@ -49,6 +62,7 @@ interface SceneArtifact {
   readonly title?: unknown;
   readonly evidence_ids?: unknown;
   readonly evidenceIds?: unknown;
+  readonly text?: unknown;
   readonly audit?: {
     readonly valid?: unknown;
     readonly status?: unknown;
@@ -86,13 +100,34 @@ export async function refreshNarrativeReview(
   const sourceHash = hashNarrative(script);
   const verification = verificationOverride ?? await readVerification(exportDirectory);
   const previous = await readNarrativeReview(exportDirectory, sessionId);
-  const scenes = await readSceneReviews(exportDirectory);
-  const normalizedScenes = scenes.length > 0
-    ? scenes
-    : [manualSceneReview(verification)];
-  const sceneHasErrors = normalizedScenes.some((scene) => scene.status === "NEEDS_REVIEW");
+  const generatedScript = await fs.readFile(join(exportDirectory, "guion.generado.md"), "utf8").catch(() => null);
+  const mode: "generated" | "manual" = generatedScript !== null && hashNarrative(generatedScript) === sourceHash
+    ? "generated"
+    : "manual";
+  const scenes = mode === "generated" ? await readSceneReviews(exportDirectory) : [];
+  const normalizedScenes = scenes.length > 0 ? scenes : [manualSceneReview(verification)];
   const verificationErrors = verification.issues.filter((issue) => issue.severity === "error").length;
   const verificationWarnings = verification.issues.filter((issue) => issue.severity === "warning").length;
+  // A repeated automatic verification must not erase a human decision for the
+  // same script. Final verification still gates the overall approval below;
+  // this only preserves scene-level review work.
+  const canPreserveSceneApprovals = previous?.sourceHash === sourceHash;
+  const scenesWithPreservedApproval = normalizedScenes.map((scene): NarrativeSceneReview => {
+    const previousScene = canPreserveSceneApprovals
+      ? previous?.scenes.find((candidate) => candidate.id === scene.id)
+      : undefined;
+    if (
+      previousScene?.status !== "APPROVED"
+      || scene.blockers.some(isHardBlocker)
+    ) return scene;
+    return {
+      ...scene,
+      status: "APPROVED",
+      ...(previousScene.approvedAt !== undefined ? { approvedAt: previousScene.approvedAt } : {}),
+      ...(previousScene.approvedBy !== undefined ? { approvedBy: previousScene.approvedBy } : {}),
+    };
+  });
+  const sceneHasErrors = scenesWithPreservedApproval.some((scene) => scene.status === "NEEDS_REVIEW");
   const stillApproved = previous?.state === "APPROVED"
     && previous.sourceHash === sourceHash
     && previous.approval?.sourceHash === sourceHash
@@ -112,17 +147,14 @@ export async function refreshNarrativeReview(
       : sceneHasErrors
         ? "SCENE_REVIEW_REQUIRED"
         : "AWAITING_APPROVAL";
-  const scenesWithApproval = normalizedScenes.map((scene): NarrativeSceneReview => {
+  const scenesWithApproval = scenesWithPreservedApproval.map((scene): NarrativeSceneReview => {
     if (stillApproved) {
       return {
         ...scene,
         status: "APPROVED",
         approvedAt: previous?.approval?.approvedAt ?? now,
+        approvedBy: previous?.approval?.approvedBy ?? "manual",
       };
-    }
-    if (scene.status === "APPROVED") {
-      const { approvedAt: _approvedAt, ...rest } = scene;
-      return { ...rest, status: "GENERATED" };
     }
     return scene;
   });
@@ -134,6 +166,7 @@ export async function refreshNarrativeReview(
     reason,
     generatedAt: previous?.generatedAt ?? now,
     updatedAt: now,
+    mode,
     verification: {
       valid: verification.valid,
       errorCount: verificationErrors,
@@ -165,6 +198,11 @@ export async function approveNarrativeReview(
   if (!current.verification.valid || current.verification.errorCount > 0) {
     throw new Error("El guion tiene errores de verificación y no puede aprobarse.");
   }
+  const structural = current.mode === "manual" ? [] : await readSceneReviews(exportDirectory);
+  const blocked = structural.filter((scene) => scene.blockers.some(isHardBlocker));
+  if (blocked.length > 0) {
+    throw new Error(`Hay ${blocked.length} escena(s) con bloqueos estructurales que deben regenerarse o corregirse.`);
+  }
   const pending = current.scenes.filter((scene) => scene.status === "NEEDS_REVIEW");
   if (pending.length > 0) {
     throw new Error(`Hay ${pending.length} escena(s) que requieren revisión antes de aprobar el guion.`);
@@ -175,7 +213,12 @@ export async function approveNarrativeReview(
     state: "APPROVED",
     reason: "APPROVED",
     updatedAt: approvedAt,
-    scenes: current.scenes.map((scene) => ({ ...scene, status: "APPROVED", approvedAt })),
+    scenes: current.scenes.map((scene) => ({
+      ...scene,
+      status: "APPROVED",
+      approvedAt,
+      approvedBy: approvedBy.slice(0, 120) || "manual",
+    })),
     approval: {
       approvedAt,
       approvedBy: approvedBy.slice(0, 120) || "manual",
@@ -184,6 +227,59 @@ export async function approveNarrativeReview(
   };
   await writeNarrativeReview(exportDirectory, approved);
   return approved;
+}
+
+export async function approveNarrativeScene(
+  exportDirectory: string,
+  sessionId: string,
+  sceneId: string,
+  approvedBy = "manual",
+): Promise<NarrativeReviewManifest> {
+  validateSessionId(sessionId);
+  if (!/^scene_\d+$/u.test(sceneId) && sceneId !== "manual") {
+    throw new Error("La escena indicada no es válida.");
+  }
+  const script = await fs.readFile(join(exportDirectory, "guion.md"), "utf8");
+  const sourceHash = hashNarrative(script);
+  const current = await readNarrativeReview(exportDirectory, sessionId);
+  if (current === null) {
+    throw new Error("El guion todavía no tiene un manifiesto de revisión. Verifícalo antes de revisar escenas.");
+  }
+  if (current.sourceHash !== sourceHash) {
+    throw new Error("El guion cambió después de su última verificación. Vuelve a verificarlo antes de revisar escenas.");
+  }
+  if (!current.scenes.some((scene) => scene.id === sceneId)) {
+    throw new Error("La escena indicada no pertenece a este guion.");
+  }
+  const structuralScene = current.mode === "manual"
+    ? undefined
+    : (await readSceneReviews(exportDirectory)).find((scene) => scene.id === sceneId);
+  const hardBlockers = structuralScene?.blockers.filter(isHardBlocker) ?? [];
+  if (hardBlockers.length > 0) {
+    const codes = hardBlockers.map((blocker) => blocker.code).join(", ");
+    throw new Error(`La escena tiene bloqueos estructurales (${codes}) y debe regenerarse o corregirse; no puede aprobarse manualmente.`);
+  }
+
+  const approvedAt = new Date().toISOString();
+  const scenes = current.scenes.map((scene): NarrativeSceneReview => scene.id === sceneId
+    ? { ...scene, status: "APPROVED", approvedAt, approvedBy: approvedBy.slice(0, 120) || "manual" }
+    : scene);
+  const verificationBlocked = !current.verification.valid || current.verification.errorCount > 0;
+  const sceneHasErrors = scenes.some((scene) => scene.status === "NEEDS_REVIEW");
+  const { approval: _approval, ...withoutApproval } = current;
+  const reviewed: NarrativeReviewManifest = {
+    ...withoutApproval,
+    state: verificationBlocked || sceneHasErrors ? "NEEDS_REVIEW" : "READY_FOR_REVIEW",
+    reason: verificationBlocked
+      ? "FINAL_VERIFICATION_FAILED"
+      : sceneHasErrors
+        ? "SCENE_REVIEW_REQUIRED"
+        : "AWAITING_APPROVAL",
+    updatedAt: approvedAt,
+    scenes,
+  };
+  await writeNarrativeReview(exportDirectory, reviewed);
+  return reviewed;
 }
 
 export async function assertNarrativeApproved(
@@ -209,6 +305,10 @@ export async function assertNarrativeApproved(
   }
   if (review.scenes.some((scene) => scene.status !== "APPROVED")) {
     throw new Error("Todas las escenas deben estar aprobadas antes de publicar.");
+  }
+  const structural = review.mode === "manual" ? [] : await readSceneReviews(exportDirectory);
+  if (structural.some((scene) => scene.blockers.some(isHardBlocker))) {
+    throw new Error("El guion contiene escenas vacías, contaminadas o sin trazabilidad y no puede publicarse.");
   }
   return review;
 }
@@ -254,8 +354,8 @@ async function readSceneReviews(exportDirectory: string): Promise<NarrativeScene
           ? artifact.evidenceIds.filter((value): value is string => typeof value === "string")
           : [];
       const auditErrors = issues.filter((issue) => issue.severity === "error").length;
-      const missingTraceability = evidenceIds.length === 0 ? 1 : 0;
-      const errorCount = auditErrors + missingTraceability;
+      const blockers = structuralBlockers(artifact, evidenceIds);
+      const errorCount = auditErrors + blockers.length;
       const warningCount = issues.filter((issue) => issue.severity === "warning").length;
       const auditValid = artifact.audit?.valid === true
         && artifact.audit?.status !== "NEEDS_REVIEW"
@@ -266,10 +366,11 @@ async function readSceneReviews(exportDirectory: string): Promise<NarrativeScene
         title: typeof artifact.title === "string" ? artifact.title : `Escena ${scenes.length + 1}`,
         status: auditValid ? "GENERATED" : "NEEDS_REVIEW",
         auditValid,
-        issueCount: issues.length + missingTraceability,
+        issueCount: issues.length + blockers.length,
         errorCount,
         warningCount,
         evidenceIds,
+        blockers,
       });
     } catch {
       scenes.push({
@@ -281,6 +382,7 @@ async function readSceneReviews(exportDirectory: string): Promise<NarrativeScene
         errorCount: 1,
         warningCount: 0,
         evidenceIds: [],
+        blockers: [{ code: "EMPTY_SCENE", message: "No se pudo leer el artefacto de la escena." }],
       });
     }
   }
@@ -293,14 +395,49 @@ function manualSceneReview(verification: VerificationReport): NarrativeSceneRevi
   const valid = verification.valid && errorCount === 0;
   return {
     id: "manual",
-    title: "Guion completo",
+    title: "Guion editado manualmente",
     status: valid ? "GENERATED" : "NEEDS_REVIEW",
     auditValid: valid,
     issueCount: verification.issues.length,
     errorCount,
     warningCount,
     evidenceIds: [],
+    blockers: [],
   };
+}
+
+function structuralBlockers(
+  artifact: SceneArtifact,
+  evidenceIds: readonly string[],
+): NarrativeSceneBlocker[] {
+  const blockers: NarrativeSceneBlocker[] = [];
+  const text = typeof artifact.text === "string" ? artifact.text.trim() : "";
+  if (text === "") {
+    blockers.push({ code: "EMPTY_SCENE", message: "La escena está vacía." });
+  } else {
+    if (!/^#\s+ESCENA\b/imu.test(text)) {
+      blockers.push({ code: "INVALID_SCENE_HEADER", message: "La escena no comienza con un encabezado # ESCENA válido." });
+    }
+    if (looksLikeModelMeta(text)) {
+      blockers.push({ code: "MODEL_META_CONTAMINATION", message: "La salida contiene razonamiento o instrucciones del modelo en lugar de narrativa." });
+    }
+  }
+  if (evidenceIds.length === 0) {
+    blockers.push({ code: "MISSING_TRACEABILITY", message: "La escena no contiene identificadores de evidencia." });
+  }
+  return blockers;
+}
+
+function looksLikeModelMeta(text: string): boolean {
+  const sample = text.slice(0, 8_000);
+  return /(?:^|\n)\s*(?:okay|alright|we need|i need|let me|the user)\b/imu.test(sample)
+    || /\bthe user (?:has|is|provided|wants|needs)\b/iu.test(sample)
+    || /\b(?:problem statement|system prompt|assistant response|language model)\b/iu.test(sample)
+    || /<\/?think>/iu.test(sample);
+}
+
+function isHardBlocker(blocker: NarrativeSceneBlocker): boolean {
+  return blocker.code === "EMPTY_SCENE" || blocker.code === "MODEL_META_CONTAMINATION";
 }
 
 async function writeNarrativeReview(

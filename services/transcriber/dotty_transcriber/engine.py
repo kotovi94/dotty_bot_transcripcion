@@ -41,12 +41,15 @@ def _configure_cuda_dll_search_path() -> None:
 
 
 class WhisperEngine:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, local_files_only: bool = False) -> None:
         _configure_cuda_dll_search_path()
         self.settings = settings
+        self._local_files_only = local_files_only
         self._model: Any = None
         self._lock = threading.Lock()
         self._active_device = settings.device
+        self._active_compute_type = settings.compute_type
+        self._fallback_reason: str | None = None
         self._known_hallucination_phrases = [
             "gracias por ver el video",
             "gracias por ver este video",
@@ -67,6 +70,16 @@ class WhisperEngine:
     @property
     def active_device(self) -> str:
         return self._active_device
+
+    @property
+    def runtime_status(self) -> dict[str, Any]:
+        return {
+            "active_device": self._active_device,
+            "active_compute_type": self._active_compute_type,
+            "model_loaded": self._model is not None,
+            "fallback_reason": self._fallback_reason,
+            "initial_prompt_applied": False,
+        }
 
     def unload(self) -> bool:
         """Release the lazy Whisper model so another local CUDA workload can run."""
@@ -108,14 +121,27 @@ class WhisperEngine:
             }
         except RuntimeError as error:
             message = str(error).lower()
-            if self.settings.device == "cuda" and any(
+            if self._active_device == "cuda" and any(
                 name in message for name in ("out of memory", "cublas", "cudnn", "cuda")
             ):
-                logger.error(
-                    "[CUDA] Transcription failed on GPU; no automatic CPU fallback is enabled: %s",
+                logger.warning(
+                    "[CUDA] Transcription failed on GPU; retrying safely on CPU/int8: %s",
                     error,
                 )
+                self._switch_to_cpu(str(error))
+                return self._transcribe_with_model(
+                    self._get_model(), audio_path, language, initial_prompt, hotwords,
+                    progress_callback, vad_parameters,
+                )
             raise
+
+    def _switch_to_cpu(self, reason: str = "CUDA unavailable") -> None:
+        with self._lock:
+            self._model = None
+            self._active_device = "cpu"
+            self._active_compute_type = "int8"
+            self._fallback_reason = reason
+            gc.collect()
 
     def _transcribe_with_model(
         self,
@@ -154,7 +180,7 @@ class WhisperEngine:
             repetition_penalty=self.settings.repetition_penalty,
             no_repeat_ngram_size=self.settings.no_repeat_ngram_size,
             temperature=0.0,
-            vad_filter=True,
+            vad_filter=self.settings.vad_enabled,
             vad_parameters=effective_vad,
             word_timestamps=True,
             condition_on_previous_text=False,
@@ -309,7 +335,7 @@ class WhisperEngine:
         with self._lock:
             if self._model is None:
                 from faster_whisper import WhisperModel
-                if self.settings.device == "cuda":
+                if self._active_device == "cuda":
                     import ctranslate2
 
                     device_count = ctranslate2.get_cuda_device_count()
@@ -320,7 +346,7 @@ class WhisperEngine:
                         device_count,
                         _cuda_device_name(),
                         self.settings.model,
-                        self.settings.compute_type,
+                        self._active_compute_type,
                     )
                 else:
                     logger.warning(
@@ -330,14 +356,14 @@ class WhisperEngine:
 
                 self._model = WhisperModel(
                     self.settings.model,
-                    device=self.settings.device,
-                    compute_type=self.settings.compute_type,
+                    device=self._active_device,
+                    compute_type=self._active_compute_type,
+                    local_files_only=self._local_files_only,
                 )
-                self._active_device = self.settings.device
                 logger.info(
                     "[CUDA] Whisper model loaded; device=%s compute_type=%s",
                     self._active_device,
-                    self.settings.compute_type,
+                    self._active_compute_type,
                 )
             return self._model
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
+import { EventEmitter } from "node:events";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,7 +45,7 @@ describe("NarrativeGenerator", () => {
   let maxActiveChats = 0;
   let invalidAuditResponses = 0;
   let correctionCalls = 0;
-  const server = createServer((request, response) => {
+  const respond = (request: EventEmitter & { url: string }, response: { statusCode: number; setHeader(name: string, value: string): void; end(content: string): void }) => {
     response.setHeader("content-type", "application/json");
     if (request.url === "/api/tags") {
       response.end(JSON.stringify({ models: [{ name: "qwen3:8b" }] }));
@@ -103,23 +103,20 @@ describe("NarrativeGenerator", () => {
     }
     response.statusCode = 404;
     response.end(JSON.stringify({ error: "not found" }));
+  };
+  const mockFetch: typeof fetch = async (input, init) => new Promise<Response>((resolveResponse) => {
+    const request = Object.assign(new EventEmitter(), { url: new URL(input instanceof Request ? input.url : String(input)).pathname });
+    const response = { statusCode: 200, setHeader() {}, end(content: string) { resolveResponse(new Response(content, { status: response.statusCode })); } };
+    respond(request, response);
+    queueMicrotask(() => { request.emit("data", Buffer.from(String(init?.body ?? ""))); request.emit("end"); });
   });
 
   before(async () => {
     root = await mkdtemp(join(tmpdir(), "dotty-narrative-"));
-    await new Promise<void>((resolveListen) => {
-      server.listen(0, "127.0.0.1", resolveListen);
-    });
-    const address = server.address();
-    if (address === null || typeof address === "string") throw new Error("No test port");
-    baseUrl = `http://127.0.0.1:${address.port}`;
+    baseUrl = "http://dotty-test.invalid";
   });
 
-  after(async () => {
-    server.closeAllConnections();
-    await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
-    await rm(root, { recursive: true, force: true });
-  });
+  after(async () => { await rm(root, { recursive: true, force: true }); });
 
   it("creates a reviewed script without replacing the raw transcript", async () => {
     const recordings = join(root, "recordings");
@@ -134,7 +131,7 @@ describe("NarrativeGenerator", () => {
     });
     await writeFile(rawPath, raw, "utf8");
 
-    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b");
+    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b", undefined, undefined, undefined, mockFetch);
     const result = await generator.generate(sessionId);
 
     assert.equal(result.status.state, "ready");
@@ -142,6 +139,18 @@ describe("NarrativeGenerator", () => {
     assert.equal(await readFile(rawPath, "utf8"), raw);
     assert.equal(JSON.parse(await readFile(join(exports, sessionId, "guion.estado.json"), "utf8")).state, "ready");
     assert.equal(chatCalls, 3);
+  });
+
+  it("stops before Ollama inference if Whisper cannot release the GPU", async () => {
+    const request: typeof fetch = async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/api/tags") return new Response(JSON.stringify({ models: [{ name: "qwen3:8b" }] }));
+      if (path === "/v1/model/unload") return new Response("busy", { status: 409 });
+      if (path === "/api/generate") return new Response("{}");
+      throw new Error("Inference must not start while Whisper is busy");
+    };
+    const generator = new NarrativeGenerator(join(root, "recordings"), join(root, "exports"), baseUrl, "qwen3:8b", baseUrl, "synthetic", undefined, request);
+    await assert.rejects(generator.generate("gpu-busy"), /No se pudo liberar Whisper/u);
   });
 
   it("serializes different sessions so one cannot unload the other's model", async () => {
@@ -157,7 +166,7 @@ describe("NarrativeGenerator", () => {
       }), "utf8");
     }
     maxActiveChats = 0;
-    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b");
+    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b", undefined, undefined, undefined, mockFetch);
 
     await Promise.all(sessionIds.map((sessionId) => generator.generate(sessionId)));
 
@@ -180,7 +189,7 @@ describe("NarrativeGenerator", () => {
       ],
     }), "utf8");
 
-    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b");
+    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b", undefined, undefined, undefined, mockFetch);
     const result = await generator.generate(sessionId);
 
     assert.equal(result.status.state, "ready");
@@ -208,7 +217,7 @@ describe("NarrativeGenerator", () => {
     }), "utf8");
     invalidAuditResponses = 2;
     correctionCalls = 0;
-    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b");
+    const generator = new NarrativeGenerator(recordings, exports, baseUrl, "qwen3:8b", undefined, undefined, undefined, mockFetch);
     const result = await generator.generate(sessionId);
     const work = join(exports, sessionId, "guion.work");
     const state = JSON.parse(await readFile(join(exports, sessionId, "guion.estado.json"), "utf8"));

@@ -5,6 +5,35 @@ import pytest
 from dotty_transcriber.storage import JobInput, JobStore
 
 
+def test_repeated_crashes_become_visible_and_manually_retryable(tmp_path: Path) -> None:
+    path = tmp_path / "crashes.db"
+    store = JobStore(path)
+    store.enqueue(JobInput("session:chunk", "unused.wav", "user", 0, "es"))
+    for attempt in range(1, 4):
+        claimed = store.claim_next()
+        assert claimed is not None and claimed["attempts"] == attempt
+        store = JobStore(path)
+    assert store.metrics()["failed"] == 1
+    assert store.metrics()["queued"] == 0
+    assert store.claim_next() is None
+    assert store.retry_failed_for_session("session") == 1
+    new_claim = store.claim_next()
+    assert new_claim is not None and new_claim["attempts"] == 1
+    assert not store.complete(claimed["id"], claimed["claim_token"], {"stale": True})
+    assert store.complete(new_claim["id"], new_claim["claim_token"], {"recovered": True})
+
+
+def test_recovers_legacy_exhausted_queued_job(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    store = JobStore(path)
+    store.enqueue(JobInput("session:chunk", "unused.wav", "user", 0, "es"))
+    store._connection().execute("UPDATE transcription_job SET attempts=3")
+    recovered = JobStore(path)
+    assert recovered.get("session:chunk")["status"] == "failed"
+    recovered.retry("session:chunk")
+    assert recovered.claim_next() is not None
+
+
 def test_queue_is_idempotent_and_recovers_processing(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "queue.db")
     job = JobInput("chunk-1", "audio.wav", "user-1", 1200, "es")

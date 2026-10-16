@@ -13,6 +13,7 @@
     "start": "electron dist/main/main/main.js",
     "dev": "npm run build && electron dist/main/main/main.js",
     "smoke": "node scripts/e2e-smoke.mjs",
+    "smoke:review": "node scripts/review-panel-smoke.mjs",
     "installer": "npm run build && npm run stage:installer && electron-builder --win nsis",
     "stage:installer": "node scripts/stage-runtime.mjs",
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit"

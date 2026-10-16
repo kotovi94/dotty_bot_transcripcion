@@ -1,4 +1,6 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { saveTranscriptRevision } from "./transcript-edits.js";
+import { writeFileAtomically } from "./atomic-file.js";
 import { promisify } from "node:util";
 import {
   copyFile,
@@ -29,6 +31,8 @@ import type {
   OperationKind,
   OperationResult,
   NarrativeOperationResult,
+  NarrativeReview,
+  ProcessingStage,
   SaveResult,
   SessionDetails,
   SessionParticipant,
@@ -51,6 +55,8 @@ interface HealthPayload {
   model?: string;
   configured_device?: string;
   active_device?: string;
+  active_compute_type?: string;
+  model_loaded?: boolean;
   compute_type?: string;
   queue?: Partial<DottyState["transcriber"]["queue"]>;
   work?: DottyState["transcriber"]["work"];
@@ -306,11 +312,12 @@ export class DottySupervisor {
           const sessionId = entry.name;
           const transcriptPath = this.transcriptPath(sessionId);
           try {
-            const [content, fileStat, manifest, narrative] = await Promise.all([
+            const [content, fileStat, manifest, narrative, review] = await Promise.all([
               readFile(transcriptPath, "utf8"),
               stat(transcriptPath),
               this.readManifest(sessionId),
               this.readNarrativeStatus(sessionId),
+              this.readNarrativeReview(sessionId, false),
             ]);
             const firstLine = content.split(/\r?\n/, 1)[0] ?? sessionId;
             const processing = await this.getSessionProcessingStatus(sessionId);
@@ -325,12 +332,15 @@ export class DottySupervisor {
               status: typeof manifest?.status === "string" ? manifest.status : null,
               canOpenDiscord: Boolean(
                 manifest?.discordGuildId &&
-                  (manifest.publication as { threadId?: unknown } | undefined)?.threadId,
+                  ((manifest.publication as { threadId?: unknown; channelId?: unknown } | undefined)?.threadId
+                    || (manifest.publication as { channelId?: unknown } | undefined)?.channelId),
               ),
               narrativeState: narrative.state,
               narrativeProgress: narrative.progress,
               narrativePhase: narrative.phase,
               narrativeError: narrative.error ?? null,
+              narrativeReviewState: review?.state ?? null,
+              narrativeReviewPendingCount: review?.scenes.filter((scene) => scene.status === "NEEDS_REVIEW").length ?? 0,
               campaignName: typeof manifest?.campaignName === "string" ? manifest.campaignName : null,
               sequenceNumber: typeof manifest?.sequenceNumber === "number" ? manifest.sequenceNumber : null,
               startedAt,
@@ -362,18 +372,13 @@ export class DottySupervisor {
       ...summary,
       content: await readFile(this.transcriptPath(sessionId), "utf8"),
       narrativeContent: await readFile(this.narrativePath(sessionId), "utf8").catch(() => null),
+      narrativeReview: await this.readNarrativeReview(sessionId, true),
     };
   }
 
   async saveTranscript(sessionId: string, content: string): Promise<SaveResult> {
-    if (content.length > 5_000_000) throw new Error("La bitacora es demasiado grande.");
-    const transcriptPath = this.transcriptPath(sessionId);
-    await stat(transcriptPath);
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupName = `bitacora.respaldo-${stamp}.md`;
-    await copyFile(transcriptPath, join(dirname(transcriptPath), backupName));
-    await writeFile(transcriptPath, content, "utf8");
-    return { saved: true, backupName };
+    return saveTranscriptRevision(this.transcriptPath(sessionId), sessionId, content,
+      () => this.invalidateNarrativeAfterTranscriptEdit(sessionId));
   }
 
   async saveNarrative(sessionId: string, content: string): Promise<SaveResult> {
@@ -391,25 +396,32 @@ export class DottySupervisor {
       await copyFile(narrativePath, join(exportDirectory, backupName));
     }
 
-    const updatedAt = new Date().toISOString();
-    await writeFile(narrativePath, `${content.trim()}\n`, "utf8");
+    await this.invalidateNarrativeAfterTranscriptEdit(sessionId);
+    await writeFileAtomically(narrativePath, `${content.trim()}\n`);
     await writeFile(
       join(exportDirectory, "guion.estado.json"),
       `${JSON.stringify({
-        state: "ready",
+        state: "generating",
         sessionId,
         model: "manual",
-        progress: 1,
-        phase: "Guion manual listo para publicar",
-        updatedAt,
+        progress: 0.95,
+        phase: "Verificando la edición manual",
+        updatedAt: new Date().toISOString(),
       }, null, 2)}\n`,
       "utf8",
     );
-    await this.runBotScript(
-      join("apps", "bot", "scripts", "editorial-cli.ts"),
-      ["verify", sessionId],
-      120_000,
-    ).catch(() => undefined);
+    try {
+      await this.runBotScript(
+        join("apps", "bot", "scripts", "editorial-cli.ts"),
+        ["verify", sessionId],
+        120_000,
+      );
+      const review = await this.readNarrativeReview(sessionId, false);
+      await this.writeNarrativeReviewStatus(sessionId, review);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.writeNarrativeReviewStatus(sessionId, null, message);
+    }
     return { saved: true, ...(backupName === undefined ? {} : { backupName }) };
   }
 
@@ -458,6 +470,58 @@ export class DottySupervisor {
     }
   }
 
+  async verifyNarrative(sessionId: string): Promise<NarrativeOperationResult> {
+    this.validateSessionId(sessionId);
+    try {
+      await this.runBotScript(
+        join("apps", "bot", "scripts", "editorial-cli.ts"),
+        ["verify", sessionId],
+        120_000,
+      );
+      const review = await this.readNarrativeReview(sessionId, false);
+      await this.writeNarrativeReviewStatus(sessionId, review);
+      return { ok: true, message: "Verificación editorial actualizada." };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `No se pudo verificar el guion: ${message.slice(-600)}` };
+    }
+  }
+
+  async approveNarrativeScene(sessionId: string, sceneId: string): Promise<NarrativeOperationResult> {
+    this.validateSessionId(sessionId);
+    if (!/^scene_\d+$/u.test(sceneId) && sceneId !== "manual") {
+      return { ok: false, message: "La escena indicada no es válida." };
+    }
+    try {
+      await this.runBotScript(
+        join("apps", "bot", "scripts", "narrative-cli.ts"),
+        ["approve-scene", sessionId, sceneId],
+        120_000,
+      );
+      await this.writeNarrativeReviewStatus(sessionId, await this.readNarrativeReview(sessionId, false));
+      return { ok: true, message: "Escena revisada y aceptada manualmente." };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `No se pudo aceptar la escena: ${message.slice(-600)}` };
+    }
+  }
+
+  async approveNarrative(sessionId: string): Promise<NarrativeOperationResult> {
+    this.validateSessionId(sessionId);
+    try {
+      await this.runBotScript(
+        join("apps", "bot", "scripts", "narrative-cli.ts"),
+        ["approve", sessionId],
+        120_000,
+      );
+      await this.writeNarrativeReviewStatus(sessionId, await this.readNarrativeReview(sessionId, false));
+      return { ok: true, message: "Guion aprobado y habilitado para publicar." };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `No se pudo aprobar el guion: ${message.slice(-600)}` };
+    }
+  }
+
   async publishNarrative(sessionId: string): Promise<NarrativeOperationResult> {
     this.validateSessionId(sessionId);
     try {
@@ -485,10 +549,12 @@ export class DottySupervisor {
   async openDiscord(sessionId: string): Promise<boolean> {
     const manifest = await this.readManifest(sessionId);
     const guildId = manifest?.discordGuildId;
-    const threadId = (manifest?.publication as { threadId?: unknown } | undefined)
-      ?.threadId;
-    if (typeof guildId !== "string" || typeof threadId !== "string") return false;
-    await shell.openExternal(`https://discord.com/channels/${guildId}/${threadId}`);
+    const publication = manifest?.publication as { threadId?: unknown; channelId?: unknown } | undefined;
+    const targetId = typeof publication?.threadId === "string"
+      ? publication.threadId
+      : typeof publication?.channelId === "string" ? publication.channelId : null;
+    if (typeof guildId !== "string" || targetId === null) return false;
+    await shell.openExternal(`https://discord.com/channels/${guildId}/${targetId}`);
     return true;
   }
 
@@ -649,8 +715,8 @@ export class DottySupervisor {
         available: health.status === "ok",
         model: health.model ?? null,
         configuredDevice: health.configured_device ?? null,
-        activeDevice: health.active_device ?? null,
-        computeType: health.compute_type ?? null,
+        activeDevice: health.model_loaded === false ? null : health.active_device ?? null,
+        computeType: health.active_compute_type ?? health.compute_type ?? null,
         queue: { ...emptyQueue, ...health.queue },
         work: health.work ?? null,
       };
@@ -805,17 +871,112 @@ export class DottySupervisor {
     error?: string;
   }> {
     try {
-      return JSON.parse(
+      const parsed = JSON.parse(
         await readFile(join(this.exportsRoot, sessionId, "guion.estado.json"), "utf8"),
       ) as {
-        state: "missing" | "queued" | "generating" | "ready" | "failed";
-        progress: number;
-        phase: string;
+        state?: unknown;
+        progress?: unknown;
+        phase?: unknown;
         error?: string;
+      };
+      const scriptExists = await this.pathExists(this.narrativePath(sessionId));
+      const state = parsed.state === "queued" || parsed.state === "generating" || parsed.state === "failed" || parsed.state === "missing"
+        ? parsed.state
+        : scriptExists ? "ready" : "missing";
+      return {
+        state,
+        progress: typeof parsed.progress === "number" && Number.isFinite(parsed.progress)
+          ? Math.max(0, Math.min(1, parsed.progress))
+          : state === "ready" ? 1 : 0,
+        phase: typeof parsed.phase === "string" && parsed.phase.trim() !== ""
+          ? parsed.phase
+          : state === "ready" ? "Guion disponible" : "Sin generar",
+        ...(typeof parsed.error === "string" && parsed.error.trim() !== "" ? { error: parsed.error } : {}),
       };
     } catch {
       const ready = await this.pathExists(this.narrativePath(sessionId));
       return { state: ready ? "ready" : "missing", progress: ready ? 1 : 0, phase: ready ? "Guion disponible" : "Sin generar" };
+    }
+  }
+
+  private async writeNarrativeReviewStatus(
+    sessionId: string,
+    review: NarrativeReview | null,
+    verificationError?: string,
+  ): Promise<void> {
+    const approved = review?.state === "APPROVED";
+    const readyForApproval = review?.state === "READY_FOR_REVIEW";
+    const state = "ready";
+    const phase = approved
+      ? "Guion aprobado para publicar"
+      : readyForApproval
+        ? "Guion verificado; aprobación final pendiente"
+        : verificationError
+          ? "Guion guardado; la verificación falló"
+          : "Guion disponible; requiere correcciones antes de publicar";
+    await writeFile(
+      join(this.exportsRoot, sessionId, "guion.estado.json"),
+      `${JSON.stringify({
+        state,
+        sessionId,
+        model: "manual",
+        progress: 1,
+        phase,
+        updatedAt: new Date().toISOString(),
+        ...(verificationError ? { error: verificationError.slice(-600) } : {}),
+      }, null, 2)}\n`,
+      "utf8",
+    );
+  }
+
+  private async readNarrativeReview(sessionId: string, includeIssues: boolean): Promise<NarrativeReview | null> {
+    this.validateSessionId(sessionId);
+    const exportDirectory = resolve(this.exportsRoot, sessionId);
+    try {
+      const review = JSON.parse(
+        await readFile(join(exportDirectory, "guion.revision.json"), "utf8"),
+      ) as NarrativeReview;
+      const normalizedReview: NarrativeReview = {
+        ...review,
+        scenes: review.scenes.map((scene) => ({ ...scene, blockers: scene.blockers ?? [], issues: scene.issues ?? [] })),
+      };
+      if (!includeIssues) return normalizedReview;
+      const scenes = await Promise.all(normalizedReview.scenes.map(async (scene) => {
+        if (!/^scene_\d+$/u.test(scene.id)) return { ...scene, issues: scene.issues ?? [] };
+        try {
+          const artifact = JSON.parse(
+            await readFile(join(exportDirectory, "guion.work", `${scene.id}.json`), "utf8"),
+          ) as {
+            audit?: {
+              auditStatus?: string;
+              reason?: string;
+              reviewReason?: string;
+              issues?: Array<{ type?: string; severity?: string; reason?: string; sceneText?: string }>;
+            };
+          };
+          const issues = (artifact.audit?.issues ?? [])
+            .filter((issue) => issue.severity === "error" || issue.severity === "warning")
+            .map((issue) => ({
+              ...(issue.type ? { type: issue.type } : {}),
+              severity: issue.severity as "error" | "warning",
+              reason: issue.reason ?? "Observación editorial sin detalle.",
+              ...(issue.sceneText ? { sceneText: issue.sceneText } : {}),
+            }));
+          return {
+            ...scene,
+            issues,
+            ...(artifact.audit?.auditStatus ? { auditStatus: artifact.audit.auditStatus } : {}),
+            ...((artifact.audit?.reviewReason ?? artifact.audit?.reason)
+              ? { reviewReason: artifact.audit?.reviewReason ?? artifact.audit?.reason }
+              : {}),
+          };
+        } catch {
+          return { ...scene, issues: scene.issues ?? [] };
+        }
+      }));
+      return { ...review, scenes };
+    } catch {
+      return null;
     }
   }
 
@@ -838,6 +999,44 @@ export class DottySupervisor {
       return await readFile(this.transcriptPath(sessionId), "utf8");
     } catch {
       return null;
+    }
+  }
+
+  private async invalidateNarrativeAfterTranscriptEdit(sessionId: string): Promise<void> {
+    const exportDirectory = join(this.exportsRoot, sessionId);
+    const reviewPath = join(exportDirectory, "guion.revision.json");
+    try {
+      const current = JSON.parse(await readFile(reviewPath, "utf8")) as NarrativeReview;
+      const { approval: _approval, ...withoutApproval } = current;
+      await writeFileAtomically(reviewPath, `${JSON.stringify({
+        ...withoutApproval,
+        state: "NEEDS_REVIEW",
+        reason: "SOURCE_TRANSCRIPT_CHANGED",
+        updatedAt: new Date().toISOString(),
+        scenes: current.scenes.map((scene) => ({
+          ...scene,
+          status: "NEEDS_REVIEW",
+          approvedAt: undefined,
+          approvedBy: undefined,
+        })),
+      }, (_key, value) => value === undefined ? undefined : value, 2)}\n`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (await this.pathExists(this.narrativePath(sessionId))) {
+      try {
+        const statusPath = join(exportDirectory, "guion.estado.json");
+        const previous = JSON.parse(await readFile(statusPath, "utf8")) as Record<string, unknown>;
+        await writeFile(statusPath, `${JSON.stringify({
+          ...previous,
+          state: "ready",
+          progress: 1,
+          phase: "Transcripción corregida; regenera el guion antes de publicarlo",
+          updatedAt: new Date().toISOString(),
+        }, null, 2)}\n`, "utf8");
+      } catch {
+        // La revisión ya quedó invalidada; el estado es solo información visual.
+      }
     }
   }
 
@@ -885,7 +1084,7 @@ export class DottySupervisor {
       if (!unique.has(key)) unique.set(key, { name: speakerName, userId: speakerUserId ?? null, source: "manifest" });
     }
     if (transcript) {
-      const transcriptMatches = [...transcript.matchAll(/\[(\d{1,2}:\d{2}:\d{2})\]\s*\*\*(.+?)\*\*:/g)];
+      const transcriptMatches = [...transcript.matchAll(/\[(\d{1,2}:\d{2}:\d{2})\]\s*\*\*(.+?):\*\*/g)];
       for (const match of transcriptMatches) {
         const speaker = match[2]?.trim();
         if (!speaker) continue;
@@ -957,40 +1156,169 @@ export class DottySupervisor {
   }
 
   private async computeProcessingStatus(sessionId: string, manifest: Record<string, unknown> | null): Promise<SessionProcessingStatus> {
-    const transcriptExists = await this.pathExists(this.transcriptPath(sessionId)).catch(() => false);
-    const narrative = await this.readNarrativeStatus(sessionId);
-    const status = typeof manifest?.status === "string" ? String(manifest.status) : "unknown";
-    const now = new Date().toISOString();
-    if (status === "recording" || status === "paused" || status === "finalizing") {
-      return {
-        sessionId,
-        state: "recording",
-        audio: { status: "running", details: status },
-        transcription: { status: transcriptExists ? "completed" : "pending" },
-        narrative: { status: narrative.state === "ready" ? "completed" : narrative.state === "generating" ? "running" : "pending" },
-        publication: { status: "unknown" },
-        updatedAt: now,
-      };
-    }
-    if (status === "completed" || status === "failed" || status === "interrupted") {
-      return {
-        sessionId,
-        state: status === "completed" ? "completed" : status === "failed" ? "error" : "unknown",
-        audio: { status: "completed" },
-        transcription: { status: transcriptExists ? "completed" : "unknown" },
-        narrative: { status: narrative.state === "ready" ? "completed" : narrative.state === "failed" ? "error" : narrative.state === "generating" ? "running" : narrative.state === "queued" ? "pending" : "unknown" },
-        publication: { status: "unknown" },
-        updatedAt: now,
-      };
-    }
+    const exportDirectory = join(this.exportsRoot, sessionId);
+    const [transcript, script, narrative, review, evidenceBundle, transcriptRaw, qualityReport, generationState] = await Promise.all([
+      readFile(this.transcriptPath(sessionId), "utf8").catch(() => null),
+      readFile(this.narrativePath(sessionId), "utf8").catch(() => null),
+      this.readNarrativeStatus(sessionId),
+      this.readNarrativeReview(sessionId, false),
+      readFile(join(exportDirectory, "guion.evidencias.json"), "utf8")
+        .then((content) => JSON.parse(content) as { blocks?: Array<{ evidenceIds?: unknown[]; evidence?: { extraction_status?: unknown } }> })
+        .catch(() => null),
+      readFile(join(exportDirectory, "transcript.raw.json"), "utf8")
+        .then((content) => JSON.parse(content) as { quality?: { linesToReview?: number }; diagnostics?: unknown[] })
+        .catch(() => null),
+      readFile(join(this.dataRoot, ".diagnostics", sessionId, "transcription-report.json"), "utf8")
+        .then((content) => JSON.parse(content) as { outcome?: "success" | "warning" | "failure"; summary?: { linesToReview?: number; suspectedHallucinations?: number; unintelligible?: number } })
+        .catch(() => null),
+      readFile(join(exportDirectory, "guion.work", "generation-state.json"), "utf8")
+        .then((content) => JSON.parse(content) as { lastBlock?: number; lastScene?: number })
+        .catch(() => null),
+    ]);
+    const recordingStatus = typeof manifest?.status === "string" ? String(manifest.status) : "unknown";
+    const recordingActive = ["recording", "paused", "finalizing"].includes(recordingStatus);
+    const recordingComplete = ["completed", "failed", "interrupted"].includes(recordingStatus);
+    const publication = manifest?.publication as { threadId?: unknown; messageIds?: unknown } | undefined;
+    const published = typeof publication?.threadId === "string"
+      || (Array.isArray(publication?.messageIds) && publication.messageIds.length > 0);
+    const scenes = review?.scenes ?? [];
+    const pendingScenes = scenes.filter((scene) => scene.status === "NEEDS_REVIEW").length;
+    const structuralBlockers = scenes.reduce((count, scene) => count + (scene.blockers?.length ?? 0), 0);
+    const sceneErrors = scenes.reduce((count, scene) => count + scene.errorCount, 0);
+    const sceneWarnings = scenes.reduce((count, scene) => count + scene.warningCount, 0);
+    const scriptAssembled = script !== null
+      && /^#\s+ESCENA\b/imu.test(script)
+      && (transcript === null || script.trim() !== transcript.trim());
+    const generationRunning = narrative.state === "generating" || narrative.state === "queued";
+    const reviewBlocked = review?.state === "NEEDS_REVIEW";
+    const approved = review?.state === "APPROVED";
+    const readyForApproval = review?.state === "READY_FOR_REVIEW";
+    const evidenceBlocks = evidenceBundle?.blocks ?? [];
+    const failedEvidenceBlocks = evidenceBlocks.filter((block) => block.evidence?.extraction_status === "EVIDENCE_EXTRACTION_FAILED").length;
+    const emptyEvidenceBlocks = evidenceBlocks.filter((block) => !Array.isArray(block.evidenceIds) || block.evidenceIds.length === 0).length;
+    const qualityOutcome = qualityReport?.outcome;
+    const qualityWarnings = Number(qualityReport?.summary?.linesToReview ?? transcriptRaw?.quality?.linesToReview ?? 0)
+      + Number(qualityReport?.summary?.suspectedHallucinations ?? transcriptRaw?.diagnostics?.length ?? 0)
+      + Number(qualityReport?.summary?.unintelligible ?? 0);
+
+    const stages: ProcessingStage[] = [
+      {
+        id: "capture",
+        label: "Captura de audio",
+        status: recordingActive ? "running" : recordingComplete ? "completed" : "unknown",
+        details: recordingActive ? `Sesión ${recordingStatus}` : recordingComplete ? "Grabación cerrada" : "Sin estado de grabación",
+        artifact: "manifest.json",
+      },
+      {
+        id: "transcription",
+        label: "Transcripción",
+        status: transcript !== null ? "completed" : recordingActive ? "pending" : "unknown",
+        details: transcript !== null ? "Bitácora generada" : "Esperando texto consolidado",
+        ...(transcript !== null ? { artifact: "bitacora.md" } : {}),
+      },
+      {
+        id: "raw_quality",
+        label: "Calidad del raw",
+        status: qualityOutcome === "failure" ? "error" : qualityOutcome === "warning" || qualityWarnings > 0 ? "warning" : transcriptRaw !== null ? "completed" : transcript !== null ? "warning" : "pending",
+        details: qualityReport !== null
+          ? qualityOutcome === "success" ? "Informe de calidad sin alertas" : `${qualityWarnings} elementos requieren revisión`
+          : transcriptRaw !== null ? "Raw disponible; informe consolidado pendiente" : transcript !== null ? "No hay raw para auditar" : "Esperando transcripción",
+        warnings: qualityWarnings,
+        ...(transcriptRaw !== null ? { artifact: "transcript.raw.json" } : {}),
+      },
+      {
+        id: "evidence",
+        label: "Extracción de evidencias",
+        status: failedEvidenceBlocks > 0 ? "warning" : evidenceBundle !== null ? "completed" : generationRunning ? "running" : transcript !== null ? "pending" : "unknown",
+        details: evidenceBundle !== null
+          ? failedEvidenceBlocks > 0 || emptyEvidenceBlocks > 0
+            ? `${evidenceBlocks.length} bloques; ${failedEvidenceBlocks} fallidos y ${emptyEvidenceBlocks} sin evidencia trazable`
+            : `${evidenceBlocks.length} bloques procesados`
+          : generationRunning ? narrative.phase : "Sin evidencias extraídas",
+        ...(generationState?.lastBlock !== undefined ? { current: generationState.lastBlock } : {}),
+        errors: failedEvidenceBlocks,
+        warnings: emptyEvidenceBlocks,
+        ...(evidenceBundle !== null ? { artifact: "guion.evidencias.json" } : {}),
+      },
+      {
+        id: "scenes",
+        label: "Redacción de escenas",
+        status: structuralBlockers > 0 ? "blocked" : scenes.length > 0 ? "completed" : generationRunning ? "running" : "pending",
+        details: structuralBlockers > 0 ? `${structuralBlockers} bloqueos estructurales` : scenes.length > 0 ? `${scenes.length} escenas generadas` : "Sin escenas verificables",
+        ...(generationState?.lastScene !== undefined ? { current: generationState.lastScene } : {}),
+        ...(scenes.length > 0 ? { total: scenes.length } : {}),
+        errors: structuralBlockers,
+        ...(scenes.length > 0 ? { artifact: "guion.work" } : {}),
+      },
+      {
+        id: "audit",
+        label: "Auditoría por escena",
+        status: pendingScenes > 0 ? "blocked" : review !== null ? "completed" : generationRunning ? "running" : "pending",
+        details: pendingScenes > 0 ? `${pendingScenes} escenas requieren acción` : review !== null ? "Auditoría consolidada" : "Aún no ejecutada",
+        errors: sceneErrors,
+        warnings: sceneWarnings,
+        ...(review !== null ? { artifact: "guion.revision.json" } : {}),
+      },
+      {
+        id: "assembly",
+        label: "Ensamblado del guion",
+        status: scriptAssembled ? "completed" : script !== null ? "blocked" : generationRunning ? "running" : "pending",
+        details: scriptAssembled ? "Guion narrativo ensamblado" : script !== null ? "El guion no tiene estructura narrativa válida" : "Esperando escenas válidas",
+        ...(script !== null ? { artifact: "guion.md" } : {}),
+      },
+      {
+        id: "verification",
+        label: "Verificación final",
+        status: review?.verification.valid ? "completed" : review !== null ? "blocked" : "pending",
+        details: review === null ? "No ejecutada" : review.verification.valid ? `${review.verification.warningCount} avisos` : `${review.verification.errorCount} errores`,
+        ...(review !== null ? {
+          errors: review.verification.errorCount,
+          warnings: review.verification.warningCount,
+          artifact: "guion.verificacion.json",
+        } : {}),
+      },
+      {
+        id: "approval",
+        label: "Aprobación humana",
+        status: approved ? "completed" : readyForApproval ? "pending" : reviewBlocked ? "blocked" : "pending",
+        details: approved ? "Aprobado para publicación" : readyForApproval ? "Esperando aprobación final" : reviewBlocked ? "Bloqueada hasta corregir incidencias" : "Aún no disponible",
+      },
+      {
+        id: "publication",
+        label: "Publicación en Discord",
+        status: published && !approved ? "warning" : published ? "completed" : approved ? "pending" : "blocked",
+        details: published && !approved ? "Existe una publicación anterior; el contenido actual requiere revisión" : published ? "Publicación confirmada" : approved ? "Lista para publicar" : "Requiere aprobación previa",
+      },
+    ];
+
+    const state: SessionProcessingStatus["state"] = narrative.state === "failed"
+      ? "error"
+      : recordingActive
+        ? "recording"
+        : generationRunning
+          ? "generating_narrative"
+          : reviewBlocked
+            ? "review_blocked"
+            : readyForApproval
+              ? "awaiting_approval"
+              : approved && published
+                ? "completed"
+                : approved
+                  ? "narrative_ready"
+                  : transcript !== null
+                    ? "transcript_ready"
+                    : "unknown";
+    const narrativeStage = stages.find((stage) => stage.id === "verification")!;
+    const publicationStage = stages.find((stage) => stage.id === "publication")!;
     return {
       sessionId,
-      state: "unknown",
-      audio: { status: "unknown" },
-      transcription: { status: transcriptExists ? "completed" : "unknown" },
-      narrative: { status: narrative.state === "ready" ? "completed" : narrative.state === "failed" ? "error" : narrative.state === "generating" ? "running" : narrative.state === "queued" ? "pending" : "unknown" },
-      publication: { status: "unknown" },
-      updatedAt: now,
+      state,
+      audio: { status: stages[0]!.status, details: stages[0]!.details },
+      transcription: { status: stages[1]!.status, details: stages[1]!.details },
+      narrative: { status: reviewBlocked ? "blocked" : narrative.state === "failed" ? "error" : generationRunning ? "running" : approved ? "completed" : narrativeStage.status, details: narrative.phase },
+      publication: { status: publicationStage.status, details: publicationStage.details },
+      stages,
+      updatedAt: new Date().toISOString(),
     };
   }
 
