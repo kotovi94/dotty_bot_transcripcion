@@ -9,6 +9,8 @@ import type { Logger } from "pino";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
 import type { VoiceCaptureManager } from "../recording/voice-capture-manager.ts";
+import type { AdaptiveVocabularyStore } from "../transcription/adaptive-vocabulary.ts";
+import { TranscriptionDispatcher } from "../transcription/transcription-dispatcher.ts";
 import { SessionAdministration } from "./session-administration.ts";
 import type { SessionService } from "./session-service.ts";
 
@@ -16,6 +18,88 @@ const directories: string[] = [];
 after(async () => Promise.all(directories.map((directory) => rm(directory, { recursive: true }))));
 
 describe("session administration", () => {
+  it("leaves existing files and blocks redispatch when recovery fails after DELETE", async () => {
+    const root = await mkdtemp(join(tmpdir(), "dotty-reprocess-prisma-"));
+    directories.push(root);
+    const recordings = join(root, "recordings");
+    const exports = join(root, "exports");
+    const directory = join(recordings, "session-1");
+    const audioPath = join(directory, "audio", "clip_001", "user-1.wav");
+    await mkdir(join(directory, ".transcription-jobs"), { recursive: true });
+    await mkdir(join(directory, "audio", "clip_001"), { recursive: true });
+    await mkdir(join(exports, "session-1"), { recursive: true });
+    const files = new Map([
+      [join(directory, "manifest.json"), JSON.stringify({
+        version: 1,
+        sessionId: "session-1",
+        campaignId: "campaign-1",
+        status: "completed",
+        chunks: [{ id: "chunk-1", file: "audio/clip_001/user-1.wav" }],
+      })],
+      [join(directory, ".transcription-jobs", "chunk-1"), "queued"],
+      [join(directory, ".transcription-enqueued"), "queued"],
+      [join(directory, ".transcription-failed"), "failed"],
+      [join(directory, ".transcription-ready"), "ready"],
+      [join(directory, ".transcription-published"), "published"],
+      [join(exports, "session-1", "bitacora.md"), "old export"],
+    ]);
+    for (const [path, contents] of files) await writeFile(path, contents);
+    const audio = Buffer.from([0, 1, 2, 255]);
+    await writeFile(audioPath, audio);
+
+    let status = "failed";
+    let recoverCalls = 0;
+    const requests: Array<{ url: string; method: string | undefined }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      requests.push({ url: String(input), method: init?.method });
+      return new Response(JSON.stringify({ deleted: 1 }), { status: 200 });
+    };
+    try {
+      const administration = new SessionAdministration(
+        { channels: { fetch: async () => null } } as unknown as Client,
+        {} as CampaignService,
+        {
+          findById: async () => ({ id: "session-1", discordGuildId: "guild-1", status }),
+          recoverFailed: async () => {
+            recoverCalls++;
+            throw new Error("Prisma unavailable");
+          },
+        } as unknown as SessionService,
+        {} as VoiceCaptureManager,
+        recordings,
+        exports,
+        "http://127.0.0.1:8765",
+        "secret",
+        { info() {}, error() {} } as unknown as Logger,
+      );
+      await assert.rejects(administration.reprocess("session-1", "guild-1"), /Prisma unavailable/);
+      assert.equal(recoverCalls, 1);
+      assert.equal(status, "failed");
+      assert.deepEqual(requests, [{
+        url: "http://127.0.0.1:8765/v1/sessions/session-1",
+        method: "DELETE",
+      }]);
+      for (const [path, contents] of files) {
+        assert.equal(await readFile(path, "utf8"), contents, path);
+      }
+      assert.deepEqual(await readFile(audioPath), audio);
+
+      const dispatcher = new TranscriptionDispatcher(
+        recordings,
+        {} as CampaignService,
+        "http://127.0.0.1:8765",
+        "secret",
+        {} as AdaptiveVocabularyStore,
+        { info() {}, warn() {}, debug() {} } as unknown as Logger,
+      );
+      await dispatcher.dispatchCompleted();
+      assert.equal(requests.length, 1, "the existing enqueued marker prevents a new POST");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("keeps a failed session and its files intact when the transcriber returns 503", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-reprocess-503-"));
     directories.push(root);
