@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants, promises as fs } from "node:fs";
 import { basename, join } from "node:path";
 import { SessionFileCoordinator } from "./session-file-coordinator.ts";
+import type { ReprocessIntentEligibility } from "./reprocess-intent-eligibility.ts";
 
 export const reprocessPhases = [
   "prepared", "delete-confirmed", "recovering", "redispatch-ready", "completed",
@@ -37,6 +38,7 @@ export class ReprocessIntentStore {
   constructor(
     private readonly root: string,
     private readonly coordinator: SessionFileCoordinator,
+    private readonly eligibility: Pick<ReprocessIntentEligibility, "assertEligible">,
     private readonly operations: StoreOperations = {},
   ) {}
 
@@ -79,7 +81,9 @@ export class ReprocessIntentStore {
   }
 
   async create(sessionId: string, operationId: string = randomUUID()): Promise<ReprocessIntent> {
-    return this.coordinator.runExclusive(sessionId, () => this.locked(sessionId, async (path) => {
+    return this.coordinator.runExclusive(sessionId, async () => {
+      await this.eligibility.assertEligible(sessionId);
+      return this.locked(sessionId, async (path) => {
       if (await exists(path) || await exists(`${path}.bak`)) {
         throw new ReprocessIntentError("Intent already exists");
       }
@@ -96,7 +100,8 @@ export class ReprocessIntentStore {
       await fs.rename(temporary, path);
       await syncDirectory(this.root);
       return intent;
-    }));
+      });
+    });
   }
 
   async updatePhase(sessionId: string, operationId: string, phase: ReprocessPhase): Promise<ReprocessIntent> {

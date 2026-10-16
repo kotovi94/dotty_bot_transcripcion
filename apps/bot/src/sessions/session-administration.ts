@@ -21,6 +21,8 @@ import {
 } from "../transcription/transcript-corrections.ts";
 import type { ManagedSession } from "./session-repository.ts";
 import type { SessionService } from "./session-service.ts";
+import type { ReprocessIntentStore } from "./reprocess-intent-store.ts";
+import type { SessionFileCoordinator } from "./session-file-coordinator.ts";
 
 const buttonPrefix = "dotty:session-delete:";
 const campaignButtonPrefix = "dotty:campaign-delete:";
@@ -37,6 +39,8 @@ export class SessionAdministration {
     private readonly transcriberBaseUrl: string,
     private readonly transcriberSecret: string,
     private readonly logger: Logger,
+    private readonly intents: ReprocessIntentStore,
+    private readonly coordinator: SessionFileCoordinator,
   ) {}
 
   async deleteCampaign(
@@ -60,31 +64,36 @@ export class SessionAdministration {
   }
 
   async delete(sessionId: string, discordGuildId: string): Promise<ManagedSession> {
-    const session = await this.sessions.findById(sessionId);
-    if (session === null || session.discordGuildId !== discordGuildId) {
-      throw new SessionDeletionError("La sesión ya no existe.");
-    }
+    return this.coordinator.runExclusive(sessionId, async () => {
+      const session = await this.sessions.findById(sessionId);
+      if (session === null || session.id !== sessionId || session.discordGuildId !== discordGuildId) {
+        throw new SessionDeletionError("La sesión ya no existe.");
+      }
+      let pending: boolean;
+      try {
+        pending = await this.intents.hasPending(sessionId);
+      } catch (error) {
+        throw new SessionDeletionError("No se pudo verificar la intención de reprocesamiento; se conserva la grabación.", { cause: error });
+      }
+      if (pending) {
+        throw new SessionDeletionError("La sesión tiene un reprocesamiento pendiente; se conserva la grabación.");
+      }
 
-    if (session.status === "recording" || session.status === "paused") {
-      await this.recordings.cancel(discordGuildId);
-    }
+      if (session.status === "recording" || session.status === "paused") {
+        await this.recordings.cancel(discordGuildId, session.id);
+      }
 
-    await this.deleteTranscriberJobs(session.id, false);
-    await this.deleteDiscordPublication(session);
-    await fs.rm(join(this.recordingsRoot, session.id), {
-      recursive: true,
-      force: true,
+      await this.deleteTranscriberJobs(session.id, false);
+      await this.deleteDiscordPublication(session);
+      await fs.rm(join(this.recordingsRoot, session.id), { recursive: true, force: true });
+      await fs.rm(join(this.exportsRoot, session.id), { recursive: true, force: true });
+      await this.sessions.deleteById(session.id);
+      this.logger.info(
+        { sessionId: session.id, sequenceNumber: session.sequenceNumber },
+        "Sesion eliminada por un administrador",
+      );
+      return session;
     });
-    await fs.rm(join(this.exportsRoot, session.id), {
-      recursive: true,
-      force: true,
-    });
-    await this.sessions.deleteById(session.id);
-    this.logger.info(
-      { sessionId: session.id, sequenceNumber: session.sequenceNumber },
-      "Sesion eliminada por un administrador",
-    );
-    return session;
   }
 
   async reprocess(sessionId: string, discordGuildId: string): Promise<ManagedSession> {

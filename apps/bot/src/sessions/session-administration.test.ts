@@ -12,12 +12,49 @@ import type { VoiceCaptureManager } from "../recording/voice-capture-manager.ts"
 import type { AdaptiveVocabularyStore } from "../transcription/adaptive-vocabulary.ts";
 import { TranscriptionDispatcher } from "../transcription/transcription-dispatcher.ts";
 import { SessionAdministration } from "./session-administration.ts";
+import { ReprocessIntentStore } from "./reprocess-intent-store.ts";
+import { SessionFileCoordinator } from "./session-file-coordinator.ts";
 import type { SessionService } from "./session-service.ts";
 
 const directories: string[] = [];
 after(async () => Promise.all(directories.map((directory) => rm(directory, { recursive: true }))));
 
+function protection(root: string): [ReprocessIntentStore, SessionFileCoordinator] {
+  const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
+  return [new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator,
+    { assertEligible: async (_sessionId: string) => {} }), coordinator];
+}
+
 describe("session administration", () => {
+  it("passes the requested session identity to capture cancellation and stops on mismatch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "dotty-delete-identity-"));
+    directories.push(root);
+    const recordings = join(root, "recordings");
+    const active = join(recordings, "session-a");
+    const requested = join(recordings, "session-b");
+    await mkdir(active, { recursive: true });
+    await mkdir(requested, { recursive: true });
+    await writeFile(join(active, "active.wav"), "active audio");
+    await writeFile(join(requested, "requested.wav"), "requested audio");
+    const calls: Array<[string, string]> = [];
+    const recordingsManager = { cancel: async (guildId: string, sessionId: string) => {
+      calls.push([guildId, sessionId]);
+      throw new Error("Active voice capture does not match the requested session.");
+    } } as unknown as VoiceCaptureManager;
+    const administration = new SessionAdministration(
+      {} as Client,
+      {} as CampaignService,
+      { findById: async () => ({ id: "session-b", discordGuildId: "guild", status: "recording" }) } as unknown as SessionService,
+      recordingsManager, recordings, join(root, "exports"), "http://127.0.0.1:8765", "secret",
+      { info() {}, error() {} } as unknown as Logger,
+      ...protection(root),
+    );
+    await assert.rejects(administration.delete("session-b", "guild"), /does not match/);
+    assert.deepEqual(calls, [["guild", "session-b"]]);
+    assert.equal(await readFile(join(active, "active.wav"), "utf8"), "active audio");
+    assert.equal(await readFile(join(requested, "requested.wav"), "utf8"), "requested audio");
+  });
+
   it("leaves existing files and blocks redispatch when recovery fails after DELETE", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-reprocess-prisma-"));
     directories.push(root);
@@ -72,6 +109,7 @@ describe("session administration", () => {
         "http://127.0.0.1:8765",
         "secret",
         { info() {}, error() {} } as unknown as Logger,
+        ...protection(root),
       );
       await assert.rejects(administration.reprocess("session-1", "guild-1"), /Prisma unavailable/);
       assert.equal(recoverCalls, 1);
@@ -156,6 +194,7 @@ describe("session administration", () => {
         "http://127.0.0.1:8765",
         "secret",
         { info() {}, error() {} } as unknown as Logger,
+        ...protection(root),
       );
 
       await assert.rejects(
@@ -246,6 +285,7 @@ describe("session administration", () => {
         "http://127.0.0.1:8765",
         "secret",
         { info() {}, error() {} } as unknown as Logger,
+        ...protection(root),
       );
 
       await administration.reprocess("session-1", "guild-1");

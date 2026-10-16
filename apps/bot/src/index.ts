@@ -27,6 +27,7 @@ import { AudioRetentionManager } from "./storage/audio-retention-manager.ts";
 import { PrismaSessionRepository } from "./sessions/session-repository.ts";
 import { SessionService } from "./sessions/session-service.ts";
 import { ReprocessIntentStore } from "./sessions/reprocess-intent-store.ts";
+import { ReprocessIntentEligibility } from "./sessions/reprocess-intent-eligibility.ts";
 import { SessionFileCoordinator } from "./sessions/session-file-coordinator.ts";
 import {
   handleCampaignDeleteButton,
@@ -56,7 +57,11 @@ const campaigns = new CampaignService(new PrismaCampaignRepository(database));
 const sessionRepository = new PrismaSessionRepository(database);
 const sessions = new SessionService(sessionRepository);
 const sessionCoordinator = new SessionFileCoordinator(resolve(environment.DOTTY_DATA_DIR, "session-locks"));
-const reprocessIntents = new ReprocessIntentStore(resolve(environment.DOTTY_DATA_DIR, "reprocess-intents"), sessionCoordinator);
+const reprocessIntents = new ReprocessIntentStore(
+  resolve(environment.DOTTY_DATA_DIR, "reprocess-intents"),
+  sessionCoordinator,
+  new ReprocessIntentEligibility(sessions, resolve(environment.DOTTY_DATA_DIR, "recordings")),
+);
 const diagnostics = new DottyDiagnostics(
   campaigns,
   sessions,
@@ -143,6 +148,8 @@ const sessionAdministration = new SessionAdministration(
   environment.TRANSCRIBER_BASE_URL,
   transcriberSecret,
   logger,
+  reprocessIntents,
+  sessionCoordinator,
 );
 const audioRetention = new AudioRetentionManager(
   campaigns,

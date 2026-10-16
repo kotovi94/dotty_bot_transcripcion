@@ -10,6 +10,8 @@ import type { CampaignService } from "../campaigns/campaign-service.ts";
 import type { RecordingManifest } from "../recording/voice-capture-manager.ts";
 import { ReprocessIntentStore } from "../sessions/reprocess-intent-store.ts";
 import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
+
+const eligible = { assertEligible: async (_sessionId: string) => {} };
 import { AudioRetentionManager } from "./audio-retention-manager.ts";
 
 const directories: string[] = [];
@@ -53,7 +55,7 @@ describe("audio retention", () => {
     const logger = { info() {}, error() {} } as unknown as Logger;
     const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
     const manager = new AudioRetentionManager(campaigns, recordings, exports, logger,
-      new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator), coordinator);
+      new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible), coordinator);
     assert.equal((await manager.report("campaign-1")).eligibleForCleanup, 1);
     assert.equal(await manager.cleanupExpired(), 1);
     await assert.rejects(access(join(audioDirectory, "voice.wav")));
@@ -118,7 +120,7 @@ describe("audio retention", () => {
         recordings,
         join(root, "exports"),
         { info() {}, error() {} } as unknown as Logger,
-        new ReprocessIntentStore(join(root, "reprocess-intents"), new SessionFileCoordinator(join(root, "session-locks"))),
+        new ReprocessIntentStore(join(root, "reprocess-intents"), new SessionFileCoordinator(join(root, "session-locks")), eligible),
         new SessionFileCoordinator(join(root, "session-locks")),
       );
 
@@ -148,7 +150,7 @@ describe("audio retention", () => {
       const wav = join(sessionDirectory, "audio.wav");
       await writeFile(wav, "fictional audio");
       const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
-      const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+      const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible);
       const created = await intents.create("session-1");
       for (const next of ["delete-confirmed", "recovering", "redispatch-ready", "completed"] as const) {
         if (phase === "prepared") break;
@@ -158,7 +160,7 @@ describe("audio retention", () => {
       const campaigns = { findById: async () => ({ audioRetentionDays: 7 }) } as unknown as CampaignService;
       const logger = { info() {}, error() {} } as unknown as Logger;
       const restarted = new AudioRetentionManager(campaigns, recordings, join(root, "exports"), logger,
-        new ReprocessIntentStore(join(root, "reprocess-intents"), new SessionFileCoordinator(join(root, "session-locks"))),
+        new ReprocessIntentStore(join(root, "reprocess-intents"), new SessionFileCoordinator(join(root, "session-locks")), eligible),
         new SessionFileCoordinator(join(root, "session-locks")));
       if (phase === "completed") {
         await writeFile(`${intents.pathFor("session-1")}.lock`, "abandoned");
@@ -186,7 +188,7 @@ describe("audio retention", () => {
     const wav = join(sessionDirectory, "audio.wav");
     await writeFile(wav, "fictional audio");
     const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
-    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible);
     const campaigns = { findById: async () => ({ audioRetentionDays: 7 }) } as unknown as CampaignService;
     const errors: unknown[] = [];
     const logger = { info() {}, error(value: unknown) { errors.push(value); } } as unknown as Logger;
@@ -220,7 +222,7 @@ describe("audio retention", () => {
     await writeFile(coordinator.pathFor("session-1"), "abandoned");
     const errors: unknown[] = [];
     const logger = { info() {}, error(value: unknown) { errors.push(value); } } as unknown as Logger;
-    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible);
     const manager = new AudioRetentionManager(
       { findById: async () => ({ audioRetentionDays: 7 }) } as unknown as CampaignService,
       recordings, join(root, "exports"), logger, intents, coordinator);
@@ -253,7 +255,7 @@ describe("audio retention", () => {
       return { audioRetentionDays: 7 };
     } } as unknown as CampaignService;
     const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
-    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible);
     const manager = new AudioRetentionManager(campaigns, recordings, join(root, "exports"),
       { info() {}, error() {} } as unknown as Logger, intents, coordinator);
     const cleanup = manager.cleanupExpired();

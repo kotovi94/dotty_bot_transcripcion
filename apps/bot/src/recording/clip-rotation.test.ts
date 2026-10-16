@@ -70,6 +70,64 @@ describe("recovered chunk timestamps", () => {
   });
 });
 
+describe("capture cancellation identity", () => {
+  async function fixture() {
+    const root = await mkdtemp(join(tmpdir(), "dotty-cancel-identity-"));
+    temporaryDirectories.push(root);
+    const connection = Object.assign(new EventEmitter(), {
+      state: { status: VoiceConnectionStatus.Ready },
+      receiver: { speaking: new EventEmitter(), subscribe: () => new PassThrough() },
+      destroy() { this.state = { status: VoiceConnectionStatus.Destroyed }; },
+    });
+    const manager = new VoiceCaptureManager(root, { info() {}, error() {}, warn() {} } as unknown as Logger, options, {
+      connect: () => connection as unknown as VoiceConnection,
+      decoder: () => new PassThrough() as unknown as prism.opus.Decoder,
+    });
+    const guild = { id: "guild", voiceAdapterCreator: {}, members: { cache: new Map() } } as unknown as Guild;
+    await manager.start(guild, {
+      id: "session-a", campaignId: "campaign", sequenceNumber: 1,
+      voiceChannelId: "voice", startedAt: new Date("2026-01-01T00:00:00Z"),
+    } as PersistedSession);
+    const directory = join(root, "recordings", "session-a");
+    const wav = join(directory, "audio", "original.wav");
+    await writeFile(wav, "fictional audio");
+    return { manager, directory, wav, connection };
+  }
+
+  it("cancels and removes only the matching active session", async () => {
+    const { manager, directory } = await fixture();
+    await manager.cancel("guild", "session-a");
+    await assert.rejects(readFile(join(directory, "manifest.json")));
+  });
+
+  it("rejects a different session in the same guild and preserves its WAV", async () => {
+    const { manager, wav, connection } = await fixture();
+    await assert.rejects(manager.cancel("guild", "session-b"), /does not match/);
+    assert.equal(await readFile(wav, "utf8"), "fictional audio");
+    assert.equal(connection.state.status, VoiceConnectionStatus.Ready);
+    await manager.cancel("guild", "session-a");
+  });
+
+  it("rejects a guild without an active capture", async () => {
+    const { manager, wav } = await fixture();
+    await assert.rejects(manager.cancel("other-guild", "session-a"), /No active voice capture/);
+    assert.equal(await readFile(wav, "utf8"), "fictional audio");
+    await manager.cancel("guild", "session-a");
+  });
+
+  it("preserves files if stopping chunks fails", async () => {
+    const { manager, wav } = await fixture();
+    const active = (manager as unknown as { active: Map<string, { chunks: Map<string, unknown> }> }).active.get("guild")!;
+    const failure = Promise.reject(new Error("stop failed"));
+    void failure.catch(() => undefined);
+    active.chunks.set("speaker", { stop() {}, finished: failure });
+    await assert.rejects(manager.cancel("guild", "session-a"), /stop failed/);
+    assert.equal(await readFile(wav, "utf8"), "fictional audio");
+    active.chunks.clear();
+    await manager.cancel("guild", "session-a");
+  });
+});
+
 describe("interrupted recording recovery", () => {
   it("preserves all PCM through four hours of simulated clip rotation with four speakers", async (test) => {
     const root = await mkdtemp(join(tmpdir(), "dotty-long-capture-"));

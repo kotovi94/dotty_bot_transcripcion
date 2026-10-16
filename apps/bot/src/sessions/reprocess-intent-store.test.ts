@@ -7,6 +7,8 @@ import { describe, it } from "node:test";
 import { ReprocessIntentAppliedError, ReprocessIntentStore } from "./reprocess-intent-store.ts";
 import { SessionFileCoordinator } from "./session-file-coordinator.ts";
 
+const eligible = { assertEligible: async (_sessionId: string) => {} };
+
 const sessionId = "session-1";
 const oldRecord = {
   version: 1, sessionId, operationId: "operation-1", phase: "prepared",
@@ -16,7 +18,7 @@ const oldRecord = {
 async function fixture(test: { after(callback: () => Promise<void>): void }) {
   const root = await mkdtemp(join(tmpdir(), "dotty-intent-"));
   test.after(() => rm(root, { recursive: true, force: true }));
-  const store = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")));
+  const store = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")), eligible);
   const path = store.pathFor(sessionId);
   return { root, store, path };
 }
@@ -96,7 +98,7 @@ describe("reprocess intent store", () => {
   it("reads a record from a new store instance", async (test) => {
     const { root, store } = await fixture(test);
     const created = await store.create(sessionId);
-    assert.deepEqual(await new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks"))).read(sessionId), created);
+    assert.deepEqual(await new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")), eligible).read(sessionId), created);
   });
 
   it("reads and restores a valid backup when the primary is absent", async (test) => {
@@ -152,7 +154,7 @@ describe("reprocess intent store", () => {
     const { root } = await fixture(test);
     const blocked = join(root, "file-instead-of-directory");
     await writeFile(blocked, "occupied");
-    const store = new ReprocessIntentStore(blocked, new SessionFileCoordinator(join(root, "locks")));
+    const store = new ReprocessIntentStore(blocked, new SessionFileCoordinator(join(root, "locks")), eligible);
     await assert.rejects(store.create(sessionId));
     assert.equal(await readFile(blocked, "utf8"), "occupied");
   });
@@ -170,7 +172,7 @@ describe("reprocess intent store", () => {
     const { root, store, path } = await fixture(test);
     const created = await store.create(sessionId, "operation-1");
     let failRemoval = true;
-    const faulty = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")), {
+    const faulty = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")), eligible, {
       removeBackup: async (backup) => {
         if (failRemoval) throw new Error("remove failed");
         await rm(backup);
@@ -209,7 +211,7 @@ describe("reprocess intent store", () => {
 
   it("serializes two instances and fails closed on an abandoned lock", async (test) => {
     const { root, store, path } = await fixture(test);
-    const other = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")));
+    const other = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")), eligible);
     const results = await Promise.allSettled([
       store.create(sessionId, "first"), other.create(sessionId, "second"),
     ]);

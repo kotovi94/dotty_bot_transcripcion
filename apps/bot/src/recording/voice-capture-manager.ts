@@ -339,8 +339,12 @@ export class VoiceCaptureManager {
     this.active.delete(discordGuildId);
   }
 
-  async cancel(discordGuildId: string): Promise<void> {
+  async cancel(discordGuildId: string, sessionId: string): Promise<void> {
     const recording = this.requireActive(discordGuildId);
+    if (recording.manifest.sessionId !== sessionId ||
+      resolve(recording.directory) !== join(this.recordingsRoot, sessionId)) {
+      throw new Error("Active voice capture does not match the requested session.");
+    }
     recording.acceptingAudio = false;
     clearInterval(recording.rotationTimer);
     recording.connection.destroy();
