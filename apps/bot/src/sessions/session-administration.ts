@@ -100,6 +100,8 @@ export class SessionAdministration {
     if (manifest === null || manifest.chunks.length === 0) {
       throw new SessionDeletionError("La sesión ya no conserva audio para reprocesar.");
     }
+    await this.deleteTranscriberJobs(session.id, true);
+
     if (session.status === "failed") {
       manifest.status = "completed";
       manifest.endedAt ??= new Date().toISOString();
@@ -111,8 +113,6 @@ export class SessionAdministration {
         throw new SessionDeletionError("La sesión cambió mientras se intentaba recuperar.");
       }
     }
-
-    await this.deleteTranscriberJobs(session.id, true);
 
     await this.prepareRepublication(session, manifest);
     await fs.rm(join(directory, ".transcription-enqueued"), { force: true });

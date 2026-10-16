@@ -16,6 +16,82 @@ const directories: string[] = [];
 after(async () => Promise.all(directories.map((directory) => rm(directory, { recursive: true }))));
 
 describe("session administration", () => {
+  it("keeps a failed session and its files intact when the transcriber returns 503", async () => {
+    const root = await mkdtemp(join(tmpdir(), "dotty-reprocess-503-"));
+    directories.push(root);
+    const recordings = join(root, "recordings");
+    const exports = join(root, "exports");
+    const directory = join(recordings, "session-1");
+    const exportDirectory = join(exports, "session-1");
+    await mkdir(join(directory, ".transcription-jobs"), { recursive: true });
+    await mkdir(exportDirectory, { recursive: true });
+    const files = new Map([
+      [join(directory, "manifest.json"), JSON.stringify({
+        sessionId: "session-1",
+        status: "failed",
+        endedAt: "2026-01-01T01:00:00.000Z",
+        chunks: [{ id: "chunk-1" }],
+      })],
+      [join(directory, ".transcription-jobs", "chunk-1"), "queued"],
+      [join(directory, ".transcription-enqueued"), "queued"],
+      [join(directory, ".transcription-failed"), "failed"],
+      [join(directory, ".transcription-ready"), "ready"],
+      [join(directory, ".transcription-published"), "published"],
+      [join(exportDirectory, "bitacora.md"), "old export"],
+    ]);
+    for (const [path, contents] of files) await writeFile(path, contents);
+
+    let status = "failed";
+    let recoverCalls = 0;
+    const session = {
+      id: "session-1",
+      discordGuildId: "guild-1",
+      status: "failed",
+    };
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; method: string | undefined }> = [];
+    globalThis.fetch = async (input, init) => {
+      requests.push({ url: String(input), method: init?.method });
+      return new Response(null, { status: 503 });
+    };
+    try {
+      const administration = new SessionAdministration(
+        { channels: { fetch: async () => null } } as unknown as Client,
+        {} as CampaignService,
+        {
+          findById: async () => session,
+          recoverFailed: async () => {
+            recoverCalls++;
+            status = "completed";
+            return true;
+          },
+        } as unknown as SessionService,
+        {} as VoiceCaptureManager,
+        recordings,
+        exports,
+        "http://127.0.0.1:8765",
+        "secret",
+        { info() {}, error() {} } as unknown as Logger,
+      );
+
+      await assert.rejects(
+        administration.reprocess("session-1", "guild-1"),
+        /No se pudo conectar con el transcriptor/,
+      );
+      assert.deepEqual(requests, [{
+        url: "http://127.0.0.1:8765/v1/sessions/session-1",
+        method: "DELETE",
+      }]);
+      for (const [path, contents] of files) {
+        assert.equal(await readFile(path, "utf8"), contents, path);
+      }
+      assert.equal(status, "failed", "a failed reprocess must not recover the session");
+      assert.equal(recoverCalls, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("clears persistent job markers before reprocessing a session", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-reprocess-"));
     directories.push(root);
