@@ -8,6 +8,8 @@ import type { Logger } from "pino";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
 import type { RecordingManifest } from "../recording/voice-capture-manager.ts";
+import { ReprocessIntentStore } from "../sessions/reprocess-intent-store.ts";
+import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
 import { AudioRetentionManager } from "./audio-retention-manager.ts";
 
 const directories: string[] = [];
@@ -49,7 +51,9 @@ describe("audio retention", () => {
       findById: async () => ({ audioRetentionDays: 7 }),
     } as unknown as CampaignService;
     const logger = { info() {}, error() {} } as unknown as Logger;
-    const manager = new AudioRetentionManager(campaigns, recordings, exports, logger);
+    const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
+    const manager = new AudioRetentionManager(campaigns, recordings, exports, logger,
+      new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator), coordinator);
     assert.equal((await manager.report("campaign-1")).eligibleForCleanup, 1);
     assert.equal(await manager.cleanupExpired(), 1);
     await assert.rejects(access(join(audioDirectory, "voice.wav")));
@@ -114,6 +118,8 @@ describe("audio retention", () => {
         recordings,
         join(root, "exports"),
         { info() {}, error() {} } as unknown as Logger,
+        new ReprocessIntentStore(join(root, "reprocess-intents"), new SessionFileCoordinator(join(root, "session-locks"))),
+        new SessionFileCoordinator(join(root, "session-locks")),
       );
 
       const report = await manager.report("campaign-1");
@@ -126,4 +132,135 @@ describe("audio retention", () => {
       assert.equal((await manager.report("campaign-1")).eligibleForCleanup, 0);
     });
   }
+
+  for (const phase of ["prepared", "delete-confirmed", "recovering", "redispatch-ready", "completed"] as const) {
+    it(`checks intent phase ${phase} before deleting audio`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "dotty-retention-intent-"));
+      directories.push(root);
+      const recordings = join(root, "recordings");
+      const sessionDirectory = join(recordings, "session-1");
+      await mkdir(sessionDirectory, { recursive: true });
+      await writeFile(join(sessionDirectory, "manifest.json"), JSON.stringify({
+        version: 1, sessionId: "session-1", campaignId: "campaign-1", status: "completed",
+        endedAt: "2026-01-01T01:00:00.000Z", chunks: [],
+      }));
+      await writeFile(join(sessionDirectory, ".transcription-published"), "ok");
+      const wav = join(sessionDirectory, "audio.wav");
+      await writeFile(wav, "fictional audio");
+      const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
+      const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+      const created = await intents.create("session-1");
+      for (const next of ["delete-confirmed", "recovering", "redispatch-ready", "completed"] as const) {
+        if (phase === "prepared") break;
+        await intents.updatePhase("session-1", created.operationId, next);
+        if (phase === next) break;
+      }
+      const campaigns = { findById: async () => ({ audioRetentionDays: 7 }) } as unknown as CampaignService;
+      const logger = { info() {}, error() {} } as unknown as Logger;
+      const restarted = new AudioRetentionManager(campaigns, recordings, join(root, "exports"), logger,
+        new ReprocessIntentStore(join(root, "reprocess-intents"), new SessionFileCoordinator(join(root, "session-locks"))),
+        new SessionFileCoordinator(join(root, "session-locks")));
+      if (phase === "completed") {
+        await writeFile(`${intents.pathFor("session-1")}.lock`, "abandoned");
+        assert.equal(await restarted.cleanupExpired(), 0);
+        assert.equal(await readFile(wav, "utf8"), "fictional audio");
+        await rm(`${intents.pathFor("session-1")}.lock`);
+      }
+      assert.equal(await restarted.cleanupExpired(), phase === "completed" ? 1 : 0);
+      if (phase === "completed") await assert.rejects(access(wav));
+      else assert.equal(await readFile(wav, "utf8"), "fictional audio");
+    });
+  }
+
+  it("keeps audio when an intent is corrupt or only a temporary survives", async () => {
+    const root = await mkdtemp(join(tmpdir(), "dotty-retention-uncertain-"));
+    directories.push(root);
+    const recordings = join(root, "recordings");
+    const sessionDirectory = join(recordings, "session-1");
+    await mkdir(sessionDirectory, { recursive: true });
+    await writeFile(join(sessionDirectory, "manifest.json"), JSON.stringify({
+      sessionId: "session-1", campaignId: "campaign-1", status: "completed",
+      endedAt: "2026-01-01T01:00:00.000Z", chunks: [],
+    }));
+    await writeFile(join(sessionDirectory, ".transcription-published"), "ok");
+    const wav = join(sessionDirectory, "audio.wav");
+    await writeFile(wav, "fictional audio");
+    const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
+    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+    const campaigns = { findById: async () => ({ audioRetentionDays: 7 }) } as unknown as CampaignService;
+    const errors: unknown[] = [];
+    const logger = { info() {}, error(value: unknown) { errors.push(value); } } as unknown as Logger;
+    const manager = new AudioRetentionManager(campaigns, recordings, join(root, "exports"), logger, intents, coordinator);
+    await mkdir(join(root, "reprocess-intents"));
+    await writeFile(intents.pathFor("session-1"), "corrupt");
+    assert.equal(await manager.cleanupExpired(), 0);
+    assert.equal(await readFile(wav, "utf8"), "fictional audio");
+    await rm(intents.pathFor("session-1"));
+    await writeFile(`${intents.pathFor("session-1")}.interrupted.tmp`, "uncommitted");
+    assert.equal(await manager.cleanupExpired(), 0);
+    assert.equal(await readFile(wav, "utf8"), "fictional audio");
+    assert.equal(errors.length, 2);
+  });
+
+  it("keeps audio when the shared lock cannot be acquired", async () => {
+    const root = await mkdtemp(join(tmpdir(), "dotty-retention-lock-"));
+    directories.push(root);
+    const recordings = join(root, "recordings");
+    const sessionDirectory = join(recordings, "session-1");
+    await mkdir(sessionDirectory, { recursive: true });
+    await writeFile(join(sessionDirectory, "manifest.json"), JSON.stringify({
+      sessionId: "session-1", campaignId: "campaign-1", status: "completed",
+      endedAt: "2026-01-01T01:00:00.000Z", chunks: [],
+    }));
+    await writeFile(join(sessionDirectory, ".transcription-published"), "ok");
+    const wav = join(sessionDirectory, "audio.wav");
+    await writeFile(wav, "fictional audio");
+    const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
+    await mkdir(join(root, "session-locks"));
+    await writeFile(coordinator.pathFor("session-1"), "abandoned");
+    const errors: unknown[] = [];
+    const logger = { info() {}, error(value: unknown) { errors.push(value); } } as unknown as Logger;
+    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+    const manager = new AudioRetentionManager(
+      { findById: async () => ({ audioRetentionDays: 7 }) } as unknown as CampaignService,
+      recordings, join(root, "exports"), logger, intents, coordinator);
+    assert.equal(await manager.cleanupExpired(), 0);
+    assert.equal(await readFile(wav, "utf8"), "fictional audio");
+    assert.equal(await readFile(coordinator.pathFor("session-1"), "utf8"), "abandoned");
+    assert.equal(errors.length, 1);
+  });
+
+  it("sees an intent created while retention is scanning", async () => {
+    const root = await mkdtemp(join(tmpdir(), "dotty-retention-race-"));
+    directories.push(root);
+    const recordings = join(root, "recordings");
+    const sessionDirectory = join(recordings, "session-1");
+    await mkdir(sessionDirectory, { recursive: true });
+    await writeFile(join(sessionDirectory, "manifest.json"), JSON.stringify({
+      sessionId: "session-1", campaignId: "campaign-1", status: "completed",
+      endedAt: "2026-01-01T01:00:00.000Z", chunks: [],
+    }));
+    await writeFile(join(sessionDirectory, ".transcription-published"), "ok");
+    const wav = join(sessionDirectory, "audio.wav");
+    await writeFile(wav, "fictional audio");
+    let scanned!: () => void;
+    const atCampaign = new Promise<void>((resolve) => { scanned = resolve; });
+    let proceed!: () => void;
+    const continueScan = new Promise<void>((resolve) => { proceed = resolve; });
+    const campaigns = { findById: async () => {
+      scanned();
+      await continueScan;
+      return { audioRetentionDays: 7 };
+    } } as unknown as CampaignService;
+    const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
+    const intents = new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator);
+    const manager = new AudioRetentionManager(campaigns, recordings, join(root, "exports"),
+      { info() {}, error() {} } as unknown as Logger, intents, coordinator);
+    const cleanup = manager.cleanupExpired();
+    await atCampaign;
+    await intents.create("session-1");
+    proceed();
+    assert.equal(await cleanup, 0);
+    assert.equal(await readFile(wav, "utf8"), "fictional audio");
+  });
 });

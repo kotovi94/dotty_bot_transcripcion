@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { ReprocessIntentAppliedError, ReprocessIntentStore } from "./reprocess-intent-store.ts";
+import { SessionFileCoordinator } from "./session-file-coordinator.ts";
 
 const sessionId = "session-1";
 const oldRecord = {
@@ -15,12 +16,56 @@ const oldRecord = {
 async function fixture(test: { after(callback: () => Promise<void>): void }) {
   const root = await mkdtemp(join(tmpdir(), "dotty-intent-"));
   test.after(() => rm(root, { recursive: true, force: true }));
-  const store = new ReprocessIntentStore(root);
+  const store = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")));
   const path = store.pathFor(sessionId);
   return { root, store, path };
 }
 
 describe("reprocess intent store", () => {
+  it("distinguishes a verified absence from a pending or completed intent", async (test) => {
+    const { store } = await fixture(test);
+    assert.equal(await store.read(sessionId), null);
+    assert.equal(await store.hasPending(sessionId), false);
+    const created = await store.create(sessionId);
+    assert.equal(await store.hasPending(sessionId), true);
+    for (const phase of ["delete-confirmed", "recovering", "redispatch-ready", "completed"] as const) {
+      await store.updatePhase(sessionId, created.operationId, phase);
+    }
+    assert.equal((await store.read(sessionId))?.phase, "completed");
+    assert.equal(await store.hasPending(sessionId), false);
+  });
+
+  it("blocks a lone temporary intent instead of reporting absence", async (test) => {
+    const { store, path } = await fixture(test);
+    const temporary = `${path}.interrupted.tmp`;
+    await writeFile(temporary, JSON.stringify(oldRecord));
+    await assert.rejects(store.read(sessionId), /Uncommitted temporary/);
+    await assert.rejects(store.hasPending(sessionId), /Uncommitted temporary/);
+    await assert.rejects(store.create(sessionId), /Uncommitted temporary/);
+    assert.equal(await readFile(temporary, "utf8"), JSON.stringify(oldRecord));
+  });
+
+  it("blocks an isolated lock instead of reporting absence", async (test) => {
+    const { store, path } = await fixture(test);
+    await writeFile(`${path}.lock`, "interrupted");
+    await assert.rejects(store.read(sessionId), /Locked intent/);
+    await assert.rejects(store.hasPending(sessionId), /Locked intent/);
+  });
+
+  it("rejects a corrupt backup when the primary is absent", async (test) => {
+    const { store, path } = await fixture(test);
+    await writeFile(`${path}.bak`, "{broken");
+    await assert.rejects(store.read(sessionId), /Corrupt backup/);
+    await assert.rejects(store.hasPending(sessionId), /Corrupt backup/);
+  });
+
+  it("propagates a read error instead of reporting absence", async (test) => {
+    const { store, path } = await fixture(test);
+    await mkdir(path);
+    await assert.rejects(store.read(sessionId));
+    await assert.rejects(store.hasPending(sessionId));
+  });
+
   it("creates and reads a pending intention", async (test) => {
     const { store } = await fixture(test);
     const created = await store.create(sessionId, "operation-1");
@@ -51,7 +96,7 @@ describe("reprocess intent store", () => {
   it("reads a record from a new store instance", async (test) => {
     const { root, store } = await fixture(test);
     const created = await store.create(sessionId);
-    assert.deepEqual(await new ReprocessIntentStore(root).read(sessionId), created);
+    assert.deepEqual(await new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks"))).read(sessionId), created);
   });
 
   it("reads and restores a valid backup when the primary is absent", async (test) => {
@@ -107,7 +152,7 @@ describe("reprocess intent store", () => {
     const { root } = await fixture(test);
     const blocked = join(root, "file-instead-of-directory");
     await writeFile(blocked, "occupied");
-    const store = new ReprocessIntentStore(blocked);
+    const store = new ReprocessIntentStore(blocked, new SessionFileCoordinator(join(root, "locks")));
     await assert.rejects(store.create(sessionId));
     assert.equal(await readFile(blocked, "utf8"), "occupied");
   });
@@ -125,7 +170,7 @@ describe("reprocess intent store", () => {
     const { root, store, path } = await fixture(test);
     const created = await store.create(sessionId, "operation-1");
     let failRemoval = true;
-    const faulty = new ReprocessIntentStore(root, {
+    const faulty = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")), {
       removeBackup: async (backup) => {
         if (failRemoval) throw new Error("remove failed");
         await rm(backup);
@@ -164,14 +209,16 @@ describe("reprocess intent store", () => {
 
   it("serializes two instances and fails closed on an abandoned lock", async (test) => {
     const { root, store, path } = await fixture(test);
-    const other = new ReprocessIntentStore(root);
+    const other = new ReprocessIntentStore(root, new SessionFileCoordinator(join(root, "locks")));
     const results = await Promise.allSettled([
       store.create(sessionId, "first"), other.create(sessionId, "second"),
     ]);
     assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
     assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+    const operationId = (await store.read(sessionId))!.operationId;
     await writeFile(`${path}.lock`, "abandoned");
-    await assert.rejects(other.updatePhase(sessionId, (await store.read(sessionId))!.operationId, "delete-confirmed"), /locked/);
+    await assert.rejects(store.read(sessionId), /Locked intent/);
+    await assert.rejects(other.updatePhase(sessionId, operationId, "delete-confirmed"), /locked/);
     await assert.rejects(other.recoverAbandonedLock(sessionId), /Cannot prove/);
     assert.equal(await readFile(`${path}.lock`, "utf8"), "abandoned");
   });

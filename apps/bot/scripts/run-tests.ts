@@ -42,6 +42,7 @@ try {
       "src/sessions/session-repository.integration.test.ts",
       "src/sessions/session-administration.test.ts",
       "src/sessions/reprocess-intent-store.test.ts",
+      "src/sessions/session-file-coordinator.test.ts",
       "src/sessions/session-finalization.test.ts",
       "src/recording/atomic-json-file.test.ts",
       "src/recording/wav-writer.test.ts",

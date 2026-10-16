@@ -5,6 +5,8 @@ import type { Logger } from "pino";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
 import type { RecordingManifest } from "../recording/voice-capture-manager.ts";
+import { ReprocessIntentStore } from "../sessions/reprocess-intent-store.ts";
+import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
 
 export interface CampaignStorageReport {
   readonly audioBytes: number;
@@ -24,6 +26,8 @@ export class AudioRetentionManager {
     private readonly recordingsRoot: string,
     private readonly exportsRoot: string,
     private readonly logger: Logger,
+    private readonly intents: ReprocessIntentStore,
+    private readonly coordinator: SessionFileCoordinator,
   ) {}
 
   start(): void {
@@ -83,23 +87,25 @@ export class AudioRetentionManager {
         if (manifest?.status !== "completed" || manifest.endedAt === null) continue;
         const campaign = await this.campaigns.findById(manifest.campaignId);
         if (!(await isEligibleForCleanup(manifest, campaign?.audioRetentionDays, entry.directory))) continue;
-        const files = await findWavFiles(entry.directory);
-        let removed = 0;
-        for (const file of files) {
-          removed += (await fs.stat(file)).size;
-          await fs.rm(file, { force: true });
-        }
-        if (removed === 0) continue;
-        await fs.writeFile(
-          join(entry.directory, ".audio-purged"),
-          `${new Date().toISOString()}\n`,
-          "utf8",
-        );
-        cleaned += 1;
-        this.logger.info(
-          { sessionId: manifest.sessionId, removedBytes: removed },
-          "Audio antiguo eliminado segun la politica de conservacion",
-        );
+        await this.coordinator.runExclusive(manifest.sessionId, async () => {
+          // Recheck the policy and the intent under the same lock used by create().
+          const current = await readManifest(entry.directory);
+          if (current === null || !(await isEligibleForCleanup(current, campaign?.audioRetentionDays, entry.directory))) return;
+          if (await this.intents.hasPending(current.sessionId)) return;
+          const files = await findWavFiles(entry.directory);
+          let removed = 0;
+          for (const file of files) {
+            removed += (await fs.stat(file)).size;
+            await fs.rm(file, { force: true });
+          }
+          if (removed === 0) return;
+          await fs.writeFile(join(entry.directory, ".audio-purged"), `${new Date().toISOString()}\n`, "utf8");
+          cleaned += 1;
+          this.logger.info(
+            { sessionId: current.sessionId, removedBytes: removed },
+            "Audio antiguo eliminado segun la politica de conservacion",
+          );
+        });
       }
       return cleaned;
     } catch (error) {

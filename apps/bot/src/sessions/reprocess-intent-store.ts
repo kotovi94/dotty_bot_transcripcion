@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants, promises as fs } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { SessionFileCoordinator } from "./session-file-coordinator.ts";
 
 export const reprocessPhases = [
   "prepared", "delete-confirmed", "recovering", "redispatch-ready", "completed",
@@ -33,7 +34,11 @@ interface StoreOperations {
 // A recovered phase is only the last locally confirmed phase: external work
 // (including Python DELETE) may already have happened after that phase.
 export class ReprocessIntentStore {
-  constructor(private readonly root: string, private readonly operations: StoreOperations = {}) {}
+  constructor(
+    private readonly root: string,
+    private readonly coordinator: SessionFileCoordinator,
+    private readonly operations: StoreOperations = {},
+  ) {}
 
   pathFor(sessionId: string): string {
     if (!sessionId || sessionId === "." || sessionId === ".." ||
@@ -46,6 +51,13 @@ export class ReprocessIntentStore {
 
   async read(sessionId: string): Promise<ReprocessIntent | null> {
     const path = this.pathFor(sessionId);
+    if (await exists(`${path}.lock`)) {
+      throw new ReprocessIntentError("Locked intent requires review");
+    }
+    return this.readCommitted(sessionId, path);
+  }
+
+  private async readCommitted(sessionId: string, path: string): Promise<ReprocessIntent | null> {
     const backup = `${path}.bak`;
     const primary = await readCandidate(path, sessionId);
     const saved = await readCandidate(backup, sessionId);
@@ -53,7 +65,11 @@ export class ReprocessIntentStore {
     if (primary.kind === "invalid") throw new ReprocessIntentError("Corrupt primary intent");
     if (saved.kind === "valid") return saved.intent;
     if (saved.kind === "invalid") throw new ReprocessIntentError("Corrupt backup intent");
-    // A leftover .tmp is not evidence that its update was committed.
+    // A .tmp alone does not confirm an update, but it also prevents proving
+    // that no intention was ever started.
+    if (await hasTemporary(this.root, path)) {
+      throw new ReprocessIntentError("Uncommitted temporary intent requires review");
+    }
     return null;
   }
 
@@ -63,9 +79,12 @@ export class ReprocessIntentStore {
   }
 
   async create(sessionId: string, operationId: string = randomUUID()): Promise<ReprocessIntent> {
-    return this.locked(sessionId, async (path) => {
+    return this.coordinator.runExclusive(sessionId, () => this.locked(sessionId, async (path) => {
       if (await exists(path) || await exists(`${path}.bak`)) {
         throw new ReprocessIntentError("Intent already exists");
+      }
+      if (await hasTemporary(this.root, path)) {
+        throw new ReprocessIntentError("Uncommitted temporary intent requires review");
       }
       const now = new Date().toISOString();
       const intent: ReprocessIntent = {
@@ -77,12 +96,12 @@ export class ReprocessIntentStore {
       await fs.rename(temporary, path);
       await syncDirectory(this.root);
       return intent;
-    });
+    }));
   }
 
   async updatePhase(sessionId: string, operationId: string, phase: ReprocessPhase): Promise<ReprocessIntent> {
     return this.locked(sessionId, async (path) => {
-      const current = await this.read(sessionId);
+      const current = await this.readCommitted(sessionId, path);
       if (current === null) throw new ReprocessIntentError("Intent does not exist");
       if (current.operationId !== operationId) throw new ReprocessIntentError("Operation ID mismatch");
       const from = reprocessPhases.indexOf(current.phase);
@@ -232,6 +251,14 @@ async function syncDirectory(path: string): Promise<void> {
 async function exists(path: string): Promise<boolean> {
   try { await fs.access(path); return true; }
   catch (error) { if (isNotFound(error)) return false; throw error; }
+}
+
+async function hasTemporary(root: string, path: string): Promise<boolean> {
+  let entries: string[];
+  try { entries = await fs.readdir(root); }
+  catch (error) { if (isNotFound(error)) return false; throw error; }
+  const prefix = `${basename(path)}.`;
+  return entries.some((entry) => entry.startsWith(prefix) && entry.endsWith(".tmp"));
 }
 
 function isNotFound(error: unknown): boolean {
