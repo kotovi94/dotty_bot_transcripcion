@@ -24,6 +24,9 @@ class JobInput:
 class JobStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        # One identity per store lifetime. A restarted process never inherits
+        # ownership of occupations left by an earlier instance.
+        self.instance_id = uuid.uuid4().hex
         self._local = threading.local()
         self._initialize()
 
@@ -69,10 +72,31 @@ class JobStore:
             CREATE TABLE IF NOT EXISTS session_admission (
               session_id TEXT PRIMARY KEY,
               closed_at TEXT NOT NULL,
-              active_at_close_json TEXT NOT NULL
+              active_at_close_json TEXT NOT NULL,
+              occupations_at_close_json TEXT NOT NULL DEFAULT '[]'
             );
+            CREATE TABLE IF NOT EXISTS worker_occupation (
+              id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              claim_token TEXT NOT NULL,
+              instance_id TEXT NOT NULL,
+              acquired_at TEXT NOT NULL,
+              released_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS worker_occupation_session_active
+              ON worker_occupation(session_id, released_at);
             """
         )
+        admission_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(session_admission)").fetchall()
+        }
+        if "occupations_at_close_json" not in admission_columns:
+            connection.execute(
+                "ALTER TABLE session_admission ADD COLUMN occupations_at_close_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
         columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(transcription_job)").fetchall()
@@ -161,10 +185,17 @@ class JobStore:
                 WHERE status='processing' AND (id=? OR substr(id,1,instr(id,':')-1)=?)
                 ORDER BY id""", (session_id, session_id),
             ).fetchall()
+            occupations = connection.execute(
+                """SELECT id,session_id,job_id,claim_token,instance_id,acquired_at
+                FROM worker_occupation WHERE session_id=? AND released_at IS NULL ORDER BY acquired_at,id""",
+                (session_id,),
+            ).fetchall()
             connection.execute(
                 """INSERT OR IGNORE INTO session_admission
-                (session_id,closed_at,active_at_close_json) VALUES (?,?,?)""",
-                (session_id, _now(), json.dumps([dict(row) for row in active])),
+                (session_id,closed_at,active_at_close_json,occupations_at_close_json)
+                VALUES (?,?,?,?)""",
+                (session_id, _now(), json.dumps([dict(row) for row in active]),
+                 json.dumps([dict(row) for row in occupations])),
             )
             state = self._admission_state(connection, session_id)
             connection.execute("COMMIT")
@@ -195,9 +226,15 @@ class JobStore:
     @staticmethod
     def _admission_state(connection: sqlite3.Connection, session_id: str) -> dict[str, Any]:
         gate = connection.execute(
-            "SELECT closed_at,active_at_close_json FROM session_admission WHERE session_id=?",
+            """SELECT closed_at,active_at_close_json,occupations_at_close_json
+            FROM session_admission WHERE session_id=?""",
             (session_id,),
         ).fetchone()
+        occupations = connection.execute(
+            """SELECT id,session_id,job_id,claim_token,instance_id,acquired_at
+            FROM worker_occupation WHERE session_id=? AND released_at IS NULL ORDER BY acquired_at,id""",
+            (session_id,),
+        ).fetchall()
         counts = {"queued": 0, "processing": 0}
         counts.update({row["status"]: row["count"] for row in connection.execute(
             """SELECT status,COUNT(*) AS count FROM transcription_job
@@ -211,6 +248,8 @@ class JobStore:
             "pending_jobs": counts["queued"],
             "active_jobs": counts["processing"],
             "active_at_close": json.loads(gate["active_at_close_json"]) if gate is not None else [],
+            "active_occupations": [dict(row) for row in occupations],
+            "occupations_at_close": json.loads(gate["occupations_at_close_json"]) if gate is not None else [],
             "workers_inactive": None,  # A database row is not a worker-liveness proof.
         }
 
@@ -231,20 +270,71 @@ class JobStore:
                 return None
             now = _now()
             claim_token = uuid.uuid4().hex
+            occupation_id = uuid.uuid4().hex
             connection.execute(
                 """UPDATE transcription_job SET status='processing', phase='loading', progress=0,
                 processed_audio_seconds=0, audio_duration_seconds=NULL, attempts=attempts+1,
                 claim_token=?, started_at=?, updated_at=?, error=NULL WHERE id=?""",
                 (claim_token, now, now, row["id"]),
             )
-            connection.execute("COMMIT")
+            self._record_occupation(
+                connection, occupation_id, _session_id(row["id"]),
+                row["id"], claim_token, now,
+            )
             claimed = connection.execute(
                 "SELECT * FROM transcription_job WHERE id=?", (row["id"],)
             ).fetchone()
-            return _serialize(claimed, include_claim_token=True) if claimed is not None else None
+            if claimed is None:
+                raise RuntimeError("Claimed job disappeared before commit")
+            result = _serialize(claimed, include_claim_token=True)
+            result["occupation_id"] = occupation_id
+            result["instance_id"] = self.instance_id
+            connection.execute("COMMIT")
+            return result
         except BaseException:
             connection.execute("ROLLBACK")
             raise
+
+    def _record_occupation(
+        self, connection: sqlite3.Connection, occupation_id: str,
+        session_id: str, job_id: str, claim_token: str, acquired_at: str,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO worker_occupation
+            (id,session_id,job_id,claim_token,instance_id,acquired_at)
+            VALUES (?,?,?,?,?,?)""",
+            (occupation_id, session_id, job_id, claim_token, self.instance_id, acquired_at),
+        )
+
+    def release_occupation(self, occupation_id: str, job_id: str, claim_token: str) -> bool:
+        """Explicit owner-verified release; job status and row existence are irrelevant."""
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            updated = connection.execute(
+                """UPDATE worker_occupation SET released_at=?
+                WHERE id=? AND job_id=? AND claim_token=? AND instance_id=?
+                AND released_at IS NULL""",
+                (_now(), occupation_id, job_id, claim_token, self.instance_id),
+            )
+            connection.execute("COMMIT")
+            return updated.rowcount == 1
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    def occupations_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        """Retain released history and flag older instances for reconciliation."""
+        _validate_session_id(session_id)
+        rows = self._connection().execute(
+            """SELECT * FROM worker_occupation WHERE session_id=? ORDER BY acquired_at,id""",
+            (session_id,),
+        ).fetchall()
+        return [
+            {**dict(row), "pending_reconciliation":
+             row["released_at"] is None and row["instance_id"] != self.instance_id}
+            for row in rows
+        ]
 
     def complete(self, job_id: str, claim_token: str, result: dict[str, Any]) -> bool:
         now = _now()
