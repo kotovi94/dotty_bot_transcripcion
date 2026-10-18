@@ -141,7 +141,8 @@ def test_failed_startup_releases_lock_before_jobstore_initialization(tmp_path: P
     monkeypatch.setenv("WEB_CONCURRENCY", "1")
     called = False
 
-    def broken_store(_path):
+    def broken_store(_path, *, instance_lock):
+        assert instance_lock is main._active_lock
         nonlocal called
         called = True
         raise RuntimeError("fixture startup failure")
@@ -192,6 +193,7 @@ def test_restart_keeps_closed_admission(tmp_path: Path, monkeypatch: pytest.Monk
         context = main.lifespan(main.app)
         _drive(context.__aenter__())
         try:
+            assert main.store.instance_id == main._active_lock.instance_id
             if close:
                 main.store.close_admission("session")
             else:
@@ -254,3 +256,11 @@ def test_lock_object_releases_normally(tmp_path: Path) -> None:
     lock.release()
     lock.release()
     assert _probe(lock.directory).returncode == 0
+
+
+def test_lock_object_cannot_be_fabricated_without_os_acquisition(tmp_path: Path) -> None:
+    path = tmp_path / "unlocked-handle"
+    path.mkdir()
+    with (path / ".transcriber-instance.lock").open("a+b") as handle:
+        with pytest.raises(InstanceLockError, match="must be acquired from the operating system"):
+            TranscriberInstanceLock(path, handle)

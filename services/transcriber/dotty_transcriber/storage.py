@@ -4,10 +4,16 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from .instance_lock import TranscriberInstanceLock
+
+
+PROVENANCE_PROTOCOL_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -22,13 +28,34 @@ class JobInput:
 
 
 class JobStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, instance_lock: TranscriberInstanceLock | None = None) -> None:
         self.path = path
-        # One identity per store lifetime. A restarted process never inherits
-        # ownership of occupations left by an earlier instance.
-        self.instance_id = uuid.uuid4().hex
+        self._instance_lock = instance_lock
+        if instance_lock is not None:
+            self._validate_instance_lock()
+            self.instance_id = instance_lock.instance_id
+        else:
+            self.instance_id = uuid.uuid4().hex
         self._local = threading.local()
         self._initialize()
+
+    def _validate_instance_lock(self) -> None:
+        if type(self._instance_lock) is not TranscriberInstanceLock or not self._instance_lock.is_held:
+            raise RuntimeError("A held transcriber instance lock is required")
+        if self._instance_lock.directory != self.path.resolve().parent:
+            raise ValueError("Transcriber instance lock does not own the job database directory")
+
+    @contextmanager
+    def _enqueue_provenance(self) -> Iterator[tuple[int | None, str | None]]:
+        if self._instance_lock is None:
+            yield None, None
+            return
+        if type(self._instance_lock) is not TranscriberInstanceLock:
+            raise RuntimeError("A held transcriber instance lock is required")
+        if self._instance_lock.directory != self.path.resolve().parent:
+            raise ValueError("Transcriber instance lock does not own the job database directory")
+        with self._instance_lock.hold_identity() as instance_id:
+            yield PROVENANCE_PROTOCOL_VERSION, instance_id
 
     def _connection(self) -> sqlite3.Connection:
         connection = getattr(self._local, "connection", None)
@@ -60,6 +87,8 @@ class JobStore:
               attempts INTEGER NOT NULL DEFAULT 0,
               max_attempts INTEGER NOT NULL DEFAULT 3,
               claim_token TEXT,
+              provenance_protocol_version INTEGER,
+              provenance_instance_id TEXT,
               result_json TEXT,
               error TEXT,
               created_at TEXT NOT NULL,
@@ -129,6 +158,14 @@ class JobStore:
             connection.execute(
                 "ALTER TABLE transcription_job ADD COLUMN claim_token TEXT"
             )
+        if "provenance_protocol_version" not in columns:
+            connection.execute(
+                "ALTER TABLE transcription_job ADD COLUMN provenance_protocol_version INTEGER"
+            )
+        if "provenance_instance_id" not in columns:
+            connection.execute(
+                "ALTER TABLE transcription_job ADD COLUMN provenance_instance_id TEXT"
+            )
         # Exhausted jobs must be visible/retryable, including queues written by
         # older versions that left an exhausted job in queued after a crash.
         connection.execute(
@@ -153,26 +190,30 @@ class JobStore:
         session_id = _session_id(job.id)
         now = _now()
         connection = self._connection()
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            self._assert_open(connection, session_id)
-            connection.execute(
-                """INSERT OR IGNORE INTO transcription_job
-                (id,audio_path,speaker_user_id,start_offset_ms,language,initial_prompt,hotwords,status,created_at,updated_at)
-                VALUES (:id,:audio_path,:speaker_user_id,:start_offset_ms,:language,:initial_prompt,:hotwords,'queued',:now,:now)""",
-                {**asdict(job), "now": now},
-            )
-            row = connection.execute("SELECT * FROM transcription_job WHERE id=?", (job.id,)).fetchone()
-            assert row is not None
-            existing = _serialize(row)
-            for key, value in asdict(job).items():
-                if existing[key] != value:
-                    raise ValueError(f"Job id already exists with different {key}.")
-            connection.execute("COMMIT")
-            return existing
-        except BaseException:
-            connection.execute("ROLLBACK")
-            raise
+        with self._enqueue_provenance() as (protocol_version, provenance_instance_id):
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_open(connection, session_id)
+                connection.execute(
+                    """INSERT OR IGNORE INTO transcription_job
+                    (id,audio_path,speaker_user_id,start_offset_ms,language,initial_prompt,hotwords,status,
+                     provenance_protocol_version,provenance_instance_id,created_at,updated_at)
+                    VALUES (:id,:audio_path,:speaker_user_id,:start_offset_ms,:language,:initial_prompt,:hotwords,
+                     'queued',:protocol_version,:instance_id,:now,:now)""",
+                    {**asdict(job), "protocol_version": protocol_version,
+                     "instance_id": provenance_instance_id, "now": now},
+                )
+                row = connection.execute("SELECT * FROM transcription_job WHERE id=?", (job.id,)).fetchone()
+                assert row is not None
+                existing = _serialize(row)
+                for key, value in asdict(job).items():
+                    if existing[key] != value:
+                        raise ValueError(f"Job id already exists with different {key}.")
+                connection.execute("COMMIT")
+                return existing
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
 
     def close_admission(self, session_id: str) -> dict[str, Any]:
         """Persist the admission barrier, without claiming that active workers stopped."""
@@ -508,6 +549,12 @@ def _serialize(row: sqlite3.Row, include_claim_token: bool = False) -> dict[str,
     value = dict(row)
     if not include_claim_token:
         value.pop("claim_token", None)
+    value["provenance_status"] = (
+        "protected"
+        if value.get("provenance_protocol_version") == PROVENANCE_PROTOCOL_VERSION
+        and value.get("provenance_instance_id")
+        else "unknown"
+    )
     value["result"] = json.loads(value.pop("result_json")) if value["result_json"] else None
     return value
 

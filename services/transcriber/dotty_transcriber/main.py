@@ -66,7 +66,7 @@ async def lifespan(_: FastAPI):
         # Acquiring the OS lock precedes Settings' secret creation and every
         # JobStore schema/recovery operation. Module import has no DB effects.
         settings = Settings.from_environment(data_dir=lock.directory)
-        store = JobStore(settings.database_path)
+        store = JobStore(settings.database_path, instance_lock=lock)
         engine = WhisperEngine(settings)
         voice_processor = AdaptiveVoiceProcessor(settings)
         diagnostics = DiagnosticReporter(settings.data_dir, enabled=settings.diagnostics_enabled)

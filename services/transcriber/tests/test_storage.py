@@ -4,7 +4,114 @@ from threading import Event
 
 import pytest
 
-from dotty_transcriber.storage import JobInput, JobStore
+from dotty_transcriber.instance_lock import TranscriberInstanceLock
+from dotty_transcriber.storage import JobInput, JobStore, PROVENANCE_PROTOCOL_VERSION
+
+
+def test_job_provenance_uses_the_held_lock_identity_and_does_not_retrofit_old_jobs(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "queue.db"
+    legacy_store = JobStore(path)
+    legacy = legacy_store.enqueue(JobInput("legacy:chunk", "unused.wav", "user", 0, "es"))
+    assert legacy["provenance_status"] == "unknown"
+    assert legacy["provenance_protocol_version"] is None
+    assert legacy["provenance_instance_id"] is None
+    legacy_store._connection().execute(
+        "ALTER TABLE transcription_job DROP COLUMN provenance_instance_id"
+    )
+    legacy_store._connection().execute(
+        "ALTER TABLE transcription_job DROP COLUMN provenance_protocol_version"
+    )
+
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        store = JobStore(path, instance_lock=lock)
+        accepted = store.enqueue(JobInput("new:chunk", "unused.wav", "user", 0, "es"))
+        assert accepted["provenance_status"] == "protected"
+        assert accepted["provenance_protocol_version"] == PROVENANCE_PROTOCOL_VERSION
+        assert accepted["provenance_instance_id"] == lock.instance_id
+        assert store.instance_id == lock.instance_id
+
+        historical = store.get("legacy:chunk")
+        assert historical is not None
+        assert historical["provenance_status"] == "unknown"
+        assert historical["provenance_protocol_version"] is None
+        assert historical["provenance_instance_id"] is None
+    finally:
+        lock.release()
+
+
+def test_unlocked_or_released_store_cannot_mark_jobs_as_protected(tmp_path: Path) -> None:
+    path = tmp_path / "queue.db"
+    unlocked = JobStore(path)
+    accepted = unlocked.enqueue(JobInput("unlocked:chunk", "unused.wav", "user", 0, "es"))
+    assert accepted["provenance_status"] == "unknown"
+
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        store = JobStore(path, instance_lock=lock)
+        lock.release()
+        with pytest.raises(RuntimeError, match="held transcriber instance lock"):
+            store.enqueue(JobInput("released:chunk", "unused.wav", "user", 0, "es"))
+        assert store.get("released:chunk") is None
+    finally:
+        lock.release()
+
+
+def test_job_store_rejects_lock_for_another_data_directory(tmp_path: Path) -> None:
+    lock = TranscriberInstanceLock.acquire(tmp_path / "owner")
+    try:
+        with pytest.raises(ValueError, match="does not own"):
+            JobStore(tmp_path / "other" / "queue.db", instance_lock=lock)
+    finally:
+        lock.release()
+
+
+def test_lock_release_waits_until_protected_enqueue_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    store = JobStore(tmp_path / "queue.db", instance_lock=lock)
+    entered, continue_enqueue, release_attempted = Event(), Event(), Event()
+    original = JobStore._assert_open
+
+    class ObservedStateLock:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        def __enter__(self):
+            if entered.is_set():
+                release_attempted.set()
+            self.inner.acquire()
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self.inner.release()
+
+    def paused_assert_open(connection, session_id):
+        original(connection, session_id)
+        entered.set()
+        assert continue_enqueue.wait(5)
+
+    monkeypatch.setattr(JobStore, "_assert_open", staticmethod(paused_assert_open))
+    lock._state_lock = ObservedStateLock(lock._state_lock)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            enqueue = pool.submit(
+                store.enqueue, JobInput("session:chunk", "unused.wav", "user", 0, "es")
+            )
+            assert entered.wait(5)
+            release = pool.submit(lock.release)
+            assert release_attempted.wait(5)
+            assert not release.done()
+            continue_enqueue.set()
+            accepted = enqueue.result(timeout=5)
+            release.result(timeout=5)
+        assert accepted["provenance_instance_id"] == lock.instance_id
+    finally:
+        continue_enqueue.set()
+        lock.release()
 
 
 def test_repeated_failures_become_visible_and_manually_retryable(tmp_path: Path) -> None:
