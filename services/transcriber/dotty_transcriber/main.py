@@ -3,15 +3,18 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
+import sqlite3
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .config import Settings, configured_data_dir
 from .diagnostics import DiagnosticReporter, summarize_transcription_result
@@ -44,6 +47,74 @@ class JobRequest(BaseModel):
     language: str = Field(default="es", min_length=2, max_length=10)
     initial_prompt: str = Field(default="", max_length=4000)
     hotwords: str = Field(default="", max_length=2000)
+
+
+class JobDeletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    operation_id: str
+    operation_type: Literal["reprocess", "administrative_delete", "manual_recovery"]
+    # No operation-specific parameters have been defined yet. Reject rather than
+    # persist an unversioned meaning that a later release might reinterpret.
+    parameters: dict[str, Any]
+
+    @field_validator("operation_id")
+    @classmethod
+    def canonical_operation_id(cls, value: str) -> str:
+        try:
+            if str(uuid.UUID(value)) != value:
+                raise ValueError("Operation ID must be a canonical UUID")
+        except (AttributeError, ValueError) as error:
+            raise ValueError("Operation ID must be a canonical UUID") from error
+        return value
+
+    @field_validator("parameters")
+    @classmethod
+    def empty_parameters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if value:
+            raise ValueError("No operation parameters are defined")
+        return value
+
+
+def _canonical_operation_id(value: str) -> str:
+    try:
+        if str(uuid.UUID(value)) != value:
+            raise ValueError
+    except (AttributeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_OPERATION_ID"}) from error
+    return value
+
+
+def _deletion_projection(operation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "operation_id": operation["operation_id"],
+        "session_id": operation["session_id"],
+        "operation_type": operation["operation_type"],
+        "parameters_hash": operation["parameters_hash"],
+        "close_id": operation["close_id"],
+        "status": operation["status"],
+        "targets": [
+            {key: target[key] for key in (
+                "job_id", "generation_id", "observation_id", "identity_status",
+                "observed_status", "observed_provenance",
+            )}
+            for target in operation["targets"]
+        ],
+        "workers_inactive": None,
+        "jobs_deleted": False,
+    }
+
+
+def _deletion_store_error(error: Exception) -> HTTPException:
+    if isinstance(error, sqlite3.Error):
+        logger.exception("Job deletion state could not be confirmed")
+        return HTTPException(status_code=503, detail={"code": "JOB_DELETION_STATE_UNCERTAIN"})
+    if isinstance(error, ValueError):
+        code = ("OPERATION_ID_CONFLICT" if "Operation ID conflicts" in str(error)
+                else "SESSION_ADMISSION_CLOSED")
+        return HTTPException(status_code=409, detail={"code": code})
+    logger.exception("Unexpected job deletion preparation failure")
+    return HTTPException(status_code=503, detail={"code": "JOB_DELETION_STATE_UNCERTAIN"})
 
 
 def authorize(authorization: Annotated[str | None, Header()] = None) -> None:
@@ -232,17 +303,35 @@ def session_diagnostics(session_id: str) -> dict[str, Any]:
     return {"session_id": session_id, "report": diagnostics.read_session_report(session_id)}
 
 
+@app.post("/v1/sessions/{session_id}/job-deletions", status_code=202,
+          dependencies=[Depends(authorize)])
+def prepare_session_job_deletion(session_id: str, request: JobDeletionRequest) -> dict[str, Any]:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id) is None:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_SESSION_ID"})
+    try:
+        operation = store.prepare_job_deletion(
+            request.operation_id, session_id, request.operation_type, request.parameters,
+        )
+    except Exception as error:
+        raise _deletion_store_error(error) from error
+    return _deletion_projection(operation)
+
+
+@app.get("/v1/job-deletions/{operation_id}", dependencies=[Depends(authorize)])
+def get_job_deletion(operation_id: str) -> dict[str, Any]:
+    _canonical_operation_id(operation_id)
+    try:
+        operation = store.job_deletion_operation(operation_id)
+    except Exception as error:
+        raise _deletion_store_error(error) from error
+    if operation is None:
+        raise HTTPException(status_code=404, detail={"code": "JOB_DELETION_NOT_FOUND"})
+    return _deletion_projection(operation)
+
+
 @app.delete("/v1/sessions/{session_id}", dependencies=[Depends(authorize)])
 def delete_session_jobs(session_id: str) -> dict[str, Any]:
-    deleted = store.delete_for_session(session_id)
-    _record_diagnostic(
-        session_id,
-        "maintenance",
-        "info",
-        "Trabajos de transcripción eliminados de la cola persistente.",
-        metrics={"deleted_jobs": deleted},
-    )
-    return {"session_id": session_id, "deleted": deleted}
+    raise HTTPException(status_code=410, detail={"code": "LEGACY_JOB_DELETE_DISABLED"})
 
 
 @app.post("/v1/sessions/{session_id}/retry", dependencies=[Depends(authorize)])
