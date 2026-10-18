@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hmac
 import logging
+import os
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -11,11 +13,12 @@ from typing import Annotated, Any
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from .config import Settings
+from .config import Settings, configured_data_dir
 from .diagnostics import DiagnosticReporter, summarize_transcription_result
 from .engine import WhisperEngine
 from .error_codes import classify_transcription_error
 from .storage import JobInput, JobStore
+from .instance_lock import InstanceLockError, TranscriberInstanceLock, reject_unsupported_process_mode
 from .voice_processing import AdaptiveVoiceProcessor, VoiceAnalysis
 
 logger = logging.getLogger("dotty.transcriber")
@@ -24,12 +27,13 @@ if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     logger.addHandler(handler)
-settings = Settings.from_environment()
-store = JobStore(settings.database_path)
-engine = WhisperEngine(settings)
-voice_processor = AdaptiveVoiceProcessor(settings)
-diagnostics = DiagnosticReporter(settings.data_dir, enabled=settings.diagnostics_enabled)
+settings: Settings
+store: JobStore
+engine: WhisperEngine
+voice_processor: AdaptiveVoiceProcessor
+diagnostics: DiagnosticReporter
 stop_event = threading.Event()
+_active_lock: TranscriberInstanceLock | None = None
 
 
 class JobRequest(BaseModel):
@@ -50,39 +54,63 @@ def authorize(authorization: Annotated[str | None, Header()] = None) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    stop_event.clear()
-    workers = [
-        threading.Thread(target=_worker_loop, name=f"transcriber-worker-{index + 1}", daemon=True)
-        for index in range(settings.gpu_workers)
-    ]
-    for worker in workers:
-        worker.start()
-    logger.info("[Transcription] GPU worker concurrency=%s", settings.gpu_workers)
-    _record_diagnostic(
-        "_system",
-        "service",
-        "success",
-        "Servicio de transcripción iniciado y listo para recibir trabajos.",
-        evidence=["workers_started", "job_store_open"],
-        metrics={
-            "gpu_workers": settings.gpu_workers,
-            "model": settings.model,
-            "configured_device": settings.device,
-            "compute_type": settings.compute_type,
-            "diagnostics_enabled": settings.diagnostics_enabled,
-        },
-    )
-    yield
-    stop_event.set()
-    for worker in workers:
-        worker.join(timeout=10)
-    _record_diagnostic(
-        "_system",
-        "service",
-        "info",
-        "Servicio de transcripción detenido.",
-        evidence=["stop_event_set", "workers_joined"],
-    )
+    global settings, store, engine, voice_processor, diagnostics, _active_lock
+    if _active_lock is not None:
+        raise InstanceLockError("A previous transcriber lifespan still owns the data directory")
+    reject_unsupported_process_mode(sys.argv, os.environ)
+    lock = TranscriberInstanceLock.acquire(configured_data_dir())
+    _active_lock = lock
+    workers: list[threading.Thread] = []
+    initialized = False
+    try:
+        # Acquiring the OS lock precedes Settings' secret creation and every
+        # JobStore schema/recovery operation. Module import has no DB effects.
+        settings = Settings.from_environment(data_dir=lock.directory)
+        store = JobStore(settings.database_path)
+        engine = WhisperEngine(settings)
+        voice_processor = AdaptiveVoiceProcessor(settings)
+        diagnostics = DiagnosticReporter(settings.data_dir, enabled=settings.diagnostics_enabled)
+        initialized = True
+        stop_event.clear()
+        workers = [
+            threading.Thread(target=_worker_loop, name=f"transcriber-worker-{index + 1}", daemon=True)
+            for index in range(settings.gpu_workers)
+        ]
+        for worker in workers:
+            worker.start()
+        logger.info("[Transcription] GPU worker concurrency=%s", settings.gpu_workers)
+        _record_diagnostic(
+            "_system", "service", "success",
+            "Servicio de transcripción iniciado y listo para recibir trabajos.",
+            evidence=["workers_started", "job_store_open"],
+            metrics={
+                "gpu_workers": settings.gpu_workers,
+                "model": settings.model,
+                "configured_device": settings.device,
+                "compute_type": settings.compute_type,
+                "diagnostics_enabled": settings.diagnostics_enabled,
+            },
+        )
+        yield
+    finally:
+        stop_event.set()
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(timeout=10)
+        alive = [worker.name for worker in workers if worker.is_alive()]
+        if initialized:
+            _record_diagnostic(
+                "_system", "service", "warning" if alive else "info",
+                "El cierre dejó workers activos; se conserva el bloqueo." if alive else
+                "Servicio de transcripción detenido.",
+                evidence=["stop_event_set", "workers_still_alive" if alive else "workers_joined"],
+                metrics={"workers_still_alive": len(alive)},
+            )
+        if alive:
+            logger.error("Transcriber workers remain alive; retaining data-directory lock: %s", alive)
+        else:
+            lock.release()
+            _active_lock = None
 
 
 app = FastAPI(title="Dotty Transcriber", version="0.1.0", lifespan=lifespan)

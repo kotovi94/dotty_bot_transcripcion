@@ -20,6 +20,14 @@ npm run transcriber:test
 npm run transcriber:start
 ```
 
+El transcriptor toma un bloqueo del sistema operativo en
+`DOTTY_DATA_DIR/.transcriber-instance.lock` antes de inicializar SQLite. Una
+segunda instancia con el mismo directorio falla al iniciar. El archivo puede
+permanecer tras el cierre: la propiedad depende del bloqueo, no de su
+existencia. Uvicorn debe ejecutarse sin `--reload` y con un solo proceso.
+Antes del primer despliegue de esta version, verifique manualmente que no
+queden procesos de versiones anteriores, que no participan en el bloqueo.
+
 El bot reintenta cada cinco segundos los manifiestos completos que aun no fueron
 aceptados. El servicio recupera trabajos que estaban procesandose, rechaza IDs
 reutilizados con otro audio y reintenta cada trabajo hasta tres veces.

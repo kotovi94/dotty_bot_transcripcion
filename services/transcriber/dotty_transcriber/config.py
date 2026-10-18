@@ -40,10 +40,8 @@ class Settings:
     vad_threshold_max: float = 0.70
 
     @classmethod
-    def from_environment(cls) -> "Settings":
-        project_root = Path(__file__).resolve().parents[3]
-        load_dotenv(project_root / ".env")
-        data_dir = (project_root / os.getenv("DOTTY_DATA_DIR", "./data")).resolve()
+    def from_environment(cls, data_dir: Path | None = None) -> "Settings":
+        data_dir = data_dir or configured_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
         return cls(
             data_dir=data_dir,
@@ -80,6 +78,12 @@ class Settings:
             vad_threshold_min=float(os.getenv("VOICE_VAD_THRESHOLD_MIN", "0.30")),
             vad_threshold_max=float(os.getenv("VOICE_VAD_THRESHOLD_MAX", "0.70")),
         )
+
+
+def configured_data_dir() -> Path:
+    project_root = Path(__file__).resolve().parents[3]
+    load_dotenv(project_root / ".env")
+    return (project_root / os.getenv("DOTTY_DATA_DIR", "./data")).resolve()
 
 
 def _resolve_secret(data_dir: Path) -> str:
