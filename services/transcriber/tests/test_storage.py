@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -130,3 +132,144 @@ def test_stale_worker_cannot_overwrite_recreated_job(tmp_path: Path) -> None:
     assert store.get(job.id)["status"] == "processing"
     assert store.complete(new_claim["id"], new_claim["claim_token"], {"fresh": True})
     assert store.get(job.id)["result"] == {"fresh": True}
+
+
+def test_admission_closure_is_idempotent_persistent_and_preserves_active_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "queue.db"
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"temporary fixture only")
+    store = JobStore(path)
+    assert store.admission_state("session-1")["closed"] is False
+    store.enqueue(JobInput("session-1:active", str(wav), "user", 0, "es"))
+    store.enqueue(JobInput("session-1:pending", str(wav), "user", 1, "es"))
+    active = store.claim_next()
+    assert active is not None and active["id"] == "session-1:active"
+    closed = store.close_admission("session-1")
+    assert closed["closed"] is True
+    assert closed["pending_jobs"] == 1
+    assert closed["active_jobs"] == 1
+    assert closed["active_at_close"] == [{"id": active["id"], "claim_token": active["claim_token"]}]
+    assert closed["workers_inactive"] is None
+    assert store.close_admission("session-1")["closed_at"] == closed["closed_at"]
+    with pytest.raises(ValueError, match="admission is closed"):
+        store.enqueue(JobInput("session-1:new", str(wav), "user", 2, "es"))
+    assert store.claim_next() is None
+    restarted = JobStore(path)
+    assert restarted.admission_state("session-1")["active_at_close"] == closed["active_at_close"]
+    assert restarted.admission_state("session-1")["active_jobs"] == 1
+    assert restarted.get(active["id"])["status"] == "processing"
+    assert restarted.claim_next() is None
+    assert wav.read_bytes() == b"temporary fixture only"
+
+
+def test_closed_session_does_not_block_other_jobs_or_allow_retries(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "queue.db")
+    closed = JobInput("closed:failed", "unused.wav", "user", 0, "es")
+    store.enqueue(closed)
+    claim = store.claim_next()
+    assert claim is not None
+    for attempt in range(3):
+        store.fail(closed.id, claim["claim_token"], "failed")
+        if attempt < 2:
+            claim = store.claim_next()
+            assert claim is not None
+    store.close_admission("closed")
+    with pytest.raises(ValueError, match="admission is closed"):
+        store.retry(closed.id)
+    with pytest.raises(ValueError, match="admission is closed"):
+        store.retry_failed_for_session("closed")
+    other = JobInput("other:chunk", "unused.wav", "user", 0, "es")
+    assert store.enqueue(other)["status"] == "queued"
+    assert store.claim_next()["id"] == other.id
+
+
+def test_enqueue_commits_before_concurrent_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore(tmp_path / "queue.db")
+    entered, release = Event(), Event()
+    original = JobStore._assert_open
+
+    def paused_check(connection, session_id):
+        original(connection, session_id)
+        if session_id == "session":
+            entered.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(JobStore, "_assert_open", staticmethod(paused_check))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        posting = pool.submit(store.enqueue, JobInput("session:chunk", "unused.wav", "user", 0, "es"))
+        assert entered.wait(5)
+        closing = pool.submit(store.close_admission, "session")
+        release.set()
+        assert posting.result(timeout=5)["id"] == "session:chunk"
+        state = closing.result(timeout=5)
+    assert state["pending_jobs"] == 1
+    assert store.claim_next() is None
+
+
+def test_close_commits_before_concurrent_enqueue_and_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore(tmp_path / "queue.db")
+    store.enqueue(JobInput("session:chunk", "unused.wav", "user", 0, "es"))
+    entered, release = Event(), Event()
+    original = JobStore._admission_state
+
+    def paused_state(connection, session_id):
+        state = original(connection, session_id)
+        if session_id == "session":
+            entered.set()
+            assert release.wait(5)
+        return state
+
+    monkeypatch.setattr(JobStore, "_admission_state", staticmethod(paused_state))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        closing = pool.submit(store.close_admission, "session")
+        assert entered.wait(5)
+        posting = pool.submit(store.enqueue, JobInput("session:new", "unused.wav", "user", 1, "es"))
+        claiming = pool.submit(store.claim_next)
+        release.set()
+        assert closing.result(timeout=5)["closed"] is True
+        with pytest.raises(ValueError, match="admission is closed"):
+            posting.result(timeout=5)
+        assert claiming.result(timeout=5) is None
+    assert store.get("session:new") is None
+
+
+def test_claim_commits_before_concurrent_close_and_is_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = JobStore(tmp_path / "queue.db")
+    store.enqueue(JobInput("session:chunk", "unused.wav", "user", 0, "es"))
+    entered, release = Event(), Event()
+    from dotty_transcriber import storage
+    original = storage.uuid.uuid4
+
+    def paused_uuid():
+        entered.set()
+        assert release.wait(5)
+        return original()
+
+    monkeypatch.setattr(storage.uuid, "uuid4", paused_uuid)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claiming = pool.submit(store.claim_next)
+        assert entered.wait(5)
+        closing = pool.submit(store.close_admission, "session")
+        release.set()
+        claim = claiming.result(timeout=5)
+        state = closing.result(timeout=5)
+    assert claim is not None
+    assert state["active_at_close"] == [{"id": claim["id"], "claim_token": claim["claim_token"]}]
+    assert state["workers_inactive"] is None
+
+
+def test_additive_schema_on_existing_database_and_snapshot_after_row_delete(tmp_path: Path) -> None:
+    path = tmp_path / "existing.db"
+    first = JobStore(path)
+    first.enqueue(JobInput("session:chunk", "unused.wav", "user", 0, "es"))
+    first._connection().execute("DROP TABLE session_admission")
+    restored = JobStore(path)
+    assert restored.get("session:chunk")["status"] == "queued"
+    active = restored.claim_next()
+    assert active is not None
+    snapshot = restored.close_admission("session")
+    assert restored.delete_for_session("session") == 1
+    after_delete = restored.admission_state("session")
+    assert after_delete["active_jobs"] == 0
+    assert after_delete["active_at_close"] == snapshot["active_at_close"]
+    assert after_delete["workers_inactive"] is None

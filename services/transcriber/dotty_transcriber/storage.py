@@ -66,6 +66,11 @@ class JobStore:
             );
             CREATE INDEX IF NOT EXISTS transcription_job_status_created
               ON transcription_job(status, created_at);
+            CREATE TABLE IF NOT EXISTS session_admission (
+              session_id TEXT PRIMARY KEY,
+              closed_at TEXT NOT NULL,
+              active_at_close_json TEXT NOT NULL
+            );
             """
         )
         columns = {
@@ -105,29 +110,109 @@ class JobStore:
         connection.execute(
             "UPDATE transcription_job SET status='failed', phase='failed', claim_token=NULL, "
             "error='Interrupted after maximum attempts; manual retry required', updated_at=? "
-            "WHERE status IN ('processing','queued') AND attempts >= max_attempts",
+            "WHERE status IN ('processing','queued') AND attempts >= max_attempts "
+            "AND NOT EXISTS (SELECT 1 FROM session_admission AS gate "
+            "WHERE gate.session_id=CASE WHEN instr(transcription_job.id, ':')=0 "
+            "THEN transcription_job.id ELSE substr(transcription_job.id,1,instr(transcription_job.id,':')-1) END)",
             (_now(),),
         )
         connection.execute(
             "UPDATE transcription_job SET status='queued', phase='queued', progress=0, "
-            "processed_audio_seconds=0, claim_token=NULL, updated_at=? WHERE status='processing'",
+            "processed_audio_seconds=0, claim_token=NULL, updated_at=? WHERE status='processing' "
+            "AND NOT EXISTS (SELECT 1 FROM session_admission AS gate "
+            "WHERE gate.session_id=CASE WHEN instr(transcription_job.id, ':')=0 "
+            "THEN transcription_job.id ELSE substr(transcription_job.id,1,instr(transcription_job.id,':')-1) END)",
             (_now(),),
         )
 
     def enqueue(self, job: JobInput) -> dict[str, Any]:
+        session_id = _session_id(job.id)
         now = _now()
-        self._connection().execute(
-            """INSERT OR IGNORE INTO transcription_job
-            (id,audio_path,speaker_user_id,start_offset_ms,language,initial_prompt,hotwords,status,created_at,updated_at)
-            VALUES (:id,:audio_path,:speaker_user_id,:start_offset_ms,:language,:initial_prompt,:hotwords,'queued',:now,:now)""",
-            {**asdict(job), "now": now},
-        )
-        existing = self.get(job.id)
-        assert existing is not None
-        for key, value in asdict(job).items():
-            if existing[key] != value:
-                raise ValueError(f"Job id already exists with different {key}.")
-        return existing
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._assert_open(connection, session_id)
+            connection.execute(
+                """INSERT OR IGNORE INTO transcription_job
+                (id,audio_path,speaker_user_id,start_offset_ms,language,initial_prompt,hotwords,status,created_at,updated_at)
+                VALUES (:id,:audio_path,:speaker_user_id,:start_offset_ms,:language,:initial_prompt,:hotwords,'queued',:now,:now)""",
+                {**asdict(job), "now": now},
+            )
+            row = connection.execute("SELECT * FROM transcription_job WHERE id=?", (job.id,)).fetchone()
+            assert row is not None
+            existing = _serialize(row)
+            for key, value in asdict(job).items():
+                if existing[key] != value:
+                    raise ValueError(f"Job id already exists with different {key}.")
+            connection.execute("COMMIT")
+            return existing
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    def close_admission(self, session_id: str) -> dict[str, Any]:
+        """Persist the admission barrier, without claiming that active workers stopped."""
+        _validate_session_id(session_id)
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            active = connection.execute(
+                """SELECT id,claim_token FROM transcription_job
+                WHERE status='processing' AND (id=? OR substr(id,1,instr(id,':')-1)=?)
+                ORDER BY id""", (session_id, session_id),
+            ).fetchall()
+            connection.execute(
+                """INSERT OR IGNORE INTO session_admission
+                (session_id,closed_at,active_at_close_json) VALUES (?,?,?)""",
+                (session_id, _now(), json.dumps([dict(row) for row in active])),
+            )
+            state = self._admission_state(connection, session_id)
+            connection.execute("COMMIT")
+            return state
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    def admission_state(self, session_id: str) -> dict[str, Any]:
+        _validate_session_id(session_id)
+        connection = self._connection()
+        connection.execute("BEGIN")
+        try:
+            state = self._admission_state(connection, session_id)
+            connection.execute("COMMIT")
+            return state
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _assert_open(connection: sqlite3.Connection, session_id: str) -> None:
+        if connection.execute(
+            "SELECT 1 FROM session_admission WHERE session_id=?", (session_id,)
+        ).fetchone() is not None:
+            raise ValueError(f"Session admission is closed: {session_id}")
+
+    @staticmethod
+    def _admission_state(connection: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+        gate = connection.execute(
+            "SELECT closed_at,active_at_close_json FROM session_admission WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        counts = {"queued": 0, "processing": 0}
+        counts.update({row["status"]: row["count"] for row in connection.execute(
+            """SELECT status,COUNT(*) AS count FROM transcription_job
+            WHERE (id=? OR substr(id,1,instr(id,':')-1)=?) AND status IN ('queued','processing')
+            GROUP BY status""", (session_id, session_id),
+        ).fetchall()})
+        return {
+            "session_id": session_id,
+            "closed": gate is not None,
+            "closed_at": gate["closed_at"] if gate is not None else None,
+            "pending_jobs": counts["queued"],
+            "active_jobs": counts["processing"],
+            "active_at_close": json.loads(gate["active_at_close_json"]) if gate is not None else [],
+            "workers_inactive": None,  # A database row is not a worker-liveness proof.
+        }
 
     def claim_next(self) -> dict[str, Any] | None:
         connection = self._connection()
@@ -136,7 +221,10 @@ class JobStore:
             row = connection.execute(
                 """SELECT * FROM transcription_job
                 WHERE status='queued' AND attempts < max_attempts
-                ORDER BY created_at LIMIT 1"""
+                AND NOT EXISTS (SELECT 1 FROM session_admission AS gate
+                  WHERE gate.session_id=CASE WHEN instr(transcription_job.id, ':')=0
+                  THEN transcription_job.id ELSE substr(transcription_job.id,1,instr(transcription_job.id,':')-1) END)
+                ORDER BY created_at LIMIT 1""",
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
@@ -216,17 +304,24 @@ class JobStore:
         return _serialize(row) if row is not None else None
 
     def retry(self, job_id: str) -> dict[str, Any] | None:
+        session_id = _session_id(job_id)
         now = _now()
-        result = self._connection().execute(
-            """UPDATE transcription_job SET status='queued', phase='queued', progress=0,
-            processed_audio_seconds=0, audio_duration_seconds=NULL, attempts=0, error=NULL,
-            claim_token=NULL, started_at=NULL, completed_at=NULL, updated_at=?
-            WHERE id=? AND status='failed'""",
-            (now, job_id),
-        )
-        if result.rowcount == 0:
-            return self.get(job_id)
-        return self.get(job_id)
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._assert_open(connection, session_id)
+            connection.execute(
+                """UPDATE transcription_job SET status='queued', phase='queued', progress=0,
+                processed_audio_seconds=0, audio_duration_seconds=NULL, attempts=0, error=NULL,
+                claim_token=NULL, started_at=NULL, completed_at=NULL, updated_at=?
+                WHERE id=? AND status='failed'""", (now, job_id),
+            )
+            row = connection.execute("SELECT * FROM transcription_job WHERE id=?", (job_id,)).fetchone()
+            connection.execute("COMMIT")
+            return _serialize(row) if row is not None else None
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
 
     def metrics(self) -> dict[str, int]:
         rows = self._connection().execute(
@@ -271,15 +366,24 @@ class JobStore:
         return value
 
     def retry_failed_for_session(self, session_id: str) -> int:
+        _validate_session_id(session_id)
         escaped = session_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        result = self._connection().execute(
-            """UPDATE transcription_job SET status='queued', phase='queued', progress=0,
-            processed_audio_seconds=0, audio_duration_seconds=NULL, attempts=0, error=NULL,
-            claim_token=NULL, started_at=NULL, completed_at=NULL, updated_at=?
-            WHERE id LIKE ? ESCAPE '\\' AND status='failed'""",
-            (_now(), f"{escaped}:%"),
-        )
-        return result.rowcount
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._assert_open(connection, session_id)
+            result = connection.execute(
+                """UPDATE transcription_job SET status='queued', phase='queued', progress=0,
+                processed_audio_seconds=0, audio_duration_seconds=NULL, attempts=0, error=NULL,
+                claim_token=NULL, started_at=NULL, completed_at=NULL, updated_at=?
+                WHERE id LIKE ? ESCAPE '\\' AND status='failed'""",
+                (_now(), f"{escaped}:%"),
+            )
+            connection.execute("COMMIT")
+            return result.rowcount
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
 
     def failed_sessions(self) -> list[dict[str, Any]]:
         rows = self._connection().execute(
@@ -318,3 +422,16 @@ def _serialize(row: sqlite3.Row, include_claim_token: bool = False) -> dict[str,
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _validate_session_id(session_id: str) -> None:
+    if not isinstance(session_id, str) or not session_id or ":" in session_id:
+        raise ValueError("Session ID must be a nonempty job ID prefix without a colon")
+
+
+def _session_id(job_id: str) -> str:
+    if not isinstance(job_id, str):
+        raise ValueError("Job ID must be a string")
+    session_id = job_id.split(":", 1)[0]
+    _validate_session_id(session_id)
+    return session_id
