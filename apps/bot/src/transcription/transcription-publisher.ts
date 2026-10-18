@@ -1,9 +1,12 @@
 import { promises as fs } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { Logger } from "pino";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
+import type { SessionService } from "../sessions/session-service.ts";
+import type { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
+import type { ReprocessIntentStore } from "../sessions/reprocess-intent-store.ts";
 import type { DottyDiagnostics } from "../diagnostics/dotty-diagnostics.ts";
 import type { RecordingManifest } from "../recording/voice-capture-manager.ts";
 import {
@@ -90,6 +93,9 @@ export class TranscriptionPublisher {
     private readonly secret: string,
     private readonly adaptiveVocabulary: AdaptiveVocabularyStore,
     private readonly logger: Logger,
+    private readonly sessions: Pick<SessionService, "findById">,
+    private readonly coordinator: SessionFileCoordinator,
+    private readonly intents: Pick<ReprocessIntentStore, "read">,
     private readonly diagnosticsReporter?: Pick<DottyDiagnostics, "recordActivity">,
   ) {}
 
@@ -118,16 +124,8 @@ export class TranscriptionPublisher {
             { error, directory: entry.name },
             "No se pudo publicar una sesión; las demás continuarán",
           );
-          await this.report({
-            sessionId: entry.name,
-            component: "transcription",
-            process: "consolidation",
-            outcome: "failure",
-            issue: "TRANSCRIPTION_EXPORT_FAILED",
-            message: "Falló la consolidación o escritura de los artefactos de transcripción.",
-            evidence: ["publisher_exception_captured", "other_sessions_continue"],
-            error,
-          });
+          // The directory may have been deleted while the lock was pending.
+          // Do not recreate diagnostic files for a session we cannot validate.
         }
       }
     } catch (error) {
@@ -138,6 +136,7 @@ export class TranscriptionPublisher {
   }
 
   private async publishDirectory(directory: string): Promise<void> {
+    const sessionId = basename(directory);
     const publishedMarker = join(directory, ".transcription-published");
     const readyMarker = join(directory, ".transcription-ready");
     const failedMarker = join(directory, ".transcription-failed");
@@ -147,19 +146,10 @@ export class TranscriptionPublisher {
       await exists(failedMarker) ||
       !(await exists(join(directory, ".transcription-enqueued")))
     ) return;
-    const manifest = JSON.parse(
-      await fs.readFile(join(directory, "manifest.json"), "utf8"),
-    ) as RecordingManifest;
+    const manifestText = await fs.readFile(join(directory, "manifest.json"), "utf8");
+    const manifest = JSON.parse(manifestText) as RecordingManifest;
+    if (manifest.sessionId !== sessionId || !Array.isArray(manifest.chunks)) return;
     const publishStarted = performance.now();
-    await this.report({
-      sessionId: manifest.sessionId,
-      component: "transcription",
-      process: "consolidation",
-      outcome: "started",
-      message: "Dotty comenzó a comprobar y consolidar los trabajos de transcripción.",
-      evidence: ["session_enqueued_marker_found", "manifest_loaded"],
-      metrics: { chunks: manifest.chunks.length },
-    });
     let payload: { jobs: TranscriptionJob[] };
     try {
       const response = await fetch(
@@ -171,11 +161,36 @@ export class TranscriptionPublisher {
       );
       if (!response.ok) throw new Error(`Could not read transcript: HTTP ${response.status}`);
       payload = (await response.json()) as { jobs: TranscriptionJob[] };
+    } catch (error) {
+      this.logger.warn({ sessionId, error }, "Could not fetch transcription status; will retry");
+      return;
+    }
+
+    await this.coordinator.runExclusive(sessionId, async () => {
+      if (!(await this.validate(directory, manifestText, payload))) return;
+      await this.report({
+        sessionId,
+        component: "transcription",
+        process: "consolidation",
+        outcome: "started",
+        message: "Dotty comenzó a comprobar y consolidar los trabajos de transcripción.",
+        evidence: ["session_enqueued_marker_found", "manifest_loaded"],
+        metrics: { chunks: manifest.chunks.length },
+      });
       const failedJobs = payload.jobs.filter((job) => job.status === "failed");
       if (failedJobs.length > 0) {
         this.logger.error(
           { sessionId: manifest.sessionId, failedJobs: failedJobs.map((j) => ({ id: j.id, error: j.error })) },
           "Transcription jobs failed; abandoning session",
+        );
+        for (const clip of manifest.clips ?? []) {
+          const ids = new Set(manifest.chunks.filter((chunk) => chunk.clipIndex === clip.clipIndex).map((chunk) => `${manifest.sessionId}:${chunk.id}`));
+          if (failedJobs.some((job) => ids.has(job.id))) clip.transcriptionStatus = "failed";
+        }
+        await writeAtomically(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+        await writeAtomically(
+          failedMarker,
+          `${new Date().toISOString()} - Transcription failed: ${failedJobs.map((j) => j.error).join("; ")}\n`,
         );
         await this.report({
           sessionId: manifest.sessionId,
@@ -188,39 +203,9 @@ export class TranscriptionPublisher {
           evidence: ["failed_jobs_detected", "session_marked_failed"],
           metrics: { failed_jobs: failedJobs.length, total_jobs: payload.jobs.length },
         });
-        for (const clip of manifest.clips ?? []) {
-          const ids = new Set(manifest.chunks.filter((chunk) => chunk.clipIndex === clip.clipIndex).map((chunk) => `${manifest.sessionId}:${chunk.id}`));
-          if (failedJobs.some((job) => ids.has(job.id))) clip.transcriptionStatus = "failed";
-        }
-        await writeAtomically(join(directory, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-        await writeAtomically(
-          failedMarker,
-          `${new Date().toISOString()} - Transcription failed: ${failedJobs.map((j) => j.error).join("; ")}\n`,
-        );
         return;
       }
-      if (
-        payload.jobs.length !== manifest.chunks.length ||
-        payload.jobs.some((job) => job.status !== "completed" || job.result === null)
-      ) return;
-    } catch (error) {
-      this.logger.warn(
-        { sessionId: manifest.sessionId, error },
-        "Could not fetch transcription status; will retry",
-      );
-      await this.report({
-        sessionId: manifest.sessionId,
-        component: "transcription",
-        process: "status_fetch",
-        outcome: "warning",
-        issue: "TRANSCRIPTION_STATUS_FETCH_FAILED",
-        message: "No se pudo consultar el estado de los trabajos; Dotty lo volverá a intentar.",
-        durationMs: performance.now() - publishStarted,
-        evidence: ["status_fetch_failed", "automatic_retry_expected"],
-        error,
-      });
-      return;
-    }
+      if (payload.jobs.some((job) => job.status !== "completed" || job.result === null)) return;
 
     const corrections = [
       ...(await loadTranscriptCorrections(join(dirname(this.recordingsRoot), "campaigns", manifest.campaignId))),
@@ -367,21 +352,6 @@ export class TranscriptionPublisher {
       ...(configuredCampaign?.transcriptionVocabulary.split(",") ?? []),
       ...configuredMembers.flatMap((member) => [member.playerName, member.characterName]),
     ].filter((term): term is string => typeof term === "string" && term.trim() !== "");
-    const activatedTerms = await this.adaptiveVocabulary.observe(
-      manifest.campaignId,
-      manifest.sessionId,
-      lines,
-      [
-        ...chronicleTerms,
-        ...baseTranscriptionVocabulary().split(","),
-      ],
-    );
-    if (activatedTerms.length > 0) {
-      this.logger.info(
-        { campaignId: manifest.campaignId, terms: activatedTerms },
-        "Vocabulario adaptativo actualizado",
-      );
-    }
     const chronicle = generateSmartChronicle(lines, chronicleTerms);
 
     const exportDirectory = join(this.exportsRoot, manifest.sessionId);
@@ -436,6 +406,13 @@ export class TranscriptionPublisher {
       join(directory, "manifest.json"),
       `${JSON.stringify(manifest, null, 2)}\n`,
     );
+    const activatedTerms = await this.adaptiveVocabulary.observe(
+      manifest.campaignId, manifest.sessionId, lines,
+      [...chronicleTerms, ...baseTranscriptionVocabulary().split(",")],
+    );
+    if (activatedTerms.length > 0) {
+      this.logger.info({ campaignId: manifest.campaignId, terms: activatedTerms }, "Vocabulario adaptativo actualizado");
+    }
     await fs.writeFile(readyMarker, `${new Date().toISOString()}\n`, { flag: "wx" });
     this.logger.info(
       { sessionId: manifest.sessionId },
@@ -466,6 +443,52 @@ export class TranscriptionPublisher {
         activated_vocabulary_terms: activatedTerms.length,
       },
     });
+    });
+  }
+
+  private async validate(directory: string, expectedManifest: string, payload: { jobs: TranscriptionJob[] }): Promise<boolean> {
+    const sessionId = basename(directory);
+    const session = await this.sessions.findById(sessionId);
+    if (session === null || session.id !== sessionId || session.status !== "completed") return false;
+    // Provisional policy shared with dispatcher: only absent/completed intents are eligible.
+    const intent = await this.intents.read(sessionId);
+    if (intent !== null && intent.phase !== "completed") return false;
+    const currentText = await fs.readFile(join(directory, "manifest.json"), "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (currentText === null || currentText !== expectedManifest) return false;
+    const manifest = JSON.parse(currentText) as RecordingManifest;
+    const campaign = await this.campaigns.findByGuildAndName(session.discordGuildId, session.campaignName);
+    if (campaign === null || manifest.sessionId !== sessionId || manifest.campaignId !== campaign.id ||
+      (manifest.campaignName !== undefined && manifest.campaignName !== session.campaignName) ||
+      manifest.discordGuildId !== session.discordGuildId ||
+      manifest.status !== "completed" || !Array.isArray(manifest.chunks) || manifest.chunks.length === 0 ||
+      !Array.isArray(manifest.clips) ||
+      !Array.isArray(payload.jobs) || payload.jobs.length !== manifest.chunks.length) return false;
+    if (!(await markerExists(join(directory, ".transcription-enqueued"))) ||
+      await markerExists(join(directory, ".transcription-ready")) ||
+      await markerExists(join(directory, ".transcription-failed")) ||
+      await markerExists(join(directory, ".transcription-published"))) return false;
+    const jobDirectory = join(directory, ".transcription-jobs");
+    const entries = await fs.readdir(jobDirectory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    if (entries.some((entry) => entry.endsWith(".posting"))) return false;
+    const ids = new Set<string>();
+    for (const chunk of manifest.chunks) {
+      const clip = manifest.clips.find((item) => item.clipIndex === chunk.clipIndex);
+      if (clip === undefined || clip.transcriptionStatus === "recording") return false;
+      const id = `${sessionId}:${chunk.id}`;
+      if (ids.has(id) || !/^[a-zA-Z0-9_-]+$/u.test(chunk.id)) return false;
+      ids.add(id);
+      const job = payload.jobs.find((candidate) => candidate.id === id);
+      if (job === undefined || job.speaker_user_id !== chunk.speakerUserId ||
+        job.start_offset_ms !== chunk.startedOffsetMs ||
+        !(await markerExists(join(jobDirectory, chunk.id)))) return false;
+    }
+    return payload.jobs.every((job) => ids.has(job.id));
   }
 
   private async report(
@@ -714,6 +737,16 @@ async function exists(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function markerExists(path: string): Promise<boolean> {
+  try {
+    await fs.lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 

@@ -86,6 +86,27 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
 }
 
 describe("administrative deletion protection", () => {
+  it("blocks individual and campaign deletion when .posting survives", async (test) => {
+    const f = await fixture(test, ["session-1", "session-2"]);
+    const jobDirectory = join(f.recordings, "session-2", ".transcription-jobs");
+    await mkdir(jobDirectory);
+    await writeFile(join(jobDirectory, "chunk-1.posting"), "uncertain");
+    let deletes = 0;
+    test.mock.method(globalThis, "fetch", async () => { deletes++; return new Response(null, { status: 200 }); });
+    await assert.rejects(f.admin.delete("session-2", "guild-1"), /aceptación incierta/);
+    await assert.rejects(f.admin.deleteCampaign("campaign-1", "guild-1"), /aceptación incierta/);
+    assert.equal(deletes, 0);
+    await access(f.wav("session-1"));
+    await access(f.wav("session-2"));
+  });
+
+  it("fails closed when job marker directory cannot be read", async (test) => {
+    const f = await fixture(test);
+    await writeFile(join(f.recordings, "session-1", ".transcription-jobs"), "not a directory");
+    await assert.rejects(f.admin.delete("session-1", "guild-1"), /No se pudo verificar el despacho/);
+    await assert.rejects(f.admin.reprocess("session-1", "guild-1"), /No se pudo verificar el despacho/);
+    await access(f.wav());
+  });
   it("deletes a session with no intent after checking it", async (test) => {
     const f = await fixture(test);
     test.mock.method(globalThis, "fetch", async () => new Response(null, { status: 200 }));
@@ -321,8 +342,15 @@ describe("administrative deletion protection", () => {
     };
     const individual = f.admin.delete("session-a", "guild-1");
     await enteredDelete.promise;
+    const listed = gate();
+    const originalList = f.service.listByCampaignId.bind(f.service);
+    f.service.listByCampaignId = async (id: string) => {
+      const result = await originalList(id);
+      listed.release();
+      return result;
+    };
     const campaign = f.admin.deleteCampaign("campaign-1", "guild-1");
-    await new Promise((done) => setTimeout(done, 50));
+    await listed.promise;
     assert.deepEqual(f.calls, []);
     resumeDelete.release();
     await individual;

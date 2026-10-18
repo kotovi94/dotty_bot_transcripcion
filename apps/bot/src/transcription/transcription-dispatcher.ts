@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import type { Logger } from "pino";
 import type { CampaignService } from "../campaigns/campaign-service.ts";
@@ -12,11 +12,15 @@ import {
 } from "./base-vocabulary.ts";
 import { loadTranscriptCorrections } from "./transcript-corrections.ts";
 import type { AdaptiveVocabularyStore } from "./adaptive-vocabulary.ts";
+import type { SessionService } from "../sessions/session-service.ts";
+import type { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
+import type { ReprocessIntentStore } from "../sessions/reprocess-intent-store.ts";
 
 interface RecordingManifest {
   readonly version: 1 | 2;
   readonly sessionId: string;
   readonly campaignId: string;
+  readonly discordGuildId: string;
   readonly campaignName?: string;
   readonly status: string;
   readonly clips?: readonly {
@@ -32,6 +36,12 @@ interface RecordingManifest {
   }[];
 }
 
+function isEligible(manifest: RecordingManifest, chunk: RecordingManifest["chunks"][number]): boolean {
+  if (manifest.version === 1 || manifest.clips === undefined) return manifest.status === "completed";
+  const clip = manifest.clips.find((item) => item.clipIndex === (chunk.clipIndex ?? 1));
+  return clip !== undefined && clip.transcriptionStatus !== "recording";
+}
+
 export class TranscriptionDispatcher {
   private timer: NodeJS.Timeout | null = null;
   private dispatching = false;
@@ -43,6 +53,9 @@ export class TranscriptionDispatcher {
     private readonly secret: string,
     private readonly adaptiveVocabulary: AdaptiveVocabularyStore,
     private readonly logger: Logger,
+    private readonly sessions: Pick<SessionService, "findById">,
+    private readonly coordinator: SessionFileCoordinator,
+    private readonly intents: Pick<ReprocessIntentStore, "read">,
     private readonly diagnostics?: Pick<DottyDiagnostics, "recordActivity">,
   ) {}
 
@@ -91,17 +104,17 @@ export class TranscriptionDispatcher {
   }
 
   private async dispatchDirectory(directory: string): Promise<void> {
-    const markerPath = join(directory, ".transcription-enqueued");
-    if (existsSync(markerPath)) return;
+    const sessionId = basename(directory);
+    if (await markerExists(join(directory, ".transcription-enqueued"))) return;
+    let manifestText: string;
     let manifest: RecordingManifest;
     try {
-      manifest = JSON.parse(
-        await fs.readFile(join(directory, "manifest.json"), "utf8"),
-      ) as RecordingManifest;
+      manifestText = await fs.readFile(join(directory, "manifest.json"), "utf8");
+      manifest = JSON.parse(manifestText) as RecordingManifest;
     } catch {
       return;
     }
-    if (manifest.chunks.length === 0) return;
+    if (manifest.sessionId !== sessionId || !Array.isArray(manifest.chunks) || manifest.chunks.length === 0) return;
 
     const contextStarted = performance.now();
     const transcriptionContext = await this.buildContext(manifest);
@@ -119,67 +132,48 @@ export class TranscriptionDispatcher {
       },
     });
 
-    const eligible = manifest.chunks.filter((chunk) => {
-      if (manifest.version === 1 || manifest.clips === undefined) return manifest.status === "completed";
-      const clip = manifest.clips.find((item) => item.clipIndex === (chunk.clipIndex ?? 1));
-      return clip !== undefined && clip.transcriptionStatus !== "recording";
-    });
-    const jobMarkers = join(directory, ".transcription-jobs");
-    await fs.mkdir(jobMarkers, { recursive: true });
+    const eligible = manifest.chunks.filter((chunk) => isEligible(manifest, chunk));
     let newlyQueued = 0;
     for (const chunk of eligible) {
-      const jobMarker = join(jobMarkers, chunk.id);
-      if (existsSync(jobMarker)) continue;
-      const queuedAt = performance.now();
-      const response = await fetch(new URL("/v1/jobs", this.baseUrl), {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${this.secret}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          id: `${manifest.sessionId}:${chunk.id}`,
-          audio_path: resolve(directory, chunk.file),
-          speaker_user_id: chunk.speakerUserId,
-          start_offset_ms: chunk.startedOffsetMs,
-          language: "es",
-          initial_prompt: transcriptionContext.initialPrompt,
-          hotwords: transcriptionContext.hotwords,
-        }),
-        signal: AbortSignal.timeout(4_000),
-      });
-      if (!response.ok) {
-        await this.report({
-          sessionId: manifest.sessionId,
-          component: "transcription",
-          process: "enqueue_job",
-          outcome: "failure",
-          issue: "JOB_ENQUEUE_REJECTED",
-          message: "El transcriptor rechazó un fragmento de audio.",
-          durationMs: performance.now() - queuedAt,
-          evidence: [`http_status_${response.status}`],
-          metrics: {
+      await this.coordinator.runExclusive(sessionId, async () => {
+        if (!(await this.validate(directory, manifestText, chunk.id))) return;
+        const jobMarkers = join(directory, ".transcription-jobs");
+        const jobMarker = join(jobMarkers, chunk.id);
+        const postingMarker = join(jobMarkers, `${chunk.id}.posting`);
+        if (await markerExists(jobMarker) || await markerExists(postingMarker)) return;
+        await fs.mkdir(jobMarkers).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "EEXIST") throw error;
+        });
+        // A surviving .posting file means the POST may have been accepted. Never rebuild its payload and retry blindly.
+        await writeSyncedMarker(postingMarker);
+        await syncDirectory(jobMarkers);
+        const queuedAt = performance.now();
+        const response = await fetch(new URL("/v1/jobs", this.baseUrl), {
+          method: "POST",
+          headers: { authorization: `Bearer ${this.secret}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            id: `${sessionId}:${chunk.id}`,
+            audio_path: resolve(directory, chunk.file),
             speaker_user_id: chunk.speakerUserId,
             start_offset_ms: chunk.startedOffsetMs,
-          },
+            language: "es",
+            initial_prompt: transcriptionContext.initialPrompt,
+            hotwords: transcriptionContext.hotwords,
+          }),
+          signal: AbortSignal.timeout(4_000),
         });
-        throw new Error(`Transcriber rejected job with HTTP ${response.status}.`);
-      }
-      await fs.writeFile(jobMarker, `${new Date().toISOString()}\n`, { flag: "wx" });
-      newlyQueued += 1;
-      await this.report({
-        sessionId: manifest.sessionId,
-        component: "transcription",
-        process: "enqueue_job",
-        outcome: "success",
-        message: "Fragmento de audio aceptado por el transcriptor.",
-        durationMs: performance.now() - queuedAt,
-        evidence: ["http_request_ok", "job_marker_written"],
-        metrics: {
-          speaker_user_id: chunk.speakerUserId,
-          start_offset_ms: chunk.startedOffsetMs,
-          clip_index: chunk.clipIndex ?? 1,
-        },
+        if (!response.ok) throw new Error(`Transcriber rejected or could not reconcile job: HTTP ${response.status}.`);
+        await writeSyncedMarker(jobMarker);
+        await syncDirectory(jobMarkers);
+        await fs.rm(postingMarker);
+        newlyQueued += 1;
+        await this.report({
+          sessionId, component: "transcription", process: "enqueue_job", outcome: "success",
+          message: "Fragmento de audio aceptado por el transcriptor.",
+          durationMs: performance.now() - queuedAt,
+          evidence: ["http_request_ok", "job_marker_written"],
+          metrics: { speaker_user_id: chunk.speakerUserId, start_offset_ms: chunk.startedOffsetMs, clip_index: chunk.clipIndex ?? 1 },
+        });
       });
     }
     if (newlyQueued > 0) {
@@ -189,7 +183,15 @@ export class TranscriptionDispatcher {
       );
     }
     if (manifest.status === "completed" && eligible.length === manifest.chunks.length) {
-      await fs.writeFile(markerPath, `${new Date().toISOString()}\n`, { flag: "wx" });
+      const finalWritten = await this.coordinator.runExclusive(sessionId, async () => {
+        if (!(await this.validate(directory, manifestText))) return false;
+        for (const chunk of manifest.chunks) {
+          if (!(await markerExists(join(directory, ".transcription-jobs", chunk.id)))) return false;
+        }
+        await fs.writeFile(join(directory, ".transcription-enqueued"), `${new Date().toISOString()}\n`, { flag: "wx" });
+        return true;
+      });
+      if (!finalWritten) return;
       this.logger.info(
         { sessionId: manifest.sessionId, chunks: manifest.chunks.length },
         "Grabacion completa enviada al transcriptor",
@@ -208,6 +210,44 @@ export class TranscriptionDispatcher {
         },
       });
     }
+  }
+
+  private async validate(directory: string, expectedManifest: string, chunkId?: string): Promise<boolean> {
+    const sessionId = basename(directory);
+    const session = await this.sessions.findById(sessionId);
+    if (session === null || session.id !== sessionId) return false;
+    const intent = await this.intents.read(sessionId);
+    // Provisional policy until reprocess phases have an operational driver:
+    // absent/completed may dispatch; prepared, delete-confirmed, recovering and
+    // redispatch-ready must wait. read() errors also fail closed.
+    if (intent !== null && intent.phase !== "completed") return false;
+    let currentText: string;
+    try { currentText = await fs.readFile(join(directory, "manifest.json"), "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    if (currentText !== expectedManifest) return false;
+    const manifest = JSON.parse(currentText) as RecordingManifest;
+    const campaign = await this.campaigns.findByGuildAndName(session.discordGuildId, session.campaignName);
+    if (campaign === null || manifest.sessionId !== sessionId || manifest.campaignId !== campaign.id ||
+      (manifest.campaignName !== undefined && manifest.campaignName !== session.campaignName) ||
+      manifest.discordGuildId !== session.discordGuildId ||
+      !["recording", "paused", "finalizing", "completed"].includes(session.status) ||
+      manifest.status !== session.status ||
+      !Array.isArray(manifest.chunks) || manifest.chunks.length === 0 ||
+      await markerExists(join(directory, ".transcription-enqueued"))) return false;
+    if (chunkId !== undefined && !manifest.chunks.some((chunk) => chunk.id === chunkId && isEligible(manifest, chunk))) return false;
+    for (const chunk of manifest.chunks) {
+      if (typeof chunk.file !== "string" || typeof chunk.id !== "string" ||
+        !/^[a-zA-Z0-9_-]+$/u.test(chunk.id) || !chunk.file.toLowerCase().endsWith(".wav")) return false;
+      const path = resolve(directory, chunk.file);
+      const within = relative(directory, path);
+      if (!within || within === ".." || within.startsWith(`..\\`) || within.startsWith("../") || isAbsolute(within)) return false;
+      const stat = await fs.lstat(path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      if (stat === null || !stat.isFile() || stat.size === 0) return false;
+    }
+    return true;
   }
 
   private async buildContext(manifest: RecordingManifest): Promise<{
@@ -268,6 +308,37 @@ export class TranscriptionDispatcher {
     await this.diagnostics?.recordActivity(input).catch((error) => {
       this.logger.debug({ error }, "No se pudo guardar el diagnóstico interno de despacho");
     });
+  }
+}
+
+async function writeSyncedMarker(path: string): Promise<void> {
+  const handle = await fs.open(path, "wx");
+  try {
+    await handle.writeFile(`${new Date().toISOString()}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function markerExists(path: string): Promise<boolean> {
+  try { await fs.lstat(path); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  const handle = await fs.open(path, constants.O_RDONLY);
+  try {
+    try { await handle.sync(); }
+    catch (error) {
+      // Windows may reject directory fsync; the marker file itself was synced.
+      if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    }
+  } finally {
+    await handle.close();
   }
 }
 

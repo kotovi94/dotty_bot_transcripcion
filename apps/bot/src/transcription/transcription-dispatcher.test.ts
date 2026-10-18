@@ -8,6 +8,7 @@ import type { Logger } from "pino";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
 import type { AdaptiveVocabularyStore } from "./adaptive-vocabulary.ts";
+import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
 import { TranscriptionDispatcher } from "./transcription-dispatcher.ts";
 
 const directories: string[] = [];
@@ -25,6 +26,7 @@ describe("transcription dispatcher", () => {
         version: 1,
         sessionId: name,
         campaignId: "campaign-1",
+        discordGuildId: "guild-1",
         campaignName: "Campaign",
         status: "completed",
         chunks: [{
@@ -40,12 +42,16 @@ describe("transcription dispatcher", () => {
       root,
       {
         findById: async () => null,
+        findByGuildAndName: async () => ({ id: "campaign-1" }),
         listMembersByCampaignId: async () => [],
       } as unknown as CampaignService,
       "http://127.0.0.1:8765",
       "secret",
       { listActive: async () => [] } as unknown as AdaptiveVocabularyStore,
       { info() {}, warn() {}, debug() {} } as unknown as Logger,
+      { findById: async (id: string) => ({ id, campaignName: "Campaign", discordGuildId: "guild-1", status: "completed" }) } as never,
+      new SessionFileCoordinator(join(root, "locks")),
+      { read: async () => null } as never,
     );
     const internal = dispatcher as unknown as {
       dispatchDirectory(directory: string): Promise<void>;

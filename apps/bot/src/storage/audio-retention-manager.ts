@@ -83,29 +83,34 @@ export class AudioRetentionManager {
     let cleaned = 0;
     try {
       for (const entry of await this.recordingEntries()) {
-        const manifest = await readManifest(entry.directory);
-        if (manifest?.status !== "completed" || manifest.endedAt === null) continue;
-        const campaign = await this.campaigns.findById(manifest.campaignId);
-        if (!(await isEligibleForCleanup(manifest, campaign?.audioRetentionDays, entry.directory))) continue;
-        await this.coordinator.runExclusive(manifest.sessionId, async () => {
-          // Recheck the policy and the intent under the same lock used by create().
-          const current = await readManifest(entry.directory);
-          if (current === null || !(await isEligibleForCleanup(current, campaign?.audioRetentionDays, entry.directory))) return;
-          if (await this.intents.hasPending(current.sessionId)) return;
-          const files = await findWavFiles(entry.directory);
-          let removed = 0;
-          for (const file of files) {
-            removed += (await fs.stat(file)).size;
-            await fs.rm(file, { force: true });
-          }
-          if (removed === 0) return;
-          await fs.writeFile(join(entry.directory, ".audio-purged"), `${new Date().toISOString()}\n`, "utf8");
-          cleaned += 1;
-          this.logger.info(
-            { sessionId: current.sessionId, removedBytes: removed },
-            "Audio antiguo eliminado segun la politica de conservacion",
-          );
-        });
+        try {
+          const manifest = await readManifest(entry.directory);
+          if (manifest?.status !== "completed" || manifest.endedAt === null) continue;
+          const campaign = await this.campaigns.findById(manifest.campaignId);
+          if (!(await isEligibleForCleanup(manifest, campaign?.audioRetentionDays, entry.directory))) continue;
+          await this.coordinator.runExclusive(manifest.sessionId, async () => {
+            // Recheck all deletion gates under the same lock as dispatch and intent creation.
+            const current = await readManifest(entry.directory);
+            if (current === null || !(await isEligibleForCleanup(current, campaign?.audioRetentionDays, entry.directory))) return;
+            if (await this.intents.hasPending(current.sessionId)) return;
+            if (await hasUncertainDispatch(entry.directory)) return;
+            const files = await findWavFiles(entry.directory);
+            let removed = 0;
+            for (const file of files) {
+              removed += (await fs.stat(file)).size;
+              await fs.rm(file, { force: true });
+            }
+            if (removed === 0) return;
+            await fs.writeFile(join(entry.directory, ".audio-purged"), `${new Date().toISOString()}\n`, "utf8");
+            cleaned += 1;
+            this.logger.info(
+              { sessionId: current.sessionId, removedBytes: removed },
+              "Audio antiguo eliminado segun la politica de conservacion",
+            );
+          });
+        } catch (error) {
+          this.logger.error({ error, directory: entry.directory }, "Fallo al aplicar la conservacion de audio a una sesion");
+        }
       }
       return cleaned;
     } catch (error) {
@@ -129,12 +134,7 @@ export class AudioRetentionManager {
 }
 
 async function findWavFiles(directory: string): Promise<string[]> {
-  let entries;
-  try {
-    entries = await fs.readdir(directory, { withFileTypes: true });
-  } catch {
-    return [];
-  }
+  const entries = await fs.readdir(directory, { withFileTypes: true });
   const files: string[] = [];
   for (const entry of entries) {
     const path = join(directory, entry.name);
@@ -144,6 +144,16 @@ async function findWavFiles(directory: string): Promise<string[]> {
     }
   }
   return files;
+}
+
+async function hasUncertainDispatch(directory: string): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(join(directory, ".transcription-jobs"));
+    return entries.some((entry) => entry.endsWith(".posting"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function isEligibleForCleanup(

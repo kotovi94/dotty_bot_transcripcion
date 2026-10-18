@@ -72,6 +72,8 @@ describe("session administration", () => {
         version: 1,
         sessionId: "session-1",
         campaignId: "campaign-1",
+        campaignName: "Campaign",
+        discordGuildId: "guild-1",
         status: "completed",
         chunks: [{ id: "chunk-1", file: "audio/clip_001/user-1.wav" }],
       })],
@@ -83,7 +85,7 @@ describe("session administration", () => {
       [join(exports, "session-1", "bitacora.md"), "old export"],
     ]);
     for (const [path, contents] of files) await writeFile(path, contents);
-    const audio = Buffer.from([0, 1, 2, 255]);
+    const audio = Buffer.alloc(48, 1);
     await writeFile(audioPath, audio);
 
     let status = "failed";
@@ -97,9 +99,9 @@ describe("session administration", () => {
     try {
       const administration = new SessionAdministration(
         { channels: { fetch: async () => null } } as unknown as Client,
-        {} as CampaignService,
+        { findByGuildAndName: async () => ({ id: "campaign-1" }) } as unknown as CampaignService,
         {
-          findById: async () => ({ id: "session-1", discordGuildId: "guild-1", status }),
+          findById: async () => ({ id: "session-1", discordGuildId: "guild-1", campaignName: "Campaign", status }),
           recoverFailed: async () => {
             recoverCalls++;
             throw new Error("Prisma unavailable");
@@ -132,6 +134,9 @@ describe("session administration", () => {
         "secret",
         {} as AdaptiveVocabularyStore,
         { info() {}, warn() {}, debug() {} } as unknown as Logger,
+        { findById: async () => null } as never,
+        new SessionFileCoordinator(join(root, "session-locks")),
+        { read: async () => null } as never,
       );
       await dispatcher.dispatchCompleted();
       assert.equal(requests.length, 1, "the existing enqueued marker prevents a new POST");
@@ -152,9 +157,12 @@ describe("session administration", () => {
     const files = new Map([
       [join(directory, "manifest.json"), JSON.stringify({
         sessionId: "session-1",
-        status: "failed",
+        campaignId: "campaign-1",
+        campaignName: "Campaign",
+        discordGuildId: "guild-1",
+        status: "interrupted",
         endedAt: "2026-01-01T01:00:00.000Z",
-        chunks: [{ id: "chunk-1" }],
+        chunks: [{ id: "chunk-1", file: "audio.wav" }],
       })],
       [join(directory, ".transcription-jobs", "chunk-1"), "queued"],
       [join(directory, ".transcription-enqueued"), "queued"],
@@ -164,12 +172,14 @@ describe("session administration", () => {
       [join(exportDirectory, "bitacora.md"), "old export"],
     ]);
     for (const [path, contents] of files) await writeFile(path, contents);
+    await writeFile(join(directory, "audio.wav"), Buffer.alloc(48, 1));
 
     let status = "failed";
     let recoverCalls = 0;
     const session = {
       id: "session-1",
       discordGuildId: "guild-1",
+      campaignName: "Campaign",
       status: "failed",
     };
     const originalFetch = globalThis.fetch;
@@ -181,7 +191,7 @@ describe("session administration", () => {
     try {
       const administration = new SessionAdministration(
         { channels: { fetch: async () => null } } as unknown as Client,
-        {} as CampaignService,
+        { findByGuildAndName: async () => ({ id: "campaign-1" }) } as unknown as CampaignService,
         {
           findById: async () => session,
           recoverFailed: async () => {
@@ -255,6 +265,8 @@ describe("session administration", () => {
         overlapMs: 0,
       }],
     }));
+    await mkdir(join(directory, "audio", "clip_001"), { recursive: true });
+    await writeFile(join(directory, "audio", "clip_001", "user-1.wav"), Buffer.alloc(48, 1));
 
     const originalFetch = globalThis.fetch;
     const requests: Array<{ url: string; method: string | undefined }> = [];
@@ -279,7 +291,7 @@ describe("session administration", () => {
       } as const;
       const administration = new SessionAdministration(
         { channels: { fetch: async () => null } } as unknown as Client,
-        {} as CampaignService,
+        { findByGuildAndName: async () => ({ id: "campaign-1" }) } as unknown as CampaignService,
         { findById: async () => session } as unknown as SessionService,
         {} as VoiceCaptureManager,
         recordings,

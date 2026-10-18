@@ -1,5 +1,5 @@
 import { promises as fs } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import {
   ChannelType,
@@ -85,6 +85,7 @@ export class SessionAdministration {
             throw new SessionDeletionError(`La sesión ${member.id} cambió o tiene un estado incierto; no se borró nada.`);
           }
           await this.assertNoPendingIntent(session.id);
+          await this.assertNoUncertainDispatch(session.id);
           validated.push(session);
         }
 
@@ -134,6 +135,7 @@ export class SessionAdministration {
         throw new SessionDeletionError("La sesión ya no existe.");
       }
       await this.assertNoPendingIntent(sessionId);
+      await this.assertNoUncertainDispatch(sessionId);
       return this.deleteLocked(session, discordGuildId);
     });
   }
@@ -164,6 +166,19 @@ export class SessionAdministration {
     }
   }
 
+  private async assertNoUncertainDispatch(sessionId: string): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(join(this.recordingsRoot, sessionId, ".transcription-jobs"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw new SessionDeletionError("No se pudo verificar el despacho de jobs; se conserva la grabación.", { cause: error });
+    }
+    if (entries.some((entry) => entry.endsWith(".posting"))) {
+      throw new SessionDeletionError("Un POST de transcripción tiene aceptación incierta; se conserva la grabación.");
+    }
+  }
+
   private async deleteLocked(
     session: ManagedSession,
     discordGuildId: string,
@@ -189,38 +204,63 @@ export class SessionAdministration {
   }
 
   async reprocess(sessionId: string, discordGuildId: string): Promise<ManagedSession> {
-    const session = await this.sessions.findById(sessionId);
-    if (session === null || session.discordGuildId !== discordGuildId) {
-      throw new SessionDeletionError("La sesión ya no existe.");
-    }
-    if (session.status !== "completed" && session.status !== "failed") {
-      throw new SessionDeletionError("Solo se pueden recuperar sesiones completadas o fallidas.");
-    }
-    const directory = join(this.recordingsRoot, session.id);
-    const manifest = await this.readManifest(session.id);
-    if (manifest === null || manifest.chunks.length === 0) {
-      throw new SessionDeletionError("La sesión ya no conserva audio para reprocesar.");
-    }
-    await this.deleteTranscriberJobs(session.id, true);
-
-    if (session.status === "failed") {
-      manifest.status = "completed";
-      manifest.endedAt ??= new Date().toISOString();
-      const recovered = await this.sessions.recoverFailed(
-        session.id,
-        new Date(manifest.endedAt),
-      );
-      if (!recovered) {
-        throw new SessionDeletionError("La sesión cambió mientras se intentaba recuperar.");
+    return this.coordinator.runExclusive(sessionId, async () => {
+      const session = await this.sessions.findById(sessionId);
+      if (session === null || session.id !== sessionId || session.discordGuildId !== discordGuildId) {
+        throw new SessionDeletionError("La sesión ya no existe.");
       }
-    }
+      if (session.status !== "completed" && session.status !== "failed") {
+        throw new SessionDeletionError("Solo se pueden recuperar sesiones completadas o fallidas.");
+      }
+      await this.assertNoPendingIntent(sessionId);
+      await this.assertNoUncertainDispatch(sessionId);
+      const directory = join(this.recordingsRoot, session.id);
+      const manifest = await this.readManifest(session.id);
+      const campaign = await this.campaigns.findByGuildAndName(discordGuildId, session.campaignName);
+      if (manifest === null || manifest.sessionId !== session.id ||
+        campaign === null || manifest.campaignId !== campaign.id ||
+        manifest.campaignName !== session.campaignName || manifest.discordGuildId !== discordGuildId ||
+        (manifest.status !== "completed" && manifest.status !== "interrupted") ||
+        manifest.chunks.length === 0) {
+        throw new SessionDeletionError("La sesión ya no conserva un manifiesto válido para reprocesar.");
+      }
+      for (const chunk of manifest.chunks) {
+        if (typeof chunk.file !== "string") {
+          throw new SessionDeletionError("La ruta del WAV no es válida; se conserva la grabación.");
+        }
+        const file = resolve(directory, chunk.file);
+        const within = relative(directory, file);
+        if (!within || within === ".." || within.startsWith(`..\\`) || within.startsWith("../") || isAbsolute(within) ||
+          !chunk.file.toLowerCase().endsWith(".wav")) {
+          throw new SessionDeletionError("La ruta del WAV no es válida; se conserva la grabación.");
+        }
+        const info = await fs.lstat(file).catch(() => null);
+        if (info === null || !info.isFile() || info.size <= 44) {
+          throw new SessionDeletionError("Falta un WAV válido; se conserva la grabación.");
+        }
+      }
+      // Python DELETE only removes queued records; it does not prove an active worker has stopped.
+      await this.deleteTranscriberJobs(session.id, true);
 
-    await this.prepareRepublication(session, manifest);
-    await fs.rm(join(directory, ".transcription-enqueued"), { force: true });
-    await fs.rm(join(directory, ".transcription-failed"), { force: true });
-    await fs.rm(join(directory, ".transcription-jobs"), { recursive: true, force: true });
-    this.logger.info({ sessionId }, "Sesion preparada para reprocesamiento");
-    return session;
+      if (session.status === "failed") {
+        manifest.status = "completed";
+        manifest.endedAt ??= new Date().toISOString();
+        const recovered = await this.sessions.recoverFailed(
+          session.id,
+          new Date(manifest.endedAt),
+        );
+        if (!recovered) {
+          throw new SessionDeletionError("La sesión cambió mientras se intentaba recuperar.");
+        }
+      }
+
+      await this.prepareRepublication(session, manifest);
+      await fs.rm(join(directory, ".transcription-enqueued"), { force: true });
+      await fs.rm(join(directory, ".transcription-failed"), { force: true });
+      await fs.rm(join(directory, ".transcription-jobs"), { recursive: true, force: true });
+      this.logger.info({ sessionId }, "Sesion preparada para reprocesamiento");
+      return session;
+    });
   }
 
   async correct(

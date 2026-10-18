@@ -94,6 +94,9 @@ const transcriptions = new TranscriptionDispatcher(
   transcriberSecret,
   adaptiveVocabulary,
   logger,
+  sessions,
+  sessionCoordinator,
+  reprocessIntents,
   activityDiagnostics,
 );
 const recoveredRecordings = await recordings.recoverInterrupted();
@@ -134,6 +137,9 @@ const publisher = new TranscriptionPublisher(
   transcriberSecret,
   adaptiveVocabulary,
   logger,
+  sessions,
+  sessionCoordinator,
+  reprocessIntents,
   activityDiagnostics,
 );
 const transcriptionReports = new TranscriptionReportService(
