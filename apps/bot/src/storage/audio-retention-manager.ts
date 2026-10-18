@@ -7,6 +7,7 @@ import type { CampaignService } from "../campaigns/campaign-service.ts";
 import type { RecordingManifest } from "../recording/voice-capture-manager.ts";
 import { ReprocessIntentStore } from "../sessions/reprocess-intent-store.ts";
 import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
+import { hasVerifiedPythonInactivity, PYTHON_INACTIVITY_PENDING_CODE } from "../sessions/python-inactivity-gate.ts";
 
 export interface CampaignStorageReport {
   readonly audioBytes: number;
@@ -62,6 +63,7 @@ export class AudioRetentionManager {
       exportBytes += await directorySize(join(this.exportsRoot, manifest.sessionId));
       if (
         wavFiles.length > 0 &&
+        hasVerifiedPythonInactivity(manifest.sessionId) &&
         await isEligibleForCleanup(manifest, campaign?.audioRetentionDays, entry.directory)
       ) {
         eligibleForCleanup += 1;
@@ -94,6 +96,13 @@ export class AudioRetentionManager {
             if (current === null || !(await isEligibleForCleanup(current, campaign?.audioRetentionDays, entry.directory))) return;
             if (await this.intents.hasPending(current.sessionId)) return;
             if (await hasUncertainDispatch(entry.directory)) return;
+            if (!hasVerifiedPythonInactivity(current.sessionId)) {
+              this.logger.info(
+                { sessionId: current.sessionId, code: PYTHON_INACTIVITY_PENDING_CODE },
+                "Conservación de WAV pospuesta hasta verificar la inactividad Python",
+              );
+              return;
+            }
             const files = await findWavFiles(entry.directory);
             let removed = 0;
             for (const file of files) {

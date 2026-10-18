@@ -24,6 +24,7 @@ import type { SessionService } from "./session-service.ts";
 import type { ReprocessIntentStore } from "./reprocess-intent-store.ts";
 import type { SessionFileCoordinator } from "./session-file-coordinator.ts";
 import type { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
+import { hasVerifiedPythonInactivity, PYTHON_INACTIVITY_PENDING_CODE } from "./python-inactivity-gate.ts";
 
 const buttonPrefix = "dotty:session-delete:";
 const campaignButtonPrefix = "dotty:campaign-delete:";
@@ -88,6 +89,10 @@ export class SessionAdministration {
           await this.assertNoUncertainDispatch(session.id);
           validated.push(session);
         }
+
+        // Preflight every member before the first cancellation, Python DELETE,
+        // publication deletion, directory removal or DB deletion.
+        for (const session of validated) this.assertPythonInactivity(session.id);
 
         const deletedSessionIds: string[] = [];
         let currentSessionId: string | undefined;
@@ -183,6 +188,7 @@ export class SessionAdministration {
     session: ManagedSession,
     discordGuildId: string,
   ): Promise<ManagedSession> {
+    this.assertPythonInactivity(session.id);
     const captureCancelled = await this.recordings.cancelIfActive(discordGuildId, session.id);
     if (
       !captureCancelled &&
@@ -201,6 +207,10 @@ export class SessionAdministration {
       "Sesion eliminada por un administrador",
     );
     return session;
+  }
+
+  private assertPythonInactivity(sessionId: string): void {
+    if (!hasVerifiedPythonInactivity(sessionId)) throw new PythonInactivityDeletionError();
   }
 
   async reprocess(sessionId: string, discordGuildId: string): Promise<ManagedSession> {
@@ -609,6 +619,14 @@ export function sessionReprocessButtonId(
 }
 
 export class SessionDeletionError extends Error {}
+
+export class PythonInactivityDeletionError extends SessionDeletionError {
+  readonly code = PYTHON_INACTIVITY_PENDING_CODE;
+
+  constructor() {
+    super("El borrado queda pendiente del protocolo de inactividad Python; se conservan los WAV.");
+  }
+}
 
 const knownSessionStatuses = new Set<string>([
   "scheduled",

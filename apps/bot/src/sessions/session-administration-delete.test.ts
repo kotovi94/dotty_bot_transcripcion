@@ -12,7 +12,7 @@ import type { VoiceCaptureManager } from "../recording/voice-capture-manager.ts"
 import { AudioRetentionManager } from "../storage/audio-retention-manager.ts";
 import { ReprocessIntentStore } from "./reprocess-intent-store.ts";
 import { ReprocessIntentEligibility } from "./reprocess-intent-eligibility.ts";
-import { SessionAdministration, SessionDeletionError } from "./session-administration.ts";
+import { PythonInactivityDeletionError, SessionAdministration, SessionDeletionError } from "./session-administration.ts";
 import { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
 import { SessionFileCoordinator } from "./session-file-coordinator.ts";
 import { SessionService } from "./session-service.ts";
@@ -107,13 +107,31 @@ describe("administrative deletion protection", () => {
     await assert.rejects(f.admin.reprocess("session-1", "guild-1"), /No se pudo verificar el despacho/);
     await access(f.wav());
   });
-  it("deletes a session with no intent after checking it", async (test) => {
+  it("blocks an otherwise eligible session before any destructive effect, even if Python DELETE would return 200", async (test) => {
     const f = await fixture(test);
-    test.mock.method(globalThis, "fetch", async () => new Response(null, { status: 200 }));
-    await f.admin.delete("session-1", "guild-1");
-    await assert.rejects(access(f.wav()));
-    assert.deepEqual(f.calls, ["db:session-1"]);
+    let requests = 0;
+    test.mock.method(globalThis, "fetch", async () => { requests++; return new Response(null, { status: 200 }); });
+    await assert.rejects(f.admin.delete("session-1", "guild-1"), (error: unknown) =>
+      error instanceof PythonInactivityDeletionError && error.code === "PYTHON_INACTIVITY_PROTOCOL_PENDING");
+    assert.equal(requests, 0);
+    assert.deepEqual(f.calls, []);
+    assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
   });
+
+  for (const outcome of ["timeout", "disconnected"] as const) {
+    it(`blocks deletion before contacting a ${outcome} transcriber`, async (test) => {
+      const f = await fixture(test);
+      let requests = 0;
+      test.mock.method(globalThis, "fetch", async () => {
+        requests++;
+        throw new Error(outcome);
+      });
+      await assert.rejects(f.admin.delete("session-1", "guild-1"), PythonInactivityDeletionError);
+      assert.equal(requests, 0);
+      assert.deepEqual(f.calls, []);
+      await access(f.wav());
+    });
+  }
 
   for (const phase of ["prepared", "delete-confirmed", "recovering", "redispatch-ready", "completed"] as const) {
     it(`checks intent phase ${phase} before administrative deletion`, async (test) => {
@@ -127,9 +145,10 @@ describe("administrative deletion protection", () => {
         if (phase === next) break;
       }
       if (phase === "completed") {
-        await f.admin.delete("session-1", "guild-1");
-        await assert.rejects(access(f.wav()));
-        assert.equal(requests, 1);
+        await assert.rejects(f.admin.delete("session-1", "guild-1"), PythonInactivityDeletionError);
+        assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
+        assert.equal(requests, 0);
+        assert.deepEqual(f.calls, []);
       } else {
         await assert.rejects(f.admin.delete("session-1", "guild-1"), SessionDeletionError);
         assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
@@ -174,10 +193,10 @@ describe("administrative deletion protection", () => {
     assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
   });
 
-  it("aborts before effects when an active DB session has no verifiable local capture", async (test) => {
+  it("aborts before capture cancellation for an active DB session", async (test) => {
     const f = await fixture(test);
     f.sessions.set("session-1", { ...f.sessions.get("session-1")!, status: "finalizing" });
-    await assert.rejects(f.admin.delete("session-1", "guild-1"), /No se pudo confirmar el cierre de la captura/);
+    await assert.rejects(f.admin.delete("session-1", "guild-1"), PythonInactivityDeletionError);
     assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
     assert.deepEqual(f.calls, []);
   });
@@ -199,14 +218,15 @@ describe("administrative deletion protection", () => {
     assert.deepEqual(f.errors, []);
   });
 
-  it("deletes all eligible sessions in sorted order without re-entering their locks", async (test) => {
+  it("rejects an eligible campaign before deleting any session", async (test) => {
     const f = await fixture(test, ["session-z", "session-a", "session-m"]);
-    test.mock.method(globalThis, "fetch", async () => new Response(null, { status: 200 }));
-    const result = await f.admin.deleteCampaign("campaign-1", "guild-1");
-    assert.deepEqual(result, { campaignName: "Test", sessionCount: 3 });
-    assert.deepEqual(f.calls, ["db:session-a", "db:session-m", "db:session-z", "campaign-deleted"]);
+    let requests = 0;
+    test.mock.method(globalThis, "fetch", async () => { requests++; return new Response(null, { status: 200 }); });
+    await assert.rejects(f.admin.deleteCampaign("campaign-1", "guild-1"), PythonInactivityDeletionError);
+    assert.equal(requests, 0);
+    assert.deepEqual(f.calls, []);
     assert.deepEqual(f.errors, []);
-    for (const id of ["session-a", "session-m", "session-z"]) await assert.rejects(access(f.wav(id)));
+    for (const id of ["session-a", "session-m", "session-z"]) await access(f.wav(id));
   });
 
   for (const protectedId of ["session-a", "session-b", "session-c"]) {
@@ -325,7 +345,7 @@ describe("administrative deletion protection", () => {
     for (const id of ["session-a", "session-b"]) assert.equal(await readFile(f.wav(id), "utf8"), fakeAudio(id));
   });
 
-  it("waits for concurrent individual deletion and aborts when campaign membership changes", async (test) => {
+  it("waits for concurrent individual deletion and keeps the campaign intact", async (test) => {
     const f = await fixture(test, ["session-a", "session-b"]);
     test.mock.method(globalThis, "fetch", async () => new Response(null, { status: 200 }));
     const enteredDelete = gate();
@@ -353,9 +373,10 @@ describe("administrative deletion protection", () => {
     await listed.promise;
     assert.deepEqual(f.calls, []);
     resumeDelete.release();
-    await individual;
-    await assert.rejects(campaign, /pertenencia de sesiones a la campaña cambió/);
-    assert.deepEqual(f.calls, ["db:session-a"]);
+    await assert.rejects(individual, PythonInactivityDeletionError);
+    await assert.rejects(campaign, PythonInactivityDeletionError);
+    assert.deepEqual(f.calls, []);
+    assert.equal(await readFile(f.wav("session-a"), "utf8"), fakeAudio("session-a"));
     assert.equal(await readFile(f.wav("session-b"), "utf8"), fakeAudio("session-b"));
   });
 
@@ -374,7 +395,7 @@ describe("administrative deletion protection", () => {
     assert.deepEqual(f.calls, []);
   });
 
-  it("logs partial effects and does not claim rollback after deletion has started", async (test) => {
+  it("rejects before reaching a later database failure or any partial campaign effects", async (test) => {
     const f = await fixture(test, ["session-b", "session-a"]);
     test.mock.method(globalThis, "fetch", async () => new Response(null, { status: 200 }));
     const deleteById = f.service.deleteById.bind(f.service);
@@ -382,26 +403,11 @@ describe("administrative deletion protection", () => {
       if (id === "session-b") throw new Error("database unavailable");
       await deleteById(id);
     };
-    await assert.rejects(f.admin.deleteCampaign("campaign-1", "guild-1"), (error: unknown) => {
-      assert.ok(error instanceof SessionDeletionError);
-      assert.match(error.message, /efectos parciales y no se revirtió/);
-      assert.equal((error.cause as Error).message, "database unavailable");
-      return true;
-    });
-    assert.deepEqual(f.calls, ["db:session-a"]);
-    assert.deepEqual(f.errors.map((entry) => entry.message), [
-      "Falló el borrado de campaña después de iniciar; los efectos pueden ser parciales",
-    ]);
-    const details = f.errors[0]!.context as {
-      completedSessionIds: string[];
-      currentSessionId: string;
-      campaignDeleteAttempted: boolean;
-    };
-    assert.deepEqual(details.completedSessionIds, ["session-a"]);
-    assert.equal(details.currentSessionId, "session-b");
-    assert.equal(details.campaignDeleteAttempted, false);
-    await assert.rejects(access(f.wav("session-a")));
-    await assert.rejects(access(f.wav("session-b")));
+    await assert.rejects(f.admin.deleteCampaign("campaign-1", "guild-1"), PythonInactivityDeletionError);
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.errors, []);
+    await access(f.wav("session-a"));
+    await access(f.wav("session-b"));
     assert.equal(f.sessions.has("session-b"), true);
   });
 
@@ -420,7 +426,7 @@ describe("administrative deletion protection", () => {
     const cleanup = retention.cleanupExpired();
     assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
     release();
-    await deletion;
+    await assert.rejects(deletion, PythonInactivityDeletionError);
     assert.equal(await cleanup, 0);
   });
 
@@ -446,20 +452,21 @@ describe("administrative deletion protection", () => {
     assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
   });
 
-  it("rejects intent creation after administrative deletion wins the lock", async (test) => {
+  it("allows intent creation after a blocked administrative deletion", async (test) => {
     const f = await fixture(test);
     test.mock.method(globalThis, "fetch", async () => new Response(null, { status: 200 }));
-    await f.admin.delete("session-1", "guild-1");
-    await assert.rejects(f.intents.create("session-1"), /missing or cannot be reprocessed/);
-    assert.equal(await f.intents.read("session-1"), null);
+    await assert.rejects(f.admin.delete("session-1", "guild-1"), PythonInactivityDeletionError);
+    await f.intents.create("session-1");
+    assert.equal((await f.intents.read("session-1"))?.phase, "prepared");
   });
 
-  it("rejects intent creation after retention wins the lock", async (test) => {
+  it("allows intent creation after retention preserves the WAV", async (test) => {
     const f = await fixture(test);
     const retention = new AudioRetentionManager(f.campaigns, f.recordings, f.exports, f.logger, f.intents, f.coordinator);
-    assert.equal(await retention.cleanupExpired(), 1);
-    await assert.rejects(f.intents.create("session-1"), /Original audio was purged/);
-    assert.equal(await f.intents.read("session-1"), null);
+    assert.equal(await retention.cleanupExpired(), 0);
+    await f.intents.create("session-1");
+    assert.equal((await f.intents.read("session-1"))?.phase, "prepared");
+    await access(f.wav());
   });
 
   it("keeps an active capture from another session untouched", async (test) => {
@@ -477,9 +484,9 @@ describe("administrative deletion protection", () => {
       captureManager,
       f.recordings, f.exports, "http://127.0.0.1:8765", "secret", f.logger, f.intents, f.coordinator, f.campaignCoordinator,
     );
-    await assert.rejects(admin.delete("session-1", "guild-1"), /capture mismatch/);
+    await assert.rejects(admin.delete("session-1", "guild-1"), PythonInactivityDeletionError);
     assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
-    assert.deepEqual(f.calls, ["cancel:guild-1:session-1"]);
+    assert.deepEqual(f.calls, []);
   });
 
   it("preserves the original diagnostic if deletion fails", async (test) => {
@@ -493,7 +500,7 @@ describe("administrative deletion protection", () => {
       f.logger, f.intents, f.coordinator, f.campaignCoordinator,
     );
     test.mock.method(globalThis, "fetch", async () => new Response(null, { status: 200 }));
-    await assert.rejects(admin.delete("session-1", "guild-1"), (error: unknown) => error === failure);
+    await assert.rejects(admin.delete("session-1", "guild-1"), PythonInactivityDeletionError);
     assert.equal(await readFile(f.wav(), "utf8"), fakeAudio("session-1"));
     assert.deepEqual(f.calls, []);
   });

@@ -202,16 +202,18 @@ describe("coordinated transcription publication", () => {
       let finished = false;
       const administrative = (action === "delete" ? f.admin.delete("session-1", "guild-1") :
         action === "deleteCampaign" ? f.admin.deleteCampaign("campaign-1", "guild-1") :
-          f.admin.reprocess("session-1", "guild-1")).then(() => { finished = true; });
+          f.admin.reprocess("session-1", "guild-1")).finally(() => { finished = true; });
       assert.equal(finished, false);
-      release.release(); await publishing; await administrative;
+      release.release(); await publishing;
+      if (action === "reprocess") await administrative;
+      else await assert.rejects(administrative, /protocolo de inactividad Python/);
       assert.equal(finished, true);
       if (action === "reprocess") {
         await access(f.path("session-1", "audio.wav"));
         await assert.rejects(access(f.path("session-1", ".transcription-ready")));
       } else {
-        await assert.rejects(access(f.path("session-1", "")));
-        await assert.rejects(access(join(f.exports, "session-1")));
+        await access(f.path("session-1", "audio.wav"));
+        await access(join(f.exports, "session-1"));
       }
     });
   }

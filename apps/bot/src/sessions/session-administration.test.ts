@@ -11,7 +11,7 @@ import type { CampaignService } from "../campaigns/campaign-service.ts";
 import type { VoiceCaptureManager } from "../recording/voice-capture-manager.ts";
 import type { AdaptiveVocabularyStore } from "../transcription/adaptive-vocabulary.ts";
 import { TranscriptionDispatcher } from "../transcription/transcription-dispatcher.ts";
-import { SessionAdministration } from "./session-administration.ts";
+import { PythonInactivityDeletionError, SessionAdministration } from "./session-administration.ts";
 import { ReprocessIntentStore } from "./reprocess-intent-store.ts";
 import { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
 import { SessionFileCoordinator } from "./session-file-coordinator.ts";
@@ -28,7 +28,7 @@ function protection(root: string): [ReprocessIntentStore, SessionFileCoordinator
 }
 
 describe("session administration", () => {
-  it("passes the requested session identity to capture cancellation and stops on mismatch", async () => {
+  it("blocks deletion before capture cancellation for the requested session", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-delete-identity-"));
     directories.push(root);
     const recordings = join(root, "recordings");
@@ -51,8 +51,8 @@ describe("session administration", () => {
       { info() {}, error() {} } as unknown as Logger,
       ...protection(root),
     );
-    await assert.rejects(administration.delete("session-b", "guild"), /does not match/);
-    assert.deepEqual(calls, [["guild", "session-b"]]);
+    await assert.rejects(administration.delete("session-b", "guild"), PythonInactivityDeletionError);
+    assert.deepEqual(calls, []);
     assert.equal(await readFile(join(active, "active.wav"), "utf8"), "active audio");
     assert.equal(await readFile(join(requested, "requested.wav"), "utf8"), "requested audio");
   });

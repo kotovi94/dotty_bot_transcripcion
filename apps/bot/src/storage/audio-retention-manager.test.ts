@@ -18,7 +18,7 @@ const directories: string[] = [];
 after(async () => Promise.all(directories.map((directory) => rm(directory, { recursive: true }))));
 
 describe("audio retention", () => {
-  it("preserves WAV with .posting after restart and purges when it is absent", async () => {
+  it("preserves WAV with and without .posting after restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-retention-posting-"));
     directories.push(root);
     const recordings = join(root, "recordings");
@@ -39,12 +39,13 @@ describe("audio retention", () => {
       { info() {}, error() {} } as unknown as Logger,
       new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible), coordinator);
     const beforeRestart = makeManager();
-    assert.equal(await beforeRestart.cleanupExpired(), 1);
+    assert.equal(await beforeRestart.cleanupExpired(), 0);
     await access(join(recordings, "session-1", "audio.wav"));
-    await assert.rejects(access(join(recordings, "session-2", "audio.wav")));
+    await access(join(recordings, "session-2", "audio.wav"));
     const afterRestart = makeManager();
     assert.equal(await afterRestart.cleanupExpired(), 0);
     await access(join(recordings, "session-1", "audio.wav"));
+    await access(join(recordings, "session-2", "audio.wav"));
   });
 
   it("skips unreadable job markers and continues with independent sessions", async () => {
@@ -70,12 +71,12 @@ describe("audio retention", () => {
       recordings, join(root, "exports"),
       { info() {}, error(value: unknown) { errors.push(value); } } as unknown as Logger,
       new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible), coordinator);
-    assert.equal(await manager.cleanupExpired(), 1);
+    assert.equal(await manager.cleanupExpired(), 0);
     assert.equal(errors.length, 1);
     await access(join(recordings, "session-1", "audio.wav"));
-    await assert.rejects(access(join(recordings, "session-2", "audio.wav")));
+    await access(join(recordings, "session-2", "audio.wav"));
   });
-  it("removes only WAV files from expired published sessions", async () => {
+  it("preserves WAV and unrelated files from expired published sessions", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-retention-"));
     directories.push(root);
     const recordings = join(root, "recordings");
@@ -113,15 +114,15 @@ describe("audio retention", () => {
     const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
     const manager = new AudioRetentionManager(campaigns, recordings, exports, logger,
       new ReprocessIntentStore(join(root, "reprocess-intents"), coordinator, eligible), coordinator);
-    assert.equal((await manager.report("campaign-1")).eligibleForCleanup, 1);
-    assert.equal(await manager.cleanupExpired(), 1);
-    await assert.rejects(access(join(audioDirectory, "voice.wav")));
+    assert.equal((await manager.report("campaign-1")).eligibleForCleanup, 0);
+    assert.equal(await manager.cleanupExpired(), 0);
+    await access(join(audioDirectory, "voice.wav"));
     assert.equal(await readFile(join(audioDirectory, "preserve.txt"), "utf8"), "metadata");
     assert.match(await readFile(join(sessionDirectory, "manifest.json"), "utf8"), /session-1/);
     assert.equal(await readFile(join(exportDirectory, "bitacora.md"), "utf8"), "transcripción");
     const report = await manager.report("campaign-1");
-    assert.equal(report.sessionsWithAudio, 0);
-    assert.equal(report.sessionsWithoutAudio, 1);
+    assert.equal(report.sessionsWithAudio, 1);
+    assert.equal(report.sessionsWithoutAudio, 0);
     assert.equal(report.eligibleForCleanup, 0);
   });
 
@@ -225,9 +226,8 @@ describe("audio retention", () => {
         assert.equal(await readFile(wav, "utf8"), "fictional audio");
         await rm(`${intents.pathFor("session-1")}.lock`);
       }
-      assert.equal(await restarted.cleanupExpired(), phase === "completed" ? 1 : 0);
-      if (phase === "completed") await assert.rejects(access(wav));
-      else assert.equal(await readFile(wav, "utf8"), "fictional audio");
+      assert.equal(await restarted.cleanupExpired(), 0);
+      assert.equal(await readFile(wav, "utf8"), "fictional audio");
     });
   }
 

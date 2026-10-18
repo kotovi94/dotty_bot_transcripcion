@@ -136,7 +136,7 @@ describe("coordinated transcription dispatch", () => {
     await assert.rejects(access(join(f.recordings, "session-1")));
   });
 
-  it("makes administrative delete wait for the accepted POST", async (test) => {
+  it("makes administrative delete wait for the accepted POST, then preserves WAV", async (test) => {
     const f = await fixture(test);
     const posted = gate(); const release = gate();
     const calls: string[] = [];
@@ -149,9 +149,9 @@ describe("coordinated transcription dispatch", () => {
     await posted.promise;
     const deleting = f.admin.delete("session-1", "guild-1");
     assert.deepEqual(calls, ["POST"]);
-    release.release(); await dispatching; await deleting;
-    assert.deepEqual(calls, ["POST", "DELETE"]);
-    await assert.rejects(access(join(f.recordings, "session-1")));
+    release.release(); await dispatching; await assert.rejects(deleting, /protocolo de inactividad Python/);
+    assert.deepEqual(calls, ["POST"]);
+    await access(join(f.recordings, "session-1", "audio.wav"));
   });
 
   it("makes reprocess wait for a POST", async (test) => {
