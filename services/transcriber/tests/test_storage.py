@@ -7,14 +7,19 @@ import pytest
 from dotty_transcriber.storage import JobInput, JobStore
 
 
-def test_repeated_crashes_become_visible_and_manually_retryable(tmp_path: Path) -> None:
+def test_repeated_failures_become_visible_and_manually_retryable(tmp_path: Path) -> None:
     path = tmp_path / "crashes.db"
     store = JobStore(path)
     store.enqueue(JobInput("session:chunk", "unused.wav", "user", 0, "es"))
     for attempt in range(1, 4):
         claimed = store.claim_next()
         assert claimed is not None and claimed["attempts"] == attempt
-        store = JobStore(path)
+        assert store.fail(claimed["id"], claimed["claim_token"], "fixture failure")
+        assert store.claim_next() is None
+        assert store.release_occupation(
+            claimed["occupation_id"], claimed["id"], claimed["claim_token"]
+        )
+    store = JobStore(path)
     assert store.metrics()["failed"] == 1
     assert store.metrics()["queued"] == 0
     assert store.claim_next() is None
@@ -49,6 +54,10 @@ def test_queue_is_idempotent_and_recovers_processing(tmp_path: Path) -> None:
 
     recovered = JobStore(tmp_path / "queue.db")
     recovered_claim = recovered.claim_next()
+    assert recovered_claim is None
+    assert recovered.occupations_for_session("chunk-1")[0]["pending_reconciliation"] is True
+    assert store.release_occupation(claimed["occupation_id"], claimed["id"], claimed["claim_token"])
+    recovered_claim = recovered.claim_next()
     assert recovered_claim["attempts"] == 2
     recovered.complete("chunk-1", recovered_claim["claim_token"], {"segments": []})
     assert recovered.get("chunk-1")["status"] == "completed"
@@ -69,6 +78,10 @@ def test_failed_job_can_be_retried(tmp_path: Path) -> None:
     for _ in range(3):
         claimed = store.claim_next()
         store.fail("retry", claimed["claim_token"], "temporary failure")
+        assert store.claim_next() is None
+        assert store.release_occupation(
+            claimed["occupation_id"], claimed["id"], claimed["claim_token"]
+        )
     assert store.get("retry")["status"] == "failed"
     assert store.retry("retry")["status"] == "queued"
     assert store.get("retry")["attempts"] == 0
@@ -93,6 +106,7 @@ def test_reports_session_progress_and_retries_failed_session(tmp_path: Path) -> 
     assert work["session_progress"] == 0.75
     for _ in range(3):
         store.fail(second["id"], second["claim_token"], "temporary")
+        assert store.release_occupation(second["occupation_id"], second["id"], second["claim_token"])
         if store.get(second["id"])["status"] != "failed":
             second = store.claim_next()
             assert second is not None
@@ -123,6 +137,8 @@ def test_stale_worker_cannot_overwrite_recreated_job(tmp_path: Path) -> None:
     assert store.delete_for_session("session-1") == 1
 
     store.enqueue(job)
+    assert store.claim_next() is None
+    assert store.release_occupation(old_claim["occupation_id"], old_claim["id"], old_claim["claim_token"])
     new_claim = store.claim_next()
     assert new_claim is not None
     assert new_claim["claim_token"] != old_claim["claim_token"]
@@ -170,6 +186,7 @@ def test_closed_session_does_not_block_other_jobs_or_allow_retries(tmp_path: Pat
     assert claim is not None
     for attempt in range(3):
         store.fail(closed.id, claim["claim_token"], "failed")
+        assert store.release_occupation(claim["occupation_id"], claim["id"], claim["claim_token"])
         if attempt < 2:
             claim = store.claim_next()
             assert claim is not None

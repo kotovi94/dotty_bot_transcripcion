@@ -114,6 +114,19 @@ def test_two_sessions_have_independent_occupation_evidence(tmp_path: Path) -> No
     assert [row["id"] for row in store.occupations_for_session("two")] == [two["occupation_id"]]
 
 
+def test_unreleased_retry_does_not_block_another_session(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.db")
+    store.enqueue(_job("one:chunk"))
+    first = store.claim_next()
+    assert store.fail(first["id"], first["claim_token"], "fixture failure")
+    store.enqueue(_job("two:chunk"))
+    other = store.claim_next()
+    assert other is not None and other["id"] == "two:chunk"
+    assert store.occupations_for_session("one")[0]["released_at"] is None
+    assert store.release_occupation(first["occupation_id"], first["id"], first["claim_token"])
+    assert store.claim_next()["id"] == "one:chunk"
+
+
 def test_restart_preserves_occupation_as_pending_reconciliation(tmp_path: Path) -> None:
     path = tmp_path / "jobs.db"
     first = JobStore(path)
@@ -126,6 +139,7 @@ def test_restart_preserves_occupation_as_pending_reconciliation(tmp_path: Path) 
     assert occupation["released_at"] is None
     assert occupation["pending_reconciliation"] is True
     assert restarted.get("session:chunk")["status"] == "queued"
+    assert restarted.claim_next() is None
     assert restarted.admission_state("session")["workers_inactive"] is None
 
 

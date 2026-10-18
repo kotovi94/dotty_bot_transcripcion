@@ -261,7 +261,8 @@ def retry_session_jobs(session_id: str) -> dict[str, Any]:
 def _worker_loop() -> None:
     while not stop_event.is_set():
         try:
-            job = store.claim_next()
+            worker_store = store
+            job = worker_store.claim_next()
         except Exception:
             logger.exception("Could not claim job; worker will retry")
             stop_event.wait(1)
@@ -271,20 +272,21 @@ def _worker_loop() -> None:
             continue
         job_started = time.perf_counter()
         session_id = _session_id(str(job["id"]))
-        _record_diagnostic(
-            session_id,
-            "job",
-            "started",
-            "Worker tomó el trabajo y comenzó a procesarlo.",
-            job_id=job["id"],
-            evidence=["job_claimed", "claim_token_assigned"],
-            metrics={
-                "speaker_user_id": job["speaker_user_id"],
-                "attempts": job["attempts"],
-                "start_offset_ms": job["start_offset_ms"],
-            },
-        )
+        release_allowed = True
         try:
+            _record_diagnostic(
+                session_id,
+                "job",
+                "started",
+                "Worker tomó el trabajo y comenzó a procesarlo.",
+                job_id=job["id"],
+                evidence=["job_claimed", "claim_token_assigned"],
+                metrics={
+                    "speaker_user_id": job["speaker_user_id"],
+                    "attempts": job["attempts"],
+                    "start_offset_ms": job["start_offset_ms"],
+                },
+            )
             logger.info(
                 "Starting transcription job=%s audio=%s speaker=%s attempts=%s",
                 job["id"],
@@ -393,7 +395,7 @@ def _worker_loop() -> None:
                     job["language"],
                     job["initial_prompt"],
                     job["hotwords"],
-                    lambda progress, processed, duration: store.update_progress(
+                    lambda progress, processed, duration: worker_store.update_progress(
                         job["id"], job["claim_token"], progress, processed, duration,
                         phase="transcribing"
                     ),
@@ -455,7 +457,7 @@ def _worker_loop() -> None:
                 "speech_ratio": analysis.speech_ratio,
                 "rms_dbfs": analysis.rms_dbfs,
             }
-            if store.complete(job["id"], job["claim_token"], result):
+            if worker_store.complete(job["id"], job["claim_token"], result):
                 _record_diagnostic(
                     session_id,
                     "persistence",
@@ -534,7 +536,7 @@ def _worker_loop() -> None:
                 )
         except Exception as error:
             logger.exception("Transcription job %s failed", job["id"])
-            store.fail(job["id"], job["claim_token"], str(error))
+            worker_store.fail(job["id"], job["claim_token"], str(error))
             cause_issue = classify_transcription_error(error)
             _record_diagnostic(
                 session_id,
@@ -560,6 +562,24 @@ def _worker_loop() -> None:
                 error=error,
             )
             time.sleep(1)
+        except BaseException:
+            # An interrupted native call may leave work whose completion cannot
+            # be verified here. Keep the durable occupation for reconciliation.
+            release_allowed = False
+            logger.exception("Worker interrupted; retaining occupation job=%s", job["id"])
+            raise
+        finally:
+            if release_allowed:
+                try:
+                    released = worker_store.release_occupation(
+                        job["occupation_id"], job["id"], job["claim_token"]
+                    )
+                    if not released:
+                        logger.error("Occupation release was not verified job=%s occupation=%s",
+                                     job["id"], job["occupation_id"])
+                except Exception:
+                    logger.exception("Could not release occupation job=%s occupation=%s",
+                                     job["id"], job["occupation_id"])
 
 
 def _session_id(job_id: str) -> str:

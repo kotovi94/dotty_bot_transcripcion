@@ -263,6 +263,8 @@ class JobStore:
                 AND NOT EXISTS (SELECT 1 FROM session_admission AS gate
                   WHERE gate.session_id=CASE WHEN instr(transcription_job.id, ':')=0
                   THEN transcription_job.id ELSE substr(transcription_job.id,1,instr(transcription_job.id,':')-1) END)
+                AND NOT EXISTS (SELECT 1 FROM worker_occupation AS occupation
+                  WHERE occupation.job_id=transcription_job.id AND occupation.released_at IS NULL)
                 ORDER BY created_at LIMIT 1""",
             ).fetchone()
             if row is None:
