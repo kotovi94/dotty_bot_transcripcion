@@ -114,6 +114,191 @@ def test_lock_release_waits_until_protected_enqueue_commits(
         lock.release()
 
 
+def test_session_inventory_matches_exact_and_delimited_ids_without_collisions(
+    tmp_path: Path,
+) -> None:
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        store = JobStore(tmp_path / "inventory.db", instance_lock=lock)
+        for job_id in ("s1", "s1:chunk", "s10:chunk", "s1x:chunk", "S1:chunk"):
+            store.enqueue(JobInput(job_id, "unused.wav", "user", 0, "es"))
+
+        inventory = store.inventory_for_session("s1")
+        assert {job["id"] for job in inventory["jobs"]} == {"s1", "s1:chunk"}
+        assert inventory["classification"] == "protected-only"
+        assert inventory["counts"]["jobs_protected"] == 2
+        assert inventory["counts"]["jobs_unknown"] == 0
+        assert inventory["instance_ids"] == [lock.instance_id]
+
+        assert {job["id"] for job in store.inventory_for_session("s10")["jobs"]} == {"s10:chunk"}
+        assert store.inventory_for_session("empty")["classification"] == "empty"
+        assert "workers_inactive" not in inventory
+        assert "wav_safe" not in inventory
+    finally:
+        lock.release()
+
+
+def test_session_inventory_distinguishes_unknown_mixed_and_invalid_provenance(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inventory.db"
+    legacy_store = JobStore(path)
+    legacy_store.enqueue(JobInput("unknown:old", "unused.wav", "user", 0, "es"))
+    legacy_store.enqueue(JobInput("mixed:old", "unused.wav", "user", 0, "es"))
+
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        store = JobStore(path, instance_lock=lock)
+        store.enqueue(JobInput("mixed:new", "unused.wav", "user", 0, "es"))
+        store.enqueue(JobInput("corrupt:job", "unused.wav", "user", 0, "es"))
+        store.enqueue(JobInput("future:job", "unused.wav", "user", 0, "es"))
+        store._connection().execute(
+            "UPDATE transcription_job SET provenance_protocol_version=1, "
+            "provenance_instance_id='not-an-instance-id' WHERE id='corrupt:job'"
+        )
+        store._connection().execute(
+            "UPDATE transcription_job SET provenance_protocol_version=?, "
+            "provenance_instance_id=? WHERE id='future:job'",
+            (PROVENANCE_PROTOCOL_VERSION + 1, lock.instance_id),
+        )
+
+        unknown = store.inventory_for_session("unknown")
+        assert unknown["classification"] == "unknown-only"
+        assert unknown["counts"]["jobs_unknown"] == 1
+
+        mixed = store.inventory_for_session("mixed")
+        assert mixed["classification"] == "mixed"
+        assert mixed["counts"]["jobs_protected"] == 1
+        assert mixed["counts"]["jobs_unknown"] == 1
+
+        corrupt = store.inventory_for_session("corrupt")
+        assert corrupt["classification"] == "uncertain"
+        assert corrupt["counts"]["jobs_malformed_or_unrecognized"] == 1
+        assert corrupt["jobs"][0]["provenance_status"] == "malformed"
+
+        future = store.inventory_for_session("future")
+        assert future["classification"] == "uncertain"
+        assert future["counts"]["jobs_malformed_or_unrecognized"] == 1
+        assert future["jobs"][0]["provenance_status"] == "unrecognized_version"
+    finally:
+        lock.release()
+
+
+def test_session_inventory_preserves_provenance_across_retry_and_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inventory.db"
+    first_lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        first = JobStore(path, instance_lock=first_lock)
+        first.enqueue(JobInput("retry:chunk", "unused.wav", "user", 0, "es"))
+        first._connection().execute(
+            "UPDATE transcription_job SET max_attempts=1 WHERE id='retry:chunk'"
+        )
+        failed_claim = first.claim_next()
+        assert failed_claim is not None
+        assert first.fail(failed_claim["id"], failed_claim["claim_token"], "fixture failure")
+        assert first.release_occupation(
+            failed_claim["occupation_id"], failed_claim["id"], failed_claim["claim_token"]
+        )
+        original = first.get("retry:chunk")
+        retried = first.retry("retry:chunk")
+        assert retried["provenance_protocol_version"] == original["provenance_protocol_version"]
+        assert retried["provenance_instance_id"] == original["provenance_instance_id"]
+
+        retry_claim = first.claim_next()
+        assert retry_claim is not None
+        assert first.complete(retry_claim["id"], retry_claim["claim_token"], {})
+        assert first.release_occupation(
+            retry_claim["occupation_id"], retry_claim["id"], retry_claim["claim_token"]
+        )
+
+        first.enqueue(JobInput("pending:chunk", "unused.wav", "user", 0, "es"))
+        pending_claim = first.claim_next()
+        assert pending_claim is not None and pending_claim["id"] == "pending:chunk"
+        first_instance_id = first_lock.instance_id
+    finally:
+        first_lock.release()
+
+    second_lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        restarted = JobStore(path, instance_lock=second_lock)
+        assert restarted.claim_next() is None
+        pending = restarted.inventory_for_session("pending")
+        assert pending["classification"] == "uncertain"
+        assert pending["counts"]["jobs_protected"] == 1
+        assert pending["counts"]["occupations_active"] == 1
+        assert pending["counts"]["occupations_unreconciled"] == 1
+        assert pending["jobs"][0]["provenance_instance_id"] == first_instance_id
+        assert pending["current_instance_id"] == second_lock.instance_id
+        assert first_instance_id in pending["instance_ids"]
+
+        retried_inventory = restarted.inventory_for_session("retry")
+        assert retried_inventory["classification"] == "protected-only"
+        assert retried_inventory["jobs"][0]["provenance_instance_id"] == first_instance_id
+    finally:
+        second_lock.release()
+
+
+def test_session_inventory_is_uncertain_after_job_delete_and_recreation(tmp_path: Path) -> None:
+    fake_wav = tmp_path / "fixture.wav"
+    fake_wav.write_bytes(b"temporary fixture audio bytes")
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        store = JobStore(tmp_path / "inventory.db", instance_lock=lock)
+        job = JobInput("session:chunk", str(fake_wav), "user", 0, "es")
+        store.enqueue(job)
+        old_claim = store.claim_next()
+        assert old_claim is not None
+
+        assert store.delete_for_session("session") == 1
+        store.enqueue(job)
+        inventory = store.inventory_for_session("session")
+        assert inventory["classification"] == "uncertain"
+        assert inventory["counts"]["jobs_protected"] == 1
+        assert inventory["counts"]["occupations_active"] == 1
+        assert "active_occupation_claim_mismatch" in inventory["uncertainty_reasons"]
+        assert fake_wav.read_bytes() == b"temporary fixture audio bytes"
+        assert "workers_inactive" not in inventory
+        assert "wav_safe" not in inventory
+    finally:
+        lock.release()
+
+
+def test_session_inventory_reads_consistently_during_admission_and_release(
+    tmp_path: Path,
+) -> None:
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        store = JobStore(tmp_path / "inventory.db", instance_lock=lock)
+        store.enqueue(JobInput("session:chunk", "unused.wav", "user", 0, "es"))
+        claim = store.claim_next()
+        assert claim is not None
+
+        def read_inventories():
+            return [store.inventory_for_session("session") for _ in range(30)]
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            reads = pool.submit(read_inventories)
+            closing = pool.submit(store.close_admission, "session")
+            releasing = pool.submit(
+                store.release_occupation, claim["occupation_id"], claim["id"], claim["claim_token"]
+            )
+            snapshots = reads.result(timeout=10)
+            assert closing.result(timeout=10)["closed"] is True
+            assert releasing.result(timeout=10) is True
+
+        for snapshot in snapshots:
+            assert snapshot["counts"]["jobs_total"] == 1
+            assert snapshot["counts"]["jobs_protected"] == 1
+            assert snapshot["counts"]["occupations_active"] in {0, 1}
+            assert snapshot["counts"]["occupations_active"] == sum(
+                occupation["active"] for occupation in snapshot["occupations"]
+            )
+    finally:
+        lock.release()
+
+
 def test_repeated_failures_become_visible_and_manually_retryable(tmp_path: Path) -> None:
     path = tmp_path / "crashes.db"
     store = JobStore(path)

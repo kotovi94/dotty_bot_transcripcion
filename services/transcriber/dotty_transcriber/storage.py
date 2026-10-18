@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -379,6 +380,159 @@ class JobStore:
             for row in rows
         ]
 
+    def inventory_for_session(self, session_id: str) -> dict[str, Any]:
+        _validate_session_id(session_id)
+        lower_job_id = f"{session_id}:"
+        upper_job_id = f"{session_id};"
+        connection = self._connection()
+        current_instance_id = None
+        if (
+            type(self._instance_lock) is TranscriberInstanceLock
+            and self._instance_lock.is_held
+            and self._instance_lock.directory == self.path.resolve().parent
+        ):
+            current_instance_id = self._instance_lock.instance_id
+
+        connection.execute("BEGIN")
+        try:
+            job_rows = connection.execute(
+                """SELECT id,status,claim_token,created_at,updated_at,
+                provenance_protocol_version,provenance_instance_id
+                FROM transcription_job
+                WHERE id COLLATE BINARY=? OR
+                  (id COLLATE BINARY>=? AND id COLLATE BINARY<?)
+                ORDER BY created_at,id""",
+                (session_id, lower_job_id, upper_job_id),
+            ).fetchall()
+            occupation_rows = connection.execute(
+                """SELECT id,session_id,job_id,claim_token,instance_id,acquired_at,released_at
+                FROM worker_occupation WHERE session_id=? ORDER BY acquired_at,id""",
+                (session_id,),
+            ).fetchall()
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+        jobs_by_id = {row["id"]: row for row in job_rows}
+        jobs: list[dict[str, Any]] = []
+        counts = {
+            "jobs_total": len(job_rows),
+            "jobs_protected": 0,
+            "jobs_unknown": 0,
+            "jobs_malformed_or_unrecognized": 0,
+            "occupations_total": len(occupation_rows),
+            "occupations_active": 0,
+            "occupations_unreconciled": 0,
+            "occupations_malformed": 0,
+        }
+        instance_ids: set[str] = set()
+        uncertainty_reasons: set[str] = set()
+
+        for row in job_rows:
+            provenance_status = _job_provenance_status(row)
+            if provenance_status == "protected":
+                counts["jobs_protected"] += 1
+                instance_ids.add(row["provenance_instance_id"])
+            elif provenance_status == "unknown":
+                counts["jobs_unknown"] += 1
+            else:
+                counts["jobs_malformed_or_unrecognized"] += 1
+                uncertainty_reasons.add(
+                    "unrecognized_job_protocol"
+                    if provenance_status == "unrecognized_version"
+                    else "malformed_job_provenance"
+                )
+            jobs.append({
+                "id": row["id"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "provenance_protocol_version": row["provenance_protocol_version"],
+                "provenance_instance_id": row["provenance_instance_id"],
+                "provenance_status": provenance_status,
+            })
+
+        occupations: list[dict[str, Any]] = []
+        for row in occupation_rows:
+            active = row["released_at"] is None
+            unreconciled = active and (
+                current_instance_id is None or row["instance_id"] != current_instance_id
+            )
+            if active:
+                counts["occupations_active"] += 1
+            if unreconciled:
+                counts["occupations_unreconciled"] += 1
+                uncertainty_reasons.add("unreconciled_occupation")
+
+            job_id = row["job_id"]
+            belongs_to_session = _job_belongs_to_session(job_id, session_id)
+            association_valid = (
+                row["session_id"] == session_id
+                and belongs_to_session
+                and job_id in jobs_by_id
+            )
+            if not association_valid:
+                uncertainty_reasons.add(
+                    "occupation_session_mismatch" if not belongs_to_session or row["session_id"] != session_id
+                    else "occupation_without_job"
+                )
+            elif active and row["claim_token"] != jobs_by_id[job_id]["claim_token"]:
+                uncertainty_reasons.add("active_occupation_claim_mismatch")
+
+            malformed = (
+                not _valid_instance_id(row["id"])
+                or not _valid_instance_id(row["instance_id"])
+                or not _valid_instance_id(row["claim_token"])
+                or not isinstance(row["acquired_at"], str)
+                or not row["acquired_at"]
+                or (row["released_at"] is not None and not isinstance(row["released_at"], str))
+            )
+            if malformed:
+                counts["occupations_malformed"] += 1
+                uncertainty_reasons.add("malformed_occupation")
+            if _valid_instance_id(row["instance_id"]):
+                instance_ids.add(row["instance_id"])
+
+            occupations.append({
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "job_id": job_id,
+                "instance_id": row["instance_id"],
+                "acquired_at": row["acquired_at"],
+                "released_at": row["released_at"],
+                "active": active,
+                "unreconciled": unreconciled,
+                "association_valid": association_valid,
+            })
+
+        if counts["occupations_active"] and current_instance_id is None:
+            uncertainty_reasons.add("current_instance_unverified")
+
+        if uncertainty_reasons:
+            classification = "uncertain"
+        elif not job_rows and not occupation_rows:
+            classification = "empty"
+        elif counts["jobs_protected"] == counts["jobs_total"]:
+            classification = "protected-only"
+        elif counts["jobs_unknown"] == counts["jobs_total"]:
+            classification = "unknown-only"
+        elif counts["jobs_protected"] and counts["jobs_unknown"]:
+            classification = "mixed"
+        else:
+            classification = "uncertain"
+
+        return {
+            "session_id": session_id,
+            "classification": classification,
+            "counts": counts,
+            "current_instance_id": current_instance_id,
+            "instance_ids": sorted(instance_ids),
+            "jobs": jobs,
+            "occupations": occupations,
+            "uncertainty_reasons": sorted(uncertainty_reasons),
+        }
+
     def complete(self, job_id: str, claim_token: str, result: dict[str, Any]) -> bool:
         now = _now()
         updated = self._connection().execute(
@@ -574,3 +728,25 @@ def _session_id(job_id: str) -> str:
     session_id = job_id.split(":", 1)[0]
     _validate_session_id(session_id)
     return session_id
+
+
+def _job_belongs_to_session(job_id: Any, session_id: str) -> bool:
+    if not isinstance(job_id, str):
+        return False
+    return job_id == session_id or job_id.partition(":")[0] == session_id and ":" in job_id
+
+
+def _valid_instance_id(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
+
+
+def _job_provenance_status(row: sqlite3.Row) -> str:
+    version = row["provenance_protocol_version"]
+    instance_id = row["provenance_instance_id"]
+    if version is None and instance_id is None:
+        return "unknown"
+    if type(version) is int and version != PROVENANCE_PROTOCOL_VERSION:
+        return "unrecognized_version" if _valid_instance_id(instance_id) else "malformed"
+    if type(version) is int and version == PROVENANCE_PROTOCOL_VERSION and _valid_instance_id(instance_id):
+        return "protected"
+    return "malformed"
