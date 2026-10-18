@@ -88,6 +88,7 @@ class JobStore:
               attempts INTEGER NOT NULL DEFAULT 0,
               max_attempts INTEGER NOT NULL DEFAULT 3,
               claim_token TEXT,
+              generation_id TEXT,
               provenance_protocol_version INTEGER,
               provenance_instance_id TEXT,
               result_json TEXT,
@@ -116,7 +117,52 @@ class JobStore:
             );
             CREATE INDEX IF NOT EXISTS worker_occupation_session_active
               ON worker_occupation(session_id, released_at);
+            CREATE TABLE IF NOT EXISTS job_history_scope (
+              id INTEGER PRIMARY KEY CHECK (id=1),
+              prior_history_status TEXT NOT NULL CHECK (prior_history_status='unknown'),
+              established_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS job_generation_history (
+              generation_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              job_id TEXT NOT NULL,
+              admission_provenance TEXT NOT NULL CHECK (admission_provenance IN ('protected','unknown')),
+              protocol_version INTEGER,
+              instance_id TEXT,
+              audio_origin_status TEXT NOT NULL CHECK (audio_origin_status='unknown'),
+              admitted_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS job_generation_history_session
+              ON job_generation_history(session_id, admitted_at, generation_id);
+            CREATE TABLE IF NOT EXISTS job_admission_event (
+              event_id TEXT PRIMARY KEY,
+              generation_id TEXT NOT NULL UNIQUE REFERENCES job_generation_history(generation_id),
+              event_type TEXT NOT NULL CHECK (event_type='created'),
+              evidence_kind TEXT NOT NULL CHECK (evidence_kind='transaction_observed'),
+              occurred_at TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS job_generation_history_no_update
+              BEFORE UPDATE ON job_generation_history BEGIN
+                SELECT RAISE(ABORT, 'job generation history is append-only');
+              END;
+            CREATE TRIGGER IF NOT EXISTS job_generation_history_no_delete
+              BEFORE DELETE ON job_generation_history BEGIN
+                SELECT RAISE(ABORT, 'job generation history is append-only');
+              END;
+            CREATE TRIGGER IF NOT EXISTS job_admission_event_no_update
+              BEFORE UPDATE ON job_admission_event BEGIN
+                SELECT RAISE(ABORT, 'job admission events are append-only');
+              END;
+            CREATE TRIGGER IF NOT EXISTS job_admission_event_no_delete
+              BEFORE DELETE ON job_admission_event BEGIN
+                SELECT RAISE(ABORT, 'job admission events are append-only');
+              END;
             """
+        )
+        # No existing database, including an empty one, proves the absence of
+        # pre-protocol jobs or readers. Never upgrade this baseline on startup.
+        connection.execute(
+            "INSERT OR IGNORE INTO job_history_scope VALUES (1,'unknown',?)", (_now(),)
         )
         admission_columns = {
             row["name"]
@@ -159,6 +205,10 @@ class JobStore:
             connection.execute(
                 "ALTER TABLE transcription_job ADD COLUMN claim_token TEXT"
             )
+        if "generation_id" not in columns:
+            connection.execute(
+                "ALTER TABLE transcription_job ADD COLUMN generation_id TEXT"
+            )
         if "provenance_protocol_version" not in columns:
             connection.execute(
                 "ALTER TABLE transcription_job ADD COLUMN provenance_protocol_version INTEGER"
@@ -195,15 +245,21 @@ class JobStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 self._assert_open(connection, session_id)
-                connection.execute(
+                generation_id = uuid.uuid4().hex
+                inserted = connection.execute(
                     """INSERT OR IGNORE INTO transcription_job
                     (id,audio_path,speaker_user_id,start_offset_ms,language,initial_prompt,hotwords,status,
-                     provenance_protocol_version,provenance_instance_id,created_at,updated_at)
+                     generation_id,provenance_protocol_version,provenance_instance_id,created_at,updated_at)
                     VALUES (:id,:audio_path,:speaker_user_id,:start_offset_ms,:language,:initial_prompt,:hotwords,
-                     'queued',:protocol_version,:instance_id,:now,:now)""",
+                     'queued',:generation_id,:protocol_version,:instance_id,:now,:now)""",
                     {**asdict(job), "protocol_version": protocol_version,
-                     "instance_id": provenance_instance_id, "now": now},
+                     "instance_id": provenance_instance_id, "generation_id": generation_id, "now": now},
                 )
+                if inserted.rowcount == 1:
+                    self._record_admission(
+                        connection, generation_id, session_id, job.id,
+                        protocol_version, provenance_instance_id, now,
+                    )
                 row = connection.execute("SELECT * FROM transcription_job WHERE id=?", (job.id,)).fetchone()
                 assert row is not None
                 existing = _serialize(row)
@@ -215,6 +271,27 @@ class JobStore:
             except BaseException:
                 connection.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    def _record_admission(
+        connection: sqlite3.Connection, generation_id: str, session_id: str,
+        job_id: str, protocol_version: int | None, instance_id: str | None, now: str,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO job_generation_history
+            (generation_id,session_id,job_id,admission_provenance,protocol_version,
+             instance_id,audio_origin_status,admitted_at)
+            VALUES (?,?,?,?,?,?,'unknown',?)""",
+            (generation_id, session_id, job_id,
+             "protected" if protocol_version is not None else "unknown",
+             protocol_version, instance_id, now),
+        )
+        connection.execute(
+            """INSERT INTO job_admission_event
+            (event_id,generation_id,event_type,evidence_kind,occurred_at)
+            VALUES (?,?,'created','transaction_observed',?)""",
+            (uuid.uuid4().hex, generation_id, now),
+        )
 
     def close_admission(self, session_id: str) -> dict[str, Any]:
         """Persist the admission barrier, without claiming that active workers stopped."""
