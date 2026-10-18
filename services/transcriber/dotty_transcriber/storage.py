@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import threading
@@ -104,7 +105,8 @@ class JobStore:
               session_id TEXT PRIMARY KEY,
               closed_at TEXT NOT NULL,
               active_at_close_json TEXT NOT NULL,
-              occupations_at_close_json TEXT NOT NULL DEFAULT '[]'
+              occupations_at_close_json TEXT NOT NULL DEFAULT '[]',
+              close_operation_id TEXT
             );
             CREATE TABLE IF NOT EXISTS worker_occupation (
               id TEXT PRIMARY KEY,
@@ -157,6 +159,42 @@ class JobStore:
               BEFORE DELETE ON job_admission_event BEGIN
                 SELECT RAISE(ABORT, 'job admission events are append-only');
               END;
+            CREATE TABLE IF NOT EXISTS job_deletion_operation (
+              operation_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              operation_type TEXT NOT NULL,
+              parameters_hash TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN
+                ('pending_drain','ready_to_delete','completed','failed','uncertain')),
+              close_id TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              result_json TEXT,
+              uncertainty_reason TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS job_deletion_one_active_session
+              ON job_deletion_operation(session_id)
+              WHERE status IN ('pending_drain','ready_to_delete','uncertain');
+            CREATE TABLE IF NOT EXISTS job_deletion_target (
+              operation_id TEXT NOT NULL REFERENCES job_deletion_operation(operation_id),
+              job_id TEXT NOT NULL,
+              generation_id TEXT,
+              observation_id TEXT NOT NULL UNIQUE,
+              observed_rowid INTEGER NOT NULL,
+              observed_status TEXT NOT NULL,
+              observed_provenance TEXT NOT NULL,
+              identity_status TEXT NOT NULL CHECK (identity_status IN ('recorded_generation','observed_only')),
+              snapshot_hash TEXT NOT NULL,
+              snapshot_json TEXT NOT NULL,
+              PRIMARY KEY(operation_id,job_id)
+            );
+            CREATE TRIGGER IF NOT EXISTS job_deletion_target_no_update
+              BEFORE UPDATE ON job_deletion_target BEGIN
+                SELECT RAISE(ABORT, 'deletion targets are immutable');
+              END;
+            CREATE TRIGGER IF NOT EXISTS job_deletion_target_no_delete
+              BEFORE DELETE ON job_deletion_target BEGIN
+                SELECT RAISE(ABORT, 'deletion targets are immutable');
+              END;
             """
         )
         # No existing database, including an empty one, proves the absence of
@@ -173,6 +211,14 @@ class JobStore:
                 "ALTER TABLE session_admission ADD COLUMN occupations_at_close_json "
                 "TEXT NOT NULL DEFAULT '[]'"
             )
+        if "close_operation_id" not in admission_columns:
+            connection.execute(
+                "ALTER TABLE session_admission ADD COLUMN close_operation_id TEXT"
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS session_admission_close_operation "
+            "ON session_admission(close_operation_id) WHERE close_operation_id IS NOT NULL"
+        )
         columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(transcription_job)").fetchall()
@@ -334,6 +380,150 @@ class JobStore:
         except BaseException:
             connection.execute("ROLLBACK")
             raise
+
+    def prepare_job_deletion(
+        self, operation_id: str, session_id: str, operation_type: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Freeze targets and close admission; never delete a job or infer worker liveness."""
+        _validate_session_id(session_id)
+        if not isinstance(operation_id, str) or str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError("Operation ID must be a canonical UUID")
+        if operation_type not in {"reprocess", "administrative_delete", "manual_recovery"}:
+            raise ValueError("Unsupported deletion operation type")
+        if parameters is not None and not isinstance(parameters, dict):
+            raise ValueError("Operation parameters must be an object")
+        canonical = json.dumps(
+            {"session_id": session_id, "operation_type": operation_type,
+             "parameters": parameters or {}},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        )
+        parameters_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT * FROM job_deletion_operation WHERE operation_id=?", (operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if (existing["session_id"] != session_id or
+                    existing["operation_type"] != operation_type or
+                    existing["parameters_hash"] != parameters_hash):
+                    raise ValueError("Operation ID conflicts with persisted parameters")
+                result = self._job_deletion_operation(connection, operation_id)
+                connection.execute("COMMIT")
+                assert result is not None
+                return result
+
+            gate = connection.execute(
+                "SELECT close_operation_id FROM session_admission WHERE session_id=?", (session_id,),
+            ).fetchone()
+            if gate is not None:
+                raise ValueError("Session admission was already closed; reconciliation required")
+            if connection.execute(
+                "SELECT 1 FROM job_deletion_operation WHERE session_id=? AND status='pending_drain'",
+                (session_id,),
+            ).fetchone() is not None:
+                raise ValueError("Another deletion operation controls this session")
+
+            now = _now()
+            close_id = uuid.uuid4().hex
+            active = connection.execute(
+                """SELECT id,claim_token FROM transcription_job WHERE status='processing'
+                AND (id=? OR substr(id,1,instr(id,':')-1)=?) ORDER BY id""",
+                (session_id, session_id),
+            ).fetchall()
+            occupations = connection.execute(
+                """SELECT id,session_id,job_id,claim_token,instance_id,acquired_at
+                FROM worker_occupation WHERE session_id=? AND released_at IS NULL ORDER BY acquired_at,id""",
+                (session_id,),
+            ).fetchall()
+            connection.execute(
+                """INSERT INTO session_admission
+                (session_id,closed_at,active_at_close_json,occupations_at_close_json,close_operation_id)
+                VALUES (?,?,?,?,?)""",
+                (session_id, now, json.dumps([dict(row) for row in active]),
+                 json.dumps([dict(row) for row in occupations]), close_id),
+            )
+            connection.execute(
+                """INSERT INTO job_deletion_operation
+                (operation_id,session_id,operation_type,parameters_hash,status,close_id,created_at)
+                VALUES (?,?,?,?,'pending_drain',?,?)""",
+                (operation_id, session_id, operation_type, parameters_hash, close_id, now),
+            )
+            rows = connection.execute(
+                """SELECT rowid AS observed_rowid,* FROM transcription_job
+                WHERE id COLLATE BINARY=? OR
+                  (id COLLATE BINARY>=? AND id COLLATE BINARY<?)
+                ORDER BY id""",
+                (session_id, f"{session_id}:", f"{session_id};"),
+            ).fetchall()
+            for row in rows:
+                self._record_deletion_target(connection, operation_id, session_id, row)
+            result = self._job_deletion_operation(connection, operation_id)
+            connection.execute("COMMIT")
+            assert result is not None
+            return result
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _record_deletion_target(
+        connection: sqlite3.Connection, operation_id: str, session_id: str, row: sqlite3.Row,
+    ) -> None:
+        snapshot = dict(row)
+        snapshot_json = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        generation_id = row["generation_id"]
+        # A legacy rowid and hash only document this observation. They cannot
+        # authenticate a later row after deletion/reuse; later stages must fail
+        # closed on observed_only targets unless identity is reconciled.
+        recorded = connection.execute(
+            """SELECT 1 FROM job_generation_history
+            WHERE generation_id=? AND session_id=? AND job_id=?""",
+            (generation_id, session_id, row["id"]),
+        ).fetchone() is not None if generation_id is not None else False
+        connection.execute(
+            """INSERT INTO job_deletion_target
+            (operation_id,job_id,generation_id,observation_id,observed_rowid,
+             observed_status,observed_provenance,identity_status,snapshot_hash,snapshot_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (operation_id, row["id"], generation_id, uuid.uuid4().hex,
+             row["observed_rowid"], row["status"], _job_provenance_status(row),
+             "recorded_generation" if recorded else "observed_only",
+             hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest(), snapshot_json),
+        )
+
+    def job_deletion_operation(self, operation_id: str) -> dict[str, Any] | None:
+        connection = self._connection()
+        connection.execute("BEGIN")
+        try:
+            result = self._job_deletion_operation(connection, operation_id)
+            connection.execute("COMMIT")
+            return result
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _job_deletion_operation(
+        connection: sqlite3.Connection, operation_id: str,
+    ) -> dict[str, Any] | None:
+        operation = connection.execute(
+            "SELECT * FROM job_deletion_operation WHERE operation_id=?", (operation_id,),
+        ).fetchone()
+        if operation is None:
+            return None
+        targets = connection.execute(
+            """SELECT job_id,generation_id,observation_id,observed_rowid,
+            observed_status,observed_provenance,identity_status,snapshot_hash,snapshot_json
+            FROM job_deletion_target WHERE operation_id=? ORDER BY job_id""",
+            (operation_id,),
+        ).fetchall()
+        return {
+            **dict(operation),
+            "targets": [{**dict(row), "snapshot": json.loads(row["snapshot_json"])} for row in targets],
+        }
 
     @staticmethod
     def _assert_open(connection: sqlite3.Connection, session_id: str) -> None:
