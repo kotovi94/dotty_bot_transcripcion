@@ -27,6 +27,7 @@ export class ReprocessIntentAppliedError extends ReprocessIntentError {
 
 interface StoreOperations {
   removeBackup?: (path: string) => Promise<void>;
+  rename?: (from: string, to: string) => Promise<void>;
 }
 
 // This store is intentionally separate from atomic-json-file.ts. On Windows,
@@ -52,6 +53,13 @@ export class ReprocessIntentStore {
   }
 
   async read(sessionId: string): Promise<ReprocessIntent | null> {
+    const intent = await this.readForInspection(sessionId);
+    if (intent !== null) assertCanonicalOperationId(intent.operationId);
+    return intent;
+  }
+
+  // Historical IDs can be inspected, but operational readers must fail closed.
+  async readForInspection(sessionId: string): Promise<ReprocessIntent | null> {
     const path = this.pathFor(sessionId);
     if (await exists(`${path}.lock`)) {
       throw new ReprocessIntentError("Locked intent requires review");
@@ -81,9 +89,30 @@ export class ReprocessIntentStore {
   }
 
   async create(sessionId: string, operationId: string = randomUUID()): Promise<ReprocessIntent> {
-    return this.coordinator.runExclusive(sessionId, async () => {
-      await this.eligibility.assertEligible(sessionId);
-      return this.locked(sessionId, async (path) => {
+    return this.coordinator.runExclusive(sessionId, () => this.createLocked(sessionId, operationId));
+  }
+
+  // The caller already owns the session lock. runWithHeldLock checks the
+  // acquisition capability and registers this work before it can write.
+  createWithHeldLock(sessionId: string, operationId: string = randomUUID()): Promise<ReprocessIntent> {
+    return this.coordinator.runWithHeldLock(sessionId, () => this.createLocked(sessionId, operationId));
+  }
+
+  // Historical records remain readable, but only a canonical UUID can be
+  // recovered for a future Python operation. Never assign one retroactively.
+  recoverWithHeldLock(sessionId: string): Promise<ReprocessIntent> {
+    return this.coordinator.runWithHeldLock(sessionId, async () => {
+      const intent = await this.read(sessionId);
+      if (intent === null) throw new ReprocessIntentError("Intent does not exist");
+      assertCanonicalOperationId(intent.operationId);
+      return intent;
+    });
+  }
+
+  private async createLocked(sessionId: string, operationId: string): Promise<ReprocessIntent> {
+    assertCanonicalOperationId(operationId);
+    await this.eligibility.assertEligible(sessionId);
+    return this.locked(sessionId, async (path) => {
       if (await exists(path) || await exists(`${path}.bak`)) {
         throw new ReprocessIntentError("Intent already exists");
       }
@@ -97,10 +126,9 @@ export class ReprocessIntentStore {
       validate(intent, sessionId);
       const temporary = `${path}.${randomUUID()}.tmp`;
       await writeSynced(temporary, intent);
-      await fs.rename(temporary, path);
+      await (this.operations.rename?.(temporary, path) ?? fs.rename(temporary, path));
       await syncDirectory(this.root);
       return intent;
-      });
     });
   }
 
@@ -221,6 +249,12 @@ function validate(value: unknown, sessionId: string): asserts value is Reprocess
     !validDate(item.createdAt) || !validDate(item.updatedAt) ||
     Date.parse(item.updatedAt as string) < Date.parse(item.createdAt as string)) {
     throw new Error("Invalid intent");
+  }
+}
+
+function assertCanonicalOperationId(operationId: string): void {
+  if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u.test(operationId)) {
+    throw new ReprocessIntentError("Operation ID is not a canonical UUID");
   }
 }
 
