@@ -9,6 +9,7 @@ Remove-Item Env:Path -ErrorAction SilentlyContinue
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $environmentPath = Join-Path $projectRoot ".env"
 $configuredDataDirectory = "./data"
+$configuredTranscriberBaseUrl = "http://127.0.0.1:8765"
 $configuredNpm = "npm.cmd"
 $configuredOllama = "./runtime/ollama/ollama.exe"
 $configuredOllamaModels = "./data/models/ollama"
@@ -16,6 +17,7 @@ $configuredOllamaModel = "qwen3:4b"
 if (Test-Path -LiteralPath $environmentPath) {
   foreach ($environmentLine in Get-Content -LiteralPath $environmentPath) {
     if ($environmentLine -match '^DOTTY_DATA_DIR=(.*)$') { $configuredDataDirectory = $Matches[1].Trim() }
+    if ($environmentLine -match '^TRANSCRIBER_BASE_URL=(.*)$') { $configuredTranscriberBaseUrl = $Matches[1].Trim() }
     if ($environmentLine -match '^DOTTY_NPM_EXECUTABLE=(.*)$') { $configuredNpm = $Matches[1].Trim() }
     if ($environmentLine -match '^DOTTY_OLLAMA_EXECUTABLE=(.*)$') { $configuredOllama = $Matches[1].Trim() }
     if ($environmentLine -match '^OLLAMA_MODELS=(.*)$') { $configuredOllamaModels = $Matches[1].Trim() }
@@ -33,6 +35,15 @@ $startLogPath = Join-Path $dataDirectory "startup.log"
 $transcriberPidPath = Join-Path $dataDirectory "transcriber.pid"
 $botPidPath = Join-Path $dataDirectory "dotty.pid"
 $botStartupTimeoutSeconds = 300
+$transcriberUri = $null
+if (-not [Uri]::TryCreate($configuredTranscriberBaseUrl, [UriKind]::Absolute, [ref]$transcriberUri) -or
+    $transcriberUri.Scheme -ne "http" -or $transcriberUri.Host -ne "127.0.0.1" -or
+    $transcriberUri.AbsolutePath -ne "/" -or $transcriberUri.Query -ne "" -or
+    $transcriberUri.Fragment -ne "" -or $transcriberUri.UserInfo -ne "") {
+  throw "TRANSCRIBER_BASE_URL debe ser http://127.0.0.1:<puerto> para el lanzador local."
+}
+$transcriberPort = $transcriberUri.Port
+$transcriberHealthUrl = "http://127.0.0.1:$transcriberPort/health"
 $ollamaExecutable = if ([System.IO.Path]::IsPathRooted($configuredOllama)) { $configuredOllama } else { Join-Path $projectRoot $configuredOllama }
 $ollamaModels = if ([System.IO.Path]::IsPathRooted($configuredOllamaModels)) { $configuredOllamaModels } else { Join-Path $projectRoot $configuredOllamaModels }
 $ollamaPidPath = Join-Path $dataDirectory "ollama.pid"
@@ -59,7 +70,6 @@ function Test-PidFile([string]$path) {
 
 Write-Host ""
 Write-Host "Iniciando Dotty..." -ForegroundColor Cyan
-Write-LogLine $startLogPath "Arrancando Dotty"
 
 if (-not (Test-Path -LiteralPath $environmentPath)) {
   throw "No existe el archivo .env. Configura primero las credenciales de Discord."
@@ -77,8 +87,21 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
   throw "Falta el entorno del transcriptor. Ejecuta la preparacion indicada en services\transcriber\README.md."
 }
 
+# A health response cannot identify an existing service. Reject every listener
+# before creating directories, writing logs, or starting another process.
+try {
+  $existingTranscriberListener = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+    Where-Object { $_.LocalPort -eq $transcriberPort })
+} catch {
+  throw "No se pudo verificar si el puerto $transcriberPort del transcriptor esta libre; no se inicio Dotty."
+}
+if ($existingTranscriberListener.Count -gt 0) {
+  throw "El puerto $transcriberPort del transcriptor ya esta ocupado. No se reutilizara ni detendra el proceso existente."
+}
+
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $ollamaModels -Force | Out-Null
+Write-LogLine $startLogPath "Arrancando Dotty"
 
 $ollamaReady = $false
 try {
@@ -131,22 +154,13 @@ if (-not $ollamaModelReady) {
 Write-Host "[OK] Modelo narrativo $configuredOllamaModel disponible." -ForegroundColor Green
 
 $transcriberReady = $false
+Write-LogLine $startLogPath "Iniciando transcriptor en http://127.0.0.1:$transcriberPort"
 try {
-  $health = Invoke-RestMethod -Uri "http://127.0.0.1:8765/health" -TimeoutSec 2
-  $transcriberReady = $health.status -eq "ok"
-} catch {
-  $transcriberReady = $false
-}
-
-if ($transcriberReady) {
-  Write-Host "[OK] El transcriptor ya estaba encendido." -ForegroundColor Green
-} else {
-  Write-LogLine $startLogPath "Iniciando transcriptor en http://127.0.0.1:8765"
   Set-Content -LiteralPath $transcriberStdout -Value "" -Encoding UTF8
   Set-Content -LiteralPath $transcriberStderr -Value "" -Encoding UTF8
   $transcriberProcess = Start-Process `
     -FilePath $pythonPath `
-    -ArgumentList @("-m", "uvicorn", "dotty_transcriber.main:app", "--host", "127.0.0.1", "--port", "8765") `
+    -ArgumentList @("-m", "uvicorn", "dotty_transcriber.main:app", "--host", "127.0.0.1", "--port", "$transcriberPort") `
     -WorkingDirectory $transcriberDirectory `
     -WindowStyle Hidden `
     -RedirectStandardOutput $transcriberStdout `
@@ -155,26 +169,61 @@ if ($transcriberReady) {
   Set-Content -LiteralPath $transcriberPidPath -Value $transcriberProcess.Id -Encoding ASCII
 
   for ($attempt = 1; $attempt -le 20; $attempt += 1) {
-    Start-Sleep -Milliseconds 500
+    $transcriberProcess.Refresh()
+    if ($transcriberProcess.HasExited) {
+      throw "El transcriptor iniciado por Dotty termino antes de estar disponible; no se aceptara otro servicio."
+    }
     try {
-      $health = Invoke-RestMethod -Uri "http://127.0.0.1:8765/health" -TimeoutSec 2
-      if ($health.status -eq "ok") {
-        $transcriberReady = $true
-        break
-      }
+      $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+        Where-Object { $_.LocalPort -eq $transcriberPort })
+    } catch {
+      throw "No se pudo verificar el propietario del puerto $transcriberPort tras iniciar el transcriptor."
+    }
+    if (@($listeners | Where-Object { $_.OwningProcess -ne $transcriberProcess.Id }).Count -gt 0) {
+      throw "Otro proceso ocupo el puerto $transcriberPort durante el arranque; no se aceptara como transcriptor."
+    }
+    Start-Sleep -Milliseconds 500
+    $health = $null
+    try {
+      $health = Invoke-RestMethod -Uri $transcriberHealthUrl -TimeoutSec 2
     } catch {
       # El servicio aun esta arrancando.
+    }
+    $transcriberProcess.Refresh()
+    if ($transcriberProcess.HasExited) {
+      throw "El transcriptor iniciado por Dotty termino antes de estar disponible; no se aceptara otro servicio."
+    }
+    try {
+      $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+        Where-Object { $_.LocalPort -eq $transcriberPort })
+    } catch {
+      throw "No se pudo verificar el propietario del puerto $transcriberPort tras consultar health."
+    }
+    if (@($listeners | Where-Object { $_.OwningProcess -ne $transcriberProcess.Id }).Count -gt 0) {
+      throw "Otro proceso ocupo el puerto $transcriberPort durante el arranque; no se aceptara como transcriptor."
+    }
+    if ($health.status -eq "ok" -and $listeners.Count -gt 0) {
+      $transcriberReady = $true
+      break
     }
   }
   if (-not $transcriberReady) {
     Write-LogLine $startLogPath "El transcriptor no respondio. Revisa data/transcriber.stderr.log."
     throw "El transcriptor no respondio. Revisa data\transcriber.stderr.log."
   }
-  $transcriberListener = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($null -ne $transcriberListener) {
-    Set-Content -LiteralPath $transcriberPidPath -Value $transcriberListener.OwningProcess -Encoding ASCII
-  }
   Write-Host "[OK] Transcriptor local encendido." -ForegroundColor Green
+} catch {
+  if ($null -ne $transcriberProcess) {
+    try {
+      $transcriberProcess.Refresh()
+      if ($transcriberProcess.HasExited) {
+        Remove-Item -LiteralPath $transcriberPidPath -Force -ErrorAction SilentlyContinue
+      }
+    } catch {
+      # Preserve the original startup error.
+    }
+  }
+  throw
 }
 
 if (Test-PidFile $botPidPath) {
