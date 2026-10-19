@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import type { Client } from "discord.js";
+import type { ButtonInteraction, Client } from "discord.js";
 import type { Logger } from "pino";
 
 import type { CampaignService } from "../campaigns/campaign-service.ts";
@@ -12,7 +13,8 @@ import type { VoiceCaptureManager } from "../recording/voice-capture-manager.ts"
 import { AudioRetentionManager } from "../storage/audio-retention-manager.ts";
 import { ReprocessIntentStore } from "./reprocess-intent-store.ts";
 import { ReprocessIntentEligibility } from "./reprocess-intent-eligibility.ts";
-import { PythonInactivityDeletionError, SessionAdministration, SessionDeletionError } from "./session-administration.ts";
+import { handleSessionReprocessButton, PythonInactivityDeletionError, SessionAdministration, SessionDeletionError,
+  sessionReprocessButtonId } from "./session-administration.ts";
 import { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
 import { SessionFileCoordinator } from "./session-file-coordinator.ts";
 import { SessionService } from "./session-service.ts";
@@ -40,7 +42,8 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, "audio.wav"), fakeAudio(id));
     await writeFile(join(directory, "manifest.json"), JSON.stringify({
-      version: 2, sessionId: id, campaignId: "campaign-1", discordGuildId: "guild-1", status: "completed",
+      version: 2, sessionId: id, campaignId: "campaign-1", campaignName: "Test",
+      discordGuildId: "guild-1", status: "completed",
       endedAt: "2026-01-01T00:00:00.000Z", chunks: [{ file: "audio.wav" }],
     }));
     await writeFile(join(directory, ".transcription-published"), "published");
@@ -86,6 +89,97 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
 }
 
 describe("administrative deletion protection", () => {
+  it("persists the UUID before POST, reuses it after retry, and leaves all artifacts intact", async (test) => {
+    const f = await fixture(test);
+    const manifestPath = join(f.recordings, "session-1", "manifest.json");
+    const originalManifest = await readFile(manifestPath);
+    const wav = await readFile(f.wav());
+    const posts: string[] = [];
+    test.mock.method(globalThis, "fetch", async (url: URL | string, init?: RequestInit) => {
+      assert.equal(String(url), "http://127.0.0.1:8765/v1/sessions/session-1/job-deletions");
+      assert.equal(init?.method, "POST");
+      const body = JSON.parse(String(init?.body)) as { operation_id: string; operation_type: string; parameters: object };
+      assert.deepEqual({ operation_type: body.operation_type, parameters: body.parameters },
+        { operation_type: "reprocess", parameters: {} });
+      assert.equal((await f.intents.read("session-1"))?.operationId, body.operation_id);
+      posts.push(body.operation_id);
+      const canonical = JSON.stringify({ operation_type: "reprocess", parameters: {}, session_id: "session-1" });
+      return new Response(JSON.stringify({ operation_id: body.operation_id, session_id: "session-1",
+        operation_type: "reprocess", parameters_hash: createHash("sha256").update(canonical).digest("hex"),
+        close_id: "a".repeat(32), status: "pending_drain", workers_inactive: null, jobs_deleted: false }),
+      { status: 202 });
+    });
+    await f.admin.reprocess("session-1", "guild-1");
+    const restartedCoordinator = new SessionFileCoordinator(join(f.root, "session-locks"));
+    const restartedIntents = new ReprocessIntentStore(join(f.root, "reprocess-intents"), restartedCoordinator,
+      new ReprocessIntentEligibility(f.service, f.recordings));
+    const restartedAdmin = new SessionAdministration(
+      { channels: { fetch: async () => null } } as unknown as Client,
+      f.campaigns, f.service, f.captureManager, f.recordings, f.exports,
+      "http://127.0.0.1:8765", "secret", f.logger, restartedIntents,
+      restartedCoordinator, f.campaignCoordinator,
+    );
+    await restartedAdmin.reprocess("session-1", "guild-1");
+    assert.equal(posts.length, 2);
+    assert.equal(posts[0], posts[1]);
+    assert.deepEqual(await readFile(f.wav()), wav);
+    assert.deepEqual(await readFile(manifestPath), originalManifest);
+    await access(join(f.recordings, "session-1", ".transcription-published"));
+    assert.deepEqual(f.calls, []);
+
+    let message = "";
+    const interaction = {
+      customId: sessionReprocessButtonId("confirmar", "session-1", "admin-1"),
+      user: { id: "admin-1" }, guildId: "guild-1",
+      memberPermissions: { has: () => true },
+      deferUpdate: async () => {},
+      editReply: async (value: { content: string }) => { message = value.content; },
+    } as unknown as ButtonInteraction;
+    assert.equal(await handleSessionReprocessButton(interaction, f.admin), true);
+    assert.match(message, /pendiente del drenaje/);
+    assert.match(message, /todavía no volvió a la cola/);
+  });
+
+  it("lets another session prepare while one Python POST remains unresolved", async (test) => {
+    const f = await fixture(test, ["session-1", "session-2"]);
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    test.mock.method(globalThis, "fetch", async (url: URL | string, init?: RequestInit) => {
+      const id = String(url).includes("session-1") ? "session-1" : "session-2";
+      if (id === "session-1") { entered(); await gate; }
+      const { operation_id } = JSON.parse(String(init?.body)) as { operation_id: string };
+      const canonical = JSON.stringify({ operation_type: "reprocess", parameters: {}, session_id: id });
+      return new Response(JSON.stringify({ operation_id, session_id: id, operation_type: "reprocess",
+        parameters_hash: createHash("sha256").update(canonical).digest("hex"),
+        close_id: "a".repeat(32), status: "pending_drain", workers_inactive: null, jobs_deleted: false }),
+      { status: 202 });
+    });
+    const first = f.admin.reprocess("session-1", "guild-1");
+    await started;
+    await f.admin.reprocess("session-2", "guild-1");
+    assert.equal((await f.intents.read("session-2"))?.phase, "prepared");
+    release();
+    await first;
+    await access(f.wav("session-1"));
+    await access(f.wav("session-2"));
+  });
+
+  it("blocks historical and corrupt intents before HTTP", async (test) => {
+    const f = await fixture(test);
+    const path = f.intents.pathFor("session-1");
+    await mkdir(join(f.root, "reprocess-intents"), { recursive: true });
+    let requests = 0;
+    test.mock.method(globalThis, "fetch", async () => { requests++; return new Response(null, { status: 202 }); });
+    await writeFile(path, JSON.stringify({ version: 1, sessionId: "session-1", operationId: "historical",
+      phase: "prepared", createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }));
+    await assert.rejects(f.admin.reprocess("session-1", "guild-1"), /intención de reprocesamiento es incierta/);
+    await writeFile(path, "{broken");
+    await assert.rejects(f.admin.reprocess("session-1", "guild-1"), /intención de reprocesamiento es incierta/);
+    assert.equal(requests, 0);
+    await access(f.wav());
+  });
   it("blocks individual and campaign deletion when .posting survives", async (test) => {
     const f = await fixture(test, ["session-1", "session-2"]);
     const jobDirectory = join(f.recordings, "session-2", ".transcription-jobs");

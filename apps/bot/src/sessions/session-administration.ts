@@ -22,6 +22,7 @@ import {
 import type { ManagedSession } from "./session-repository.ts";
 import type { SessionService } from "./session-service.ts";
 import type { ReprocessIntentStore } from "./reprocess-intent-store.ts";
+import { prepareReprocessJobDeletion } from "./reprocess-job-deletion-client.ts";
 import type { SessionFileCoordinator } from "./session-file-coordinator.ts";
 import type { CampaignFileCoordinator } from "./campaign-file-coordinator.ts";
 import { hasVerifiedPythonInactivity, PYTHON_INACTIVITY_PENDING_CODE } from "./python-inactivity-gate.ts";
@@ -214,7 +215,7 @@ export class SessionAdministration {
   }
 
   async reprocess(sessionId: string, discordGuildId: string): Promise<ManagedSession> {
-    return this.coordinator.runExclusive(sessionId, async () => {
+    const prepared = await this.coordinator.runExclusive(sessionId, async () => {
       const session = await this.sessions.findById(sessionId);
       if (session === null || session.id !== sessionId || session.discordGuildId !== discordGuildId) {
         throw new SessionDeletionError("La sesión ya no existe.");
@@ -222,7 +223,6 @@ export class SessionAdministration {
       if (session.status !== "completed" && session.status !== "failed") {
         throw new SessionDeletionError("Solo se pueden recuperar sesiones completadas o fallidas.");
       }
-      await this.assertNoPendingIntent(sessionId);
       await this.assertNoUncertainDispatch(sessionId);
       const directory = join(this.recordingsRoot, session.id);
       const manifest = await this.readManifest(session.id);
@@ -249,28 +249,39 @@ export class SessionAdministration {
           throw new SessionDeletionError("Falta un WAV válido; se conserva la grabación.");
         }
       }
-      // Python DELETE only removes queued records; it does not prove an active worker has stopped.
-      await this.deleteTranscriberJobs(session.id, true);
-
-      if (session.status === "failed") {
-        manifest.status = "completed";
-        manifest.endedAt ??= new Date().toISOString();
-        const recovered = await this.sessions.recoverFailed(
-          session.id,
-          new Date(manifest.endedAt),
-        );
-        if (!recovered) {
-          throw new SessionDeletionError("La sesión cambió mientras se intentaba recuperar.");
-        }
+      // Persist the operation identity while holding the verified session lock.
+      // The persisted intent blocks dispatcher, publisher and deletion after release.
+      let existing;
+      try { existing = await this.intents.read(sessionId); }
+      catch (error) {
+        throw new SessionDeletionError("La intención de reprocesamiento es incierta; se conservan los archivos.", { cause: error });
       }
-
-      await this.prepareRepublication(session, manifest);
-      await fs.rm(join(directory, ".transcription-enqueued"), { force: true });
-      await fs.rm(join(directory, ".transcription-failed"), { force: true });
-      await fs.rm(join(directory, ".transcription-jobs"), { recursive: true, force: true });
-      this.logger.info({ sessionId }, "Sesion preparada para reprocesamiento");
-      return session;
+      if (existing !== null && existing.phase !== "prepared") {
+        throw new SessionDeletionError("La intención existente no permite preparar otro reprocesamiento.");
+      }
+      const intent = existing === null
+        ? await this.intents.createWithHeldLock(sessionId)
+        : await this.intents.recoverWithHeldLock(sessionId);
+      return { session, operationId: intent.operationId };
     });
+
+    // Never hold the Node file lock during Python HTTP waits. The persisted
+    // intent remains the barrier, including after timeout or process restart.
+    try {
+      await prepareReprocessJobDeletion(
+        sessionId, prepared.operationId, this.transcriberBaseUrl, this.transcriberSecret,
+      );
+    } catch (error) {
+      this.logger.error({ sessionId, operationId: prepared.operationId, error },
+        "No se pudo confirmar la preparación del reprocesamiento en Python");
+      throw new SessionDeletionError(
+        "No se pudo confirmar la preparación en Python. La intención y los archivos se conservan para revisión o reintento.",
+        { cause: error },
+      );
+    }
+    this.logger.info({ sessionId, operationId: prepared.operationId },
+      "Reprocesamiento pendiente del drenaje de workers Python");
+    return prepared.session;
   }
 
   async correct(
@@ -596,7 +607,7 @@ export async function handleSessionReprocessButton(
   try {
     const session = await administration.reprocess(sessionId, interaction.guildId);
     await interaction.editReply({
-      content: `🔄 La sesión **${session.sequenceNumber}** de **${session.campaignName}** entró nuevamente a la cola. La publicación actual se conservará hasta que revises y publiques manualmente el nuevo guion.`,
+      content: `⏳ El reprocesamiento de la sesión **${session.sequenceNumber}** de **${session.campaignName}** quedó pendiente del drenaje de workers Python. Se conservan los WAV, los trabajos y la publicación actual; todavía no volvió a la cola.`,
       components: [],
       embeds: [],
     });

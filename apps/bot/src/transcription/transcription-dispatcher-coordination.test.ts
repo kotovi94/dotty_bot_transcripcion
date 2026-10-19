@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,14 @@ function gate() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => { release = resolve; });
   return { promise, release };
+}
+
+function prepared(init: RequestInit | undefined): Response {
+  const { operation_id } = JSON.parse(String(init?.body)) as { operation_id: string };
+  const canonical = JSON.stringify({ operation_type: "reprocess", parameters: {}, session_id: "session-1" });
+  return new Response(JSON.stringify({ operation_id, session_id: "session-1", operation_type: "reprocess",
+    parameters_hash: createHash("sha256").update(canonical).digest("hex"), close_id: "a".repeat(32),
+    status: "pending_drain", workers_inactive: null, jobs_deleted: false }), { status: 202 });
 }
 
 async function fixture(test: { after(callback: () => Promise<void>): void }, ids = ["session-1"]) {
@@ -44,6 +53,7 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
   }
   let phase: ReprocessPhase | null = null;
   let intentError: Error | null = null;
+  const operationId = "4b2aa77f-cc49-4f24-9033-6a48f5f880c1";
   const campaigns = {
     findById: async () => ({ name: "Campaign", transcriptionVocabulary: "" }),
     findByGuildAndName: async () => ({ id: "campaign-1" }),
@@ -52,8 +62,11 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
   const service = { findById: async (id: string) => sessions.get(id) ?? null } as unknown as SessionService;
   const intents = { read: async (id: string) => {
     if (intentError) throw intentError;
-    return phase === null ? null : { version: 1, sessionId: id, phase };
-  }, hasPending: async () => phase !== null && phase !== "completed" } as unknown as ReprocessIntentStore;
+    return phase === null ? null : { version: 1, sessionId: id, phase, operationId };
+  }, hasPending: async () => phase !== null && phase !== "completed",
+  createWithHeldLock: async (id: string) => { phase = "prepared"; return { version: 1, sessionId: id, phase, operationId }; },
+  recoverWithHeldLock: async (id: string) => ({ version: 1, sessionId: id, phase, operationId }),
+  } as unknown as ReprocessIntentStore;
   const logger = { info() {}, warn() {}, debug() {}, error() {} } as unknown as Logger;
   const createDispatcher = () => new TranscriptionDispatcher(recordings, campaigns, "http://127.0.0.1:8765", "secret",
     { listActive: async () => [] } as unknown as AdaptiveVocabularyStore,
@@ -148,20 +161,21 @@ describe("coordinated transcription dispatch", () => {
     const dispatching = f.dispatcher.dispatchCompleted();
     await posted.promise;
     const deleting = f.admin.delete("session-1", "guild-1");
+    const deletionResult = assert.rejects(deleting, /protocolo de inactividad Python/);
     assert.deepEqual(calls, ["POST"]);
-    release.release(); await dispatching; await assert.rejects(deleting, /protocolo de inactividad Python/);
+    release.release(); await dispatching; await deletionResult;
     assert.deepEqual(calls, ["POST"]);
     await access(join(f.recordings, "session-1", "audio.wav"));
   });
 
   it("makes reprocess wait for a POST", async (test) => {
     const f = await fixture(test);
-    const posted = gate(); const releasePost = gate(); const deleting = gate(); const releaseDelete = gate();
+    const posted = gate(); const releasePost = gate(); const preparing = gate(); const releasePrepare = gate();
     const calls: string[] = [];
-    test.mock.method(globalThis, "fetch", async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-      if (init?.method === "DELETE") {
-        calls.push("DELETE"); deleting.release(); await releaseDelete.promise;
-        return new Response(null, { status: 200 });
+    test.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      if (String(input).endsWith("/job-deletions")) {
+        calls.push("PREPARE"); preparing.release(); await releasePrepare.promise;
+        return prepared(init);
       }
       calls.push("POST"); posted.release(); await releasePost.promise;
       return new Response(null, { status: 200 });
@@ -170,30 +184,30 @@ describe("coordinated transcription dispatch", () => {
     await posted.promise;
     const reprocessing = f.admin.reprocess("session-1", "guild-1");
     assert.deepEqual(calls, ["POST"]);
-    releasePost.release(); await firstDispatch; await deleting.promise;
-    assert.deepEqual(calls, ["POST", "DELETE"]);
-    releaseDelete.release(); await reprocessing;
-    assert.deepEqual(calls, ["POST", "DELETE"]);
-    await assert.rejects(access(f.path("session-1", ".transcription-enqueued")));
+    releasePost.release(); await firstDispatch; await preparing.promise;
+    assert.deepEqual(calls, ["POST", "PREPARE"]);
+    releasePrepare.release(); await reprocessing;
+    assert.deepEqual(calls, ["POST", "PREPARE"]);
+    await access(f.path("session-1", ".transcription-enqueued"));
   });
 
-  it("makes dispatcher wait for reprocess and reject its stale manifest", async (test) => {
+  it("makes dispatcher stop after a prepared reprocess intent", async (test) => {
     const f = await fixture(test);
-    const deleting = gate(); const releaseDelete = gate();
+    const preparing = gate(); const releasePrepare = gate();
     const calls: string[] = [];
-    test.mock.method(globalThis, "fetch", async (_input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-      if (init?.method === "DELETE") {
-        calls.push("DELETE"); deleting.release(); await releaseDelete.promise;
-        return new Response(null, { status: 200 });
+    test.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      if (String(input).endsWith("/job-deletions")) {
+        calls.push("PREPARE"); preparing.release(); await releasePrepare.promise;
+        return prepared(init);
       }
       calls.push("POST"); return new Response(null, { status: 200 });
     });
     const reprocessing = f.admin.reprocess("session-1", "guild-1");
-    await deleting.promise;
+    await preparing.promise;
     const dispatching = f.dispatcher.dispatchCompleted();
-    assert.deepEqual(calls, ["DELETE"]);
-    releaseDelete.release(); await reprocessing; await dispatching;
-    assert.deepEqual(calls, ["DELETE"]);
+    assert.deepEqual(calls, ["PREPARE"]);
+    releasePrepare.release(); await reprocessing; await dispatching;
+    assert.deepEqual(calls, ["PREPARE"]);
   });
 
   for (const outcome of ["timeout", "conflict"] as const) {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,16 @@ import type { SessionService } from "./session-service.ts";
 
 const directories: string[] = [];
 after(async () => Promise.all(directories.map((directory) => rm(directory, { recursive: true }))));
+
+function pendingResponse(init: RequestInit | undefined, sessionId = "session-1"): Response {
+  const request = JSON.parse(String(init?.body)) as { operation_id: string };
+  const canonical = JSON.stringify({ operation_type: "reprocess", parameters: {}, session_id: sessionId });
+  return new Response(JSON.stringify({
+    operation_id: request.operation_id, session_id: sessionId, operation_type: "reprocess",
+    parameters_hash: createHash("sha256").update(canonical).digest("hex"),
+    close_id: "a".repeat(32), status: "pending_drain", workers_inactive: null, jobs_deleted: false,
+  }), { status: 202 });
+}
 
 function protection(root: string): [ReprocessIntentStore, SessionFileCoordinator, CampaignFileCoordinator] {
   const coordinator = new SessionFileCoordinator(join(root, "session-locks"));
@@ -57,7 +68,7 @@ describe("session administration", () => {
     assert.equal(await readFile(join(requested, "requested.wav"), "utf8"), "requested audio");
   });
 
-  it("leaves existing files and blocks redispatch when recovery fails after DELETE", async () => {
+  it("preserves files and blocks redispatch while Python is pending drain", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-reprocess-prisma-"));
     directories.push(root);
     const recordings = join(root, "recordings");
@@ -94,7 +105,7 @@ describe("session administration", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (input, init) => {
       requests.push({ url: String(input), method: init?.method });
-      return new Response(JSON.stringify({ deleted: 1 }), { status: 200 });
+      return pendingResponse(init);
     };
     try {
       const administration = new SessionAdministration(
@@ -115,12 +126,12 @@ describe("session administration", () => {
         { info() {}, error() {} } as unknown as Logger,
         ...protection(root),
       );
-      await assert.rejects(administration.reprocess("session-1", "guild-1"), /Prisma unavailable/);
-      assert.equal(recoverCalls, 1);
+      await administration.reprocess("session-1", "guild-1");
+      assert.equal(recoverCalls, 0);
       assert.equal(status, "failed");
       assert.deepEqual(requests, [{
-        url: "http://127.0.0.1:8765/v1/sessions/session-1",
-        method: "DELETE",
+        url: "http://127.0.0.1:8765/v1/sessions/session-1/job-deletions",
+        method: "POST",
       }]);
       for (const [path, contents] of files) {
         assert.equal(await readFile(path, "utf8"), contents, path);
@@ -139,7 +150,7 @@ describe("session administration", () => {
         { read: async () => null } as never,
       );
       await dispatcher.dispatchCompleted();
-      assert.equal(requests.length, 1, "the existing enqueued marker prevents a new POST");
+      assert.equal(requests.length, 1, "the persisted intent prevents a new dispatch POST");
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -211,11 +222,11 @@ describe("session administration", () => {
 
       await assert.rejects(
         administration.reprocess("session-1", "guild-1"),
-        /No se pudo conectar con el transcriptor/,
+        /No se pudo confirmar la preparación en Python/,
       );
       assert.deepEqual(requests, [{
-        url: "http://127.0.0.1:8765/v1/sessions/session-1",
-        method: "DELETE",
+        url: "http://127.0.0.1:8765/v1/sessions/session-1/job-deletions",
+        method: "POST",
       }]);
       for (const [path, contents] of files) {
         assert.equal(await readFile(path, "utf8"), contents, path);
@@ -227,7 +238,7 @@ describe("session administration", () => {
     }
   });
 
-  it("clears persistent job markers before reprocessing a session", async () => {
+  it("keeps persistent job markers and exports during preparation", async () => {
     const root = await mkdtemp(join(tmpdir(), "dotty-reprocess-"));
     directories.push(root);
     const recordings = join(root, "recordings");
@@ -272,10 +283,7 @@ describe("session administration", () => {
     const requests: Array<{ url: string; method: string | undefined }> = [];
     globalThis.fetch = async (input, init) => {
       requests.push({ url: String(input), method: init?.method });
-      return new Response(JSON.stringify({ deleted: 1 }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return pendingResponse(init);
     };
     try {
       const session = {
@@ -305,13 +313,13 @@ describe("session administration", () => {
       await administration.reprocess("session-1", "guild-1");
 
       assert.deepEqual(requests, [{
-        url: "http://127.0.0.1:8765/v1/sessions/session-1",
-        method: "DELETE",
+        url: "http://127.0.0.1:8765/v1/sessions/session-1/job-deletions",
+        method: "POST",
       }]);
-      await assert.rejects(access(join(directory, ".transcription-jobs")));
-      await assert.rejects(access(join(directory, ".transcription-enqueued")));
-      await assert.rejects(access(join(directory, ".transcription-published")));
-      await assert.rejects(access(join(exports, "session-1")));
+      await access(join(directory, ".transcription-jobs"));
+      await access(join(directory, ".transcription-enqueued"));
+      await access(join(directory, ".transcription-published"));
+      await access(join(exports, "session-1"));
       assert.equal(JSON.parse(await readFile(join(directory, "manifest.json"), "utf8")).sessionId, "session-1");
     } finally {
       globalThis.fetch = originalFetch;

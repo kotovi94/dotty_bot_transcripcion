@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,14 @@ function gate() {
   let release!: () => void;
   const promise = new Promise<void>((resolve) => { release = resolve; });
   return { promise, release };
+}
+
+function prepared(init: RequestInit | undefined): Response {
+  const { operation_id } = JSON.parse(String(init?.body)) as { operation_id: string };
+  const canonical = JSON.stringify({ operation_type: "reprocess", parameters: {}, session_id: "session-1" });
+  return new Response(JSON.stringify({ operation_id, session_id: "session-1", operation_type: "reprocess",
+    parameters_hash: createHash("sha256").update(canonical).digest("hex"), close_id: "a".repeat(32),
+    status: "pending_drain", workers_inactive: null, jobs_deleted: false }), { status: 202 });
 }
 
 const job = (id: string) => ({ id: `${id}:chunk-1`, status: "completed", speaker_user_id: "user-1",
@@ -47,6 +56,7 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
   }
   let phase: ReprocessPhase | null = null;
   let intentError: Error | null = null;
+  const operationId = "4b2aa77f-cc49-4f24-9033-6a48f5f880c1";
   let campaignExists = true;
   let observations = 0;
   let observing: (() => Promise<void>) | null = null;
@@ -59,8 +69,11 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
     recoverFailed: async () => true } as unknown as SessionService;
   const intents = { read: async (id: string) => {
     if (intentError) throw intentError;
-    return phase === null ? null : { version: 1, sessionId: id, phase };
-  }, hasPending: async () => phase !== null && phase !== "completed" } as unknown as ReprocessIntentStore;
+    return phase === null ? null : { version: 1, sessionId: id, phase, operationId };
+  }, hasPending: async () => phase !== null && phase !== "completed",
+  createWithHeldLock: async (id: string) => { phase = "prepared"; return { version: 1, sessionId: id, phase, operationId }; },
+  recoverWithHeldLock: async (id: string) => ({ version: 1, sessionId: id, phase, operationId }),
+  } as unknown as ReprocessIntentStore;
   const logger = { info() {}, warn() {}, debug() {}, error() {} } as unknown as Logger;
   const vocabulary = { observe: async () => { observations++; if (observing) await observing(); return []; } } as unknown as AdaptiveVocabularyStore;
   const publisher = new TranscriptionPublisher(campaigns, recordings, exports, "http://127.0.0.1:8765", "secret",
@@ -195,8 +208,8 @@ describe("coordinated transcription publication", () => {
       const f = await fixture(test);
       const entered = gate(); const release = gate();
       f.setObserving(async () => { entered.release(); await release.promise; });
-      test.mock.method(globalThis, "fetch", async (_url: URL | string, options?: RequestInit) =>
-        options?.method === "DELETE" ? new Response(null, { status: 200 }) :
+      test.mock.method(globalThis, "fetch", async (url: URL | string, options?: RequestInit) =>
+        String(url).endsWith("/job-deletions") ? prepared(options) :
           new Response(JSON.stringify({ jobs: [job("session-1")] }), { status: 200 }));
       const publishing = f.publisher.publishReady(); await entered.promise;
       let finished = false;
@@ -210,7 +223,7 @@ describe("coordinated transcription publication", () => {
       assert.equal(finished, true);
       if (action === "reprocess") {
         await access(f.path("session-1", "audio.wav"));
-        await assert.rejects(access(f.path("session-1", ".transcription-ready")));
+        await access(f.path("session-1", ".transcription-ready"));
       } else {
         await access(f.path("session-1", "audio.wav"));
         await access(join(f.exports, "session-1"));
@@ -218,11 +231,11 @@ describe("coordinated transcription publication", () => {
     });
   }
 
-  it("waits for reprocess and rejects its changed manifest", async (test) => {
+  it("waits for reprocess and rejects its pending intent", async (test) => {
     const f = await fixture(test);
     const fetching = gate(); const release = gate();
-    test.mock.method(globalThis, "fetch", async (_url: URL | string, options?: RequestInit) => {
-      if (options?.method === "DELETE") return new Response(null, { status: 200 });
+    test.mock.method(globalThis, "fetch", async (url: URL | string, options?: RequestInit) => {
+      if (String(url).endsWith("/job-deletions")) return prepared(options);
       fetching.release(); await release.promise;
       return new Response(JSON.stringify({ jobs: [job("session-1")] }), { status: 200 });
     });
