@@ -8,6 +8,7 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  Notification,
   Tray,
 } from "electron";
 
@@ -19,6 +20,10 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
 let pollTimer: NodeJS.Timeout | null = null;
+let progressPollTimer: NodeJS.Timeout | null = null;
+let progressPollRunning = false;
+let progressBaselineReady = false;
+const stageSnapshots = new Map<string, Map<string, string>>();
 
 const e2eMode = process.env.DOTTY_E2E === "1";
 const gotLock = e2eMode || app.requestSingleInstanceLock();
@@ -172,6 +177,9 @@ function registerIpc(): void {
     (_event, sessionId: string, content: string) =>
       supervisor.saveTranscript(String(sessionId), String(content)),
   );
+  ipcMain.handle("dotty:regenerate-raw", (_event, sessionId: string) =>
+    supervisor.regenerateRaw(String(sessionId)),
+  );
   ipcMain.handle(
     "dotty:save-narrative",
     (_event, sessionId: string, content: string) =>
@@ -264,12 +272,62 @@ async function broadcastState(): Promise<void> {
   }
 }
 
+function notifyProgress(title: string, body: string): void {
+  if (!Notification.isSupported()) return;
+  const notice = new Notification({ title: `Dotty · ${title}`, body, icon: createDottyIcon(64) });
+  notice.on("click", showWindow);
+  notice.show();
+}
+
+async function pollProcessingProgress(): Promise<void> {
+  if (progressPollRunning) return;
+  progressPollRunning = true;
+  try {
+    const sessions = await supervisor.getRecentProcessingSessions();
+    const activeIds = new Set(sessions.map((session) => session.sessionId));
+    for (const session of sessions) {
+      const status = await supervisor.getSessionProcessingStatus(session.sessionId);
+      const previous = stageSnapshots.get(session.sessionId);
+      const current = new Map(status.stages.map((stage) => [stage.id, `${stage.status}\0${stage.details}`]));
+      stageSnapshots.set(session.sessionId, current);
+      if (!progressBaselineReady) continue;
+      if (!previous) {
+        if (status.audio.status === "running") notifyProgress("Grabación iniciada", session.label);
+        continue;
+      }
+      for (const stage of status.stages) {
+        const old = previous.get(stage.id);
+        if (!old || old === current.get(stage.id)) continue;
+        const oldStatus = old.split("\0", 1)[0];
+        if (stage.id === "transcription" && stage.status === "running" && oldStatus !== "running" && stage.details.startsWith("Rehaciendo raw")) {
+          notifyProgress("Rehaciendo raw", `${session.label}. ${stage.details}`);
+        } else if (stage.status === "completed" && oldStatus !== "completed") {
+          notifyProgress(`Etapa completada: ${stage.label}`, `${session.label}. ${stage.details}`);
+        } else if ((stage.status === "error" || stage.status === "blocked" || stage.status === "warning") && oldStatus !== stage.status) {
+          notifyProgress(`${stage.label}: requiere atención`, `${session.label}. ${stage.details}`);
+        } else if (stage.id === "approval" && stage.status === "pending" && stage.details === "Esperando aprobación final") {
+          notifyProgress("Guion listo para aprobar", session.label);
+        }
+      }
+    }
+    for (const sessionId of stageSnapshots.keys()) {
+      if (!activeIds.has(sessionId)) stageSnapshots.delete(sessionId);
+    }
+    progressBaselineReady = true;
+  } catch {
+    // Un fallo de lectura temporal no debe generar avisos falsos ni detener el panel.
+  } finally {
+    progressPollRunning = false;
+  }
+}
+
 if (gotLock) {
   app.on("second-instance", showWindow);
   app.on("activate", showWindow);
   app.on("before-quit", () => {
     quitting = true;
     if (pollTimer) clearInterval(pollTimer);
+    if (progressPollTimer) clearInterval(progressPollTimer);
   });
   app.on("window-all-closed", () => {
     // El supervisor permanece disponible en la bandeja de Windows.
@@ -283,6 +341,8 @@ if (gotLock) {
     createWindow();
     createTray();
     pollTimer = setInterval(() => void broadcastState(), 1_000);
+    await pollProcessingProgress();
+    progressPollTimer = setInterval(() => void pollProcessingProgress(), 5_000);
     await broadcastState();
   });
 }

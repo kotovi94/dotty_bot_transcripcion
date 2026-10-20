@@ -16,8 +16,10 @@ import prism from "prism-media";
 import type { Logger } from "pino";
 
 import type { PersistedSession } from "../sessions/session-repository.ts";
+import type { CampaignService } from "../campaigns/campaign-service.ts";
 import { writeJsonAtomically } from "./atomic-json-file.ts";
 import { createWavHeader, WavFileWriter } from "./wav-writer.ts";
+import { voiceEncryptionStatus, waitForVoiceEncryption } from "./voice-encryption.ts";
 
 export interface RecordingClip {
   readonly clipIndex: number;
@@ -86,6 +88,7 @@ interface ActiveRecording {
   readonly directory: string;
   readonly manifestPath: string;
   readonly manifest: RecordingManifest;
+  readonly speakerNames: ReadonlyMap<string, string>;
   readonly chunks: Map<string, ActiveChunk>;
   acceptingAudio: boolean;
   currentClip: RecordingClip | null;
@@ -100,6 +103,7 @@ interface ActiveRecording {
   rotationTimer: NodeJS.Timeout;
   failure?: Error;
   interruption?: Promise<void>;
+  decodeFailureTimes: number[];
 }
 
 type CaptureClosureState = "open" | "closing" | "closed" | "failed" | "uncertain";
@@ -140,6 +144,8 @@ interface SegmentWriter {
 
 const PCM_BYTES_PER_MS = 48_000 * 2 / 1_000;
 const CHUNK_FINALIZATION_TIMEOUT_MS = 30_000;
+const DECODE_FAILURE_WINDOW_MS = 10_000;
+const MAX_DECODE_FAILURES = 3;
 
 export class VoiceCaptureManager {
   private readonly active = new Map<string, ActiveRecording>();
@@ -161,6 +167,7 @@ export class VoiceCaptureManager {
       writerCloseTimeoutMs?: number;
       writeManifest?: typeof writeJsonAtomically;
     } = {},
+    private readonly campaigns?: Pick<CampaignService, "listMembersByCampaignId">,
   ) {
     if (!(rotation.searchStartMs <= rotation.targetMs && rotation.targetMs <= rotation.maxMs)) {
       throw new Error("Recording clip thresholds must satisfy searchStart <= target <= max.");
@@ -183,7 +190,10 @@ export class VoiceCaptureManager {
       } catch {
         continue;
       }
-      if (!["recording", "paused", "finalizing", "interrupted"].includes(manifest.status)) continue;
+      // An interrupted manifest was already closed by the capture failure path.
+      // Leave historical failures untouched on startup.
+      if (!["recording", "paused", "finalizing"].includes(manifest.status) ||
+          manifest.recoveredAt !== undefined) continue;
 
       for (const filePath of await findWavFiles(directory)) {
         const stats = await fs.stat(filePath);
@@ -233,7 +243,7 @@ export class VoiceCaptureManager {
         clip.endTimestamp ??= endedAt;
         clip.durationSeconds ??= Math.max(0, (Date.parse(clip.endTimestamp) - Date.parse(clip.startTimestamp)) / 1_000);
       }
-      manifest.status = "completed";
+      manifest.status = "interrupted";
       manifest.endedAt = endedAt;
       manifest.interruptionReason ??= "Recording interrupted before normal finalization";
       manifest.recoveredAt = now;
@@ -251,6 +261,8 @@ export class VoiceCaptureManager {
     mkdirSync(join(directory, "audio"), { recursive: true });
     mkdirSync(join(directory, "transcripts"), { recursive: true });
     const manifestPath = join(directory, "manifest.json");
+    const speakerNames = new Map((await this.campaigns?.listMembersByCampaignId(session.campaignId) ?? [])
+      .map((member) => [member.discordUserId, member.characterName?.trim() || member.playerName] as const));
     const startedAt = (session.startedAt ?? new Date()).toISOString();
     const firstClip = createClip(1, 0, startedAt);
     mkdirSync(join(directory, firstClip.audioDirectory), { recursive: true });
@@ -280,6 +292,8 @@ export class VoiceCaptureManager {
     });
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+      this.logger.info(voiceEncryptionStatus(connection), "Estado de cifrado al conectar voz");
+      await waitForVoiceEncryption(connection);
     } catch (error) {
       connection.destroy();
       manifest.status = "interrupted";
@@ -294,7 +308,9 @@ export class VoiceCaptureManager {
       directory,
       manifestPath,
       manifest,
+      speakerNames,
       chunks: new Map<string, ActiveChunk>(),
+      decodeFailureTimes: [],
       acceptingAudio: true,
       currentClip: firstClip,
       rotationInProgress: false,
@@ -322,7 +338,7 @@ export class VoiceCaptureManager {
       if (member?.user.bot === true) return;
       this.logger.info({ userId }, "[Voice] User speaking started");
       try {
-        this.startChunk(recording, userId, member?.displayName ?? userId);
+        this.startChunk(recording, userId, recording.speakerNames.get(userId) ?? member?.displayName ?? userId);
       } catch (error) {
         this.logger.error({ error, userId }, "No se pudo iniciar el flujo de audio");
         this.interrupt(recording, error);
@@ -509,7 +525,6 @@ export class VoiceCaptureManager {
       }
     });
     subscription.on("error", (error) => this.interrupt(recording, error));
-    subscription.pipe(decoder);
 
     let resolveFinished!: () => void;
     let rejectFinished!: (error: unknown) => void;
@@ -540,8 +555,23 @@ export class VoiceCaptureManager {
     decoder.once("finish", closeChunk);
     decoder.once("close", closeChunk);
     decoder.on("error", (error) => {
-      this.logger.warn({ error, userId }, "Fallo al decodificar audio Opus");
-      this.interrupt(recording, error);
+      this.logger.warn({ error, userId, ...voiceEncryptionStatus(recording.connection) }, "Fallo al decodificar audio Opus");
+      subscription.unpipe(decoder);
+      subscription.destroy();
+      const now = Date.now();
+      recording.decodeFailureTimes = recording.decodeFailureTimes.filter((time) => now - time < DECODE_FAILURE_WINDOW_MS);
+      recording.decodeFailureTimes.push(now);
+      if (recording.decodeFailureTimes.length >= MAX_DECODE_FAILURES) {
+        this.interrupt(recording, error);
+      } else {
+        // A single bad frame ends this decoder, not the entire recording. A new
+        // subscription can receive the next frame once the saved WAV is closed.
+        void chunkFinished.then(() => {
+          if (recording.closeState === "open" && recording.acceptingAudio && !recording.chunks.has(userId)) {
+            this.startChunk(recording, userId, speakerName);
+          }
+        }).catch((restartError) => this.interrupt(recording, restartError));
+      }
       closeChunk();
     });
 
@@ -569,6 +599,7 @@ export class VoiceCaptureManager {
       finished: chunkFinished,
     };
     recording.chunks.set(userId, chunk);
+    subscription.pipe(decoder);
   }
 
   private createSegment(

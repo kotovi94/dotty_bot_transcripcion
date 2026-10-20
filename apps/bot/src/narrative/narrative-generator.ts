@@ -1,5 +1,4 @@
 import { promises as fs } from "node:fs";
-import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
@@ -7,6 +6,7 @@ import { writeFileAtomically } from "../recording/atomic-json-file.ts";
 import type { EditorialLearningService } from "../editorial/editorial-learning-service.ts";
 import { verifyDraft } from "../editorial/draft-verifier.ts";
 import { readNarrativeReview, type NarrativeReviewManifest } from "./narrative-review.ts";
+import { readNarrativeTranscript, type NarrativeTranscript } from "./transcript-source.ts";
 
 export type NarrativeState = "missing" | "queued" | "generating" | "ready" | "failed";
 
@@ -163,22 +163,7 @@ export interface ContinuityState {
   readonly unresolvedQuestions: string[];
 }
 
-interface ExportedTranscript {
-  readonly manifest?: {
-    readonly sessionId?: string;
-    readonly campaignId?: string;
-    readonly campaignName?: string;
-    readonly sequenceNumber?: number;
-  };
-  readonly lines?: readonly {
-    readonly startMs?: number;
-    readonly endMs?: number;
-    readonly speakerName?: string;
-    readonly text?: string;
-    readonly confidence?: number | null;
-    readonly lineId?: string;
-  }[];
-}
+type ExportedTranscript = NarrativeTranscript;
 
 type RawTranscriptLine = {
   lineId: string;
@@ -265,14 +250,15 @@ export class NarrativeGenerator {
     await fs.mkdir(exportDirectory, { recursive: true });
     const lock = await this.acquireSessionLock(lockPath, sessionId);
     let engineLock: { handle: fs.FileHandle; path: string } | null = null;
+    let ollamaTouched = false;
 
     try {
       engineLock = await this.acquireEngineLock(sessionId);
       await this.writeStatus(sessionId, "generating", 0.02, "Preparando la transcripción");
+      const transcript = await this.readTranscript(sessionId);
+      ollamaTouched = true;
       await this.ensureOllamaReady();
       await this.unloadWhisperIfIdle();
-
-      const transcript = await this.readTranscript(sessionId);
       const manifest = transcript.manifest ?? {};
       const sequenceNumber = Number(manifest.sequenceNumber ?? 0);
       const campaignName = String(manifest.campaignName ?? "Campaña");
@@ -566,7 +552,7 @@ export class NarrativeGenerator {
       throw error;
     } finally {
       if (engineLock !== null) {
-        await this.unloadOllama().catch(() => undefined);
+        if (ollamaTouched) await this.unloadOllama().catch(() => undefined);
         await engineLock.handle.close().catch(() => undefined);
         await fs.rm(engineLock.path, { force: true }).catch(() => undefined);
       }
@@ -1086,27 +1072,7 @@ export class NarrativeGenerator {
   }
 
   private async readTranscript(sessionId: string): Promise<ExportedTranscript> {
-    try {
-      const transcript = JSON.parse(
-        await fs.readFile(join(this.exportDirectory(sessionId), "transcript.raw.json"), "utf8"),
-      ) as ExportedTranscript;
-      const manual = await fs.readFile(
-        join(this.exportDirectory(sessionId), "transcript.manual.json"),
-        "utf8",
-      ).then((content) => JSON.parse(content) as { sessionId?: unknown; lines?: unknown; sourceHash?: string }).catch(() => null);
-      if (manual?.sessionId === sessionId && Array.isArray(manual.lines) && manual.lines.length > 0) {
-        if (manual.sourceHash !== undefined) {
-          const markdown = await fs.readFile(join(this.exportDirectory(sessionId), "bitacora.md"), "utf8");
-          if (createHash("sha256").update(markdown, "utf8").digest("hex") !== manual.sourceHash) {
-            throw new Error("La edición de transcripción no coincide con su fuente. Vuelve a guardar la corrección.");
-          }
-        }
-        return { ...transcript, lines: manual.lines as NonNullable<ExportedTranscript["lines"]> };
-      }
-      return transcript;
-    } catch {
-      throw new Error("La transcripción aún no está preparada para generar un guion.");
-    }
+    return readNarrativeTranscript(this.exportDirectory(sessionId), this.recordingsRoot, sessionId);
   }
 
   private async readContext(sessionId: string): Promise<NarrativeContext> {

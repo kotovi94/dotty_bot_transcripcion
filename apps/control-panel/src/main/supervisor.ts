@@ -192,6 +192,24 @@ export class DottySupervisor {
     return status;
   }
 
+  async getRecentProcessingSessions(limit = 5): Promise<Array<{ sessionId: string; label: string }>> {
+    const entries = await readdir(this.recordingsRoot, { withFileTypes: true }).catch(() => [] as Dirent[]);
+    const sessions = await Promise.all(entries.filter((entry) => entry.isDirectory() && /^[a-zA-Z0-9_-]+$/u.test(entry.name))
+      .map(async (entry) => {
+        const manifest = await this.readManifest(entry.name);
+        if (!manifest) return null;
+        return {
+          sessionId: entry.name,
+          label: `${typeof manifest.campaignName === "string" ? manifest.campaignName : "Campaña"} · sesión ${typeof manifest.sequenceNumber === "number" ? manifest.sequenceNumber : entry.name}`,
+          startedAt: typeof manifest.startedAt === "string" ? manifest.startedAt : "",
+        };
+      }));
+    return sessions.filter((session): session is NonNullable<typeof session> => session !== null)
+      .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
+      .slice(0, limit)
+      .map(({ sessionId, label }) => ({ sessionId, label }));
+  }
+
   async runOperation(kind: OperationKind): Promise<OperationResult> {
     if (this.operation) {
       return {
@@ -381,6 +399,36 @@ export class DottySupervisor {
       () => this.invalidateNarrativeAfterTranscriptEdit(sessionId));
   }
 
+  async regenerateRaw(sessionId: string): Promise<OperationResult> {
+    this.validateSessionId(sessionId);
+    const manifest = await this.readManifest(sessionId);
+    const result = await this.transcriberRequest(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/retranscribe`, "POST",
+    ) as { state?: string; queued?: number; total?: number; backup?: boolean };
+    if (manifest?.status === "interrupted") {
+      const python = join(this.projectRoot, "services", "transcriber", ".venv", "Scripts", "python.exe");
+      const script = join(this.projectRoot, "tools", "recover-session-transcript.py");
+      const worker = spawn(python, [script, sessionId, this.dataRoot, "--redo"], {
+        cwd: this.projectRoot,
+        detached: true,
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      await new Promise<void>((resolveSpawn, rejectSpawn) => {
+        worker.once("spawn", resolveSpawn);
+        worker.once("error", rejectSpawn);
+      });
+      worker.unref();
+    }
+    await this.invalidateNarrativeAfterTranscriptEdit(sessionId);
+    return {
+      accepted: true,
+      message: result.state === "running"
+        ? "La transcripción ya se está rehaciendo. El raw actual sigue disponible hasta completar el nuevo."
+        : `${Number(result.queued ?? 0)} de ${Number(result.total ?? 0)} fragmentos enviados de nuevo al transcriptor. ${result.backup ? "Se guardó un único respaldo del raw anterior." : "No había raw anterior para respaldar."}`,
+    };
+  }
+
   async saveNarrative(sessionId: string, content: string): Promise<SaveResult> {
     if (content.length > 5_000_000) throw new Error("El guion es demasiado grande.");
     if (content.trim().length < 100) throw new Error("El guion está vacío o incompleto.");
@@ -457,6 +505,7 @@ export class DottySupervisor {
 
   async generateNarrative(sessionId: string): Promise<NarrativeOperationResult> {
     this.validateSessionId(sessionId);
+    const startedAt = Date.now();
     try {
       await this.runBotScript(
         join("apps", "bot", "scripts", "narrative-cli.ts"),
@@ -465,8 +514,12 @@ export class DottySupervisor {
       );
       return { ok: true, message: "Guion narrativo generado y listo para revisar." };
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return { ok: false, message: `No se pudo generar el guion: ${message.slice(-600)}` };
+      const status = await this.readNarrativeStatus(sessionId);
+      const fallback = error instanceof Error ? error.message.split(/\r?\n/u)[0] : String(error);
+      const freshFailure = status.state === "failed" && status.updatedAt
+        && Date.parse(status.updatedAt) >= startedAt;
+      const reason = freshFailure && status.error ? status.error : fallback;
+      return { ok: false, message: `No se pudo generar el guion: ${reason}` };
     }
   }
 
@@ -611,6 +664,10 @@ export class DottySupervisor {
       const status = typeof manifest.status === "string" ? manifest.status : "desconocido";
       const failed = failures.get(entry.name);
       const failedMarker = await this.pathExists(join(this.recordingsRoot, entry.name, ".transcription-failed"));
+      let recovery: { phase?: string; enqueued?: number; completed?: number; total?: number; failed?: number; error?: string } | null = null;
+      try {
+        recovery = JSON.parse(await readFile(join(this.dataRoot, "recovered-audio", entry.name, "transcription.status.json"), "utf8"));
+      } catch { /* La recuperación de texto aún no comenzó. */ }
       const staleActive = ["recording", "paused", "finalizing"].includes(status) && !bot.connected;
       const staleFinalizing = status === "finalizing" && Date.now() - (manifest.endedAt ? Date.parse(String(manifest.endedAt)) : 0) > 120_000;
       const recoverable = status === "interrupted" || staleActive || staleFinalizing || failedMarker;
@@ -620,11 +677,17 @@ export class DottySupervisor {
       issues.push({
         sessionId: entry.name,
         title: `${typeof campaign === "string" ? campaign : "Campaña"}${typeof sequence === "number" ? ` · Sesión ${sequence}` : ""}`,
-        status: staleActive ? "grabación detenida inesperadamente" : failedMarker ? "transcripción fallida" : status,
+        status: recovery?.phase === "completed"
+          ? "transcripción recuperada"
+          : recovery?.phase === "transcribing" || recovery?.phase === "enqueuing"
+            ? Number(recovery.enqueued ?? 0) < Number(recovery.total ?? 0)
+              ? `enviando ${Number(recovery.enqueued ?? 0)}/${Number(recovery.total ?? 0)} fragmentos`
+              : `transcribiendo ${Number(recovery.completed ?? 0)}/${Number(recovery.total ?? 0)} fragmentos`
+            : staleActive ? "grabación detenida inesperadamente" : failedMarker ? "transcripción fallida" : status,
         chunks: Array.isArray(manifest.chunks) ? manifest.chunks.length : 0,
         failedJobs: failed?.failedJobs ?? 0,
-        lastError: failed?.lastError ?? null,
-        canRecover: recoverable && Array.isArray(manifest.chunks) && manifest.chunks.length > 0,
+        lastError: recovery?.error ?? failed?.lastError ?? null,
+        canRecover: recoverable && recovery?.phase !== "completed" && Array.isArray(manifest.chunks) && manifest.chunks.length > 0,
         canRetry: (failed?.failedJobs ?? 0) > 0,
       });
     }
@@ -648,14 +711,32 @@ export class DottySupervisor {
       };
     }
 
-    const { stdout } = await this.runBotScript(
-      join("apps", "bot", "scripts", "recover-session.ts"),
-      [sessionId],
-      600_000,
-    );
-    const lastLine = stdout.trim().split(/\r?\n/u).at(-1);
-    if (!lastLine) throw new Error("La recuperación no devolvió confirmación.");
-    return { accepted: true, message: "Sesión recuperada y enviada a transcripción." };
+    const python = join(this.projectRoot, "services", "transcriber", ".venv", "Scripts", "python.exe");
+    const script = join(this.projectRoot, "tools", "recover-session-audio.py");
+    const { stdout } = await execFileAsync(python, [script, sessionId, this.dataRoot], {
+      cwd: this.projectRoot,
+      windowsHide: true,
+      timeout: 600_000,
+      maxBuffer: 1024 * 1024,
+    });
+    const output = stdout.trim().split(/\r?\n/u).at(-1);
+    if (!output || !await this.pathExists(join(output, "recovery.json"))) {
+      throw new Error("La recuperación de audio no devolvió archivos verificados.");
+    }
+    const transcriptScript = join(this.projectRoot, "tools", "recover-session-transcript.py");
+    if (!await this.pathExists(transcriptScript)) throw new Error("Falta el recuperador de transcripciones.");
+    const worker = spawn(python, [transcriptScript, sessionId, this.dataRoot], {
+      cwd: this.projectRoot,
+      detached: true,
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      worker.once("spawn", () => resolveSpawn());
+      worker.once("error", rejectSpawn);
+    });
+    worker.unref();
+    return { accepted: true, message: `Recuperación iniciada: Dotty transcribirá los fragmentos conservados. El avance aparecerá en Herramientas y el texto en ${output}.` };
   }
 
   private async readBotState(): Promise<DottyState["bot"]> {
@@ -770,7 +851,11 @@ export class DottySupervisor {
       headers: { authorization: `Bearer ${secret}` },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!response.ok) throw new Error(`El transcriptor respondió HTTP ${response.status}.`);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null) as { detail?: unknown } | null;
+      const detail = typeof payload?.detail === "string" ? payload.detail : `HTTP ${response.status}`;
+      throw new Error(`El transcriptor rechazó la operación: ${detail}.`);
+    }
     return response.json();
   }
 
@@ -869,6 +954,7 @@ export class DottySupervisor {
     progress: number;
     phase: string;
     error?: string;
+    updatedAt?: string;
   }> {
     try {
       const parsed = JSON.parse(
@@ -878,6 +964,7 @@ export class DottySupervisor {
         progress?: unknown;
         phase?: unknown;
         error?: string;
+        updatedAt?: unknown;
       };
       const scriptExists = await this.pathExists(this.narrativePath(sessionId));
       const state = parsed.state === "queued" || parsed.state === "generating" || parsed.state === "failed" || parsed.state === "missing"
@@ -892,6 +979,7 @@ export class DottySupervisor {
           ? parsed.phase
           : state === "ready" ? "Guion disponible" : "Sin generar",
         ...(typeof parsed.error === "string" && parsed.error.trim() !== "" ? { error: parsed.error } : {}),
+        ...(typeof parsed.updatedAt === "string" ? { updatedAt: parsed.updatedAt } : {}),
       };
     } catch {
       const ready = await this.pathExists(this.narrativePath(sessionId));
@@ -1157,7 +1245,7 @@ export class DottySupervisor {
 
   private async computeProcessingStatus(sessionId: string, manifest: Record<string, unknown> | null): Promise<SessionProcessingStatus> {
     const exportDirectory = join(this.exportsRoot, sessionId);
-    const [transcript, script, narrative, review, evidenceBundle, transcriptRaw, qualityReport, generationState] = await Promise.all([
+    const [transcript, script, narrative, review, evidenceBundle, transcriptRaw, qualityReport, generationState, recovery, publicationAttempt, publicationLock, regenerationMarker, readyMarker] = await Promise.all([
       readFile(this.transcriptPath(sessionId), "utf8").catch(() => null),
       readFile(this.narrativePath(sessionId), "utf8").catch(() => null),
       this.readNarrativeStatus(sessionId),
@@ -1174,7 +1262,24 @@ export class DottySupervisor {
       readFile(join(exportDirectory, "guion.work", "generation-state.json"), "utf8")
         .then((content) => JSON.parse(content) as { lastBlock?: number; lastScene?: number })
         .catch(() => null),
+      readFile(join(this.dataRoot, "recovered-audio", sessionId, "transcription.status.json"), "utf8")
+        .then((content) => JSON.parse(content) as { phase?: string; completed?: number; total?: number; failed?: number })
+        .catch(() => null),
+      readFile(join(this.recordingsRoot, sessionId, ".publication-attempt.json"), "utf8")
+        .then((content) => JSON.parse(content) as { totalMessages?: number; steps?: Array<{ messageId?: string }> })
+        .catch(() => null),
+      this.pathExists(join(this.recordingsRoot, sessionId, ".publication.lock")),
+      this.pathExists(join(this.recordingsRoot, sessionId, ".transcription-regenerating")),
+      this.pathExists(join(this.recordingsRoot, sessionId, ".transcription-ready")),
     ]);
+    const regenerating = regenerationMarker && !readyMarker;
+    const regenerationProgress = regenerating
+      ? await this.transcriberRequest(`/v1/sessions/${encodeURIComponent(sessionId)}/progress`)
+        .catch(() => null) as { completed?: number; failed?: number; total?: number } | null
+      : null;
+    const regenerationTotal = Number(regenerationProgress?.total ?? 0);
+    const regenerationCompleted = Number(regenerationProgress?.completed ?? 0);
+    const regenerationFailed = Number(regenerationProgress?.failed ?? 0);
     const recordingStatus = typeof manifest?.status === "string" ? String(manifest.status) : "unknown";
     const recordingActive = ["recording", "paused", "finalizing"].includes(recordingStatus);
     const recordingComplete = ["completed", "failed", "interrupted"].includes(recordingStatus);
@@ -1200,6 +1305,10 @@ export class DottySupervisor {
     const qualityWarnings = Number(qualityReport?.summary?.linesToReview ?? transcriptRaw?.quality?.linesToReview ?? 0)
       + Number(qualityReport?.summary?.suspectedHallucinations ?? transcriptRaw?.diagnostics?.length ?? 0)
       + Number(qualityReport?.summary?.unintelligible ?? 0);
+    const recoveryTotal = Number(recovery?.total ?? 0);
+    const recoveryCompleted = Number(recovery?.completed ?? 0);
+    const publicationTotal = Number(publicationAttempt?.totalMessages ?? 0);
+    const publicationSent = publicationAttempt?.steps?.filter((step) => typeof step.messageId === "string").length ?? 0;
 
     const stages: ProcessingStage[] = [
       {
@@ -1212,15 +1321,17 @@ export class DottySupervisor {
       {
         id: "transcription",
         label: "Transcripción",
-        status: transcript !== null ? "completed" : recordingActive ? "pending" : "unknown",
-        details: transcript !== null ? "Bitácora generada" : "Esperando texto consolidado",
+        status: regenerating ? regenerationFailed > 0 ? "error" : "running" : transcript !== null ? "completed" : recovery?.phase === "failed" || recovery?.phase === "error" ? "error" : recovery?.phase === "transcribing" || recovery?.phase === "enqueuing" ? "running" : recordingActive ? "pending" : "unknown",
+        details: regenerating ? regenerationTotal > 0 ? `Rehaciendo raw: ${regenerationCompleted} de ${regenerationTotal} fragmentos` : "Preparando nueva transcripción" : transcript !== null ? "Bitácora generada" : recoveryTotal > 0 ? `${recoveryCompleted} de ${recoveryTotal} fragmentos recuperados` : "Esperando texto consolidado",
+        ...(regenerating && regenerationTotal > 0 ? { current: regenerationCompleted, total: regenerationTotal, progress: regenerationCompleted / regenerationTotal } : recoveryTotal > 0 ? { current: recoveryCompleted, total: recoveryTotal, progress: recoveryCompleted / recoveryTotal } : {}),
+        ...(regenerating && regenerationFailed > 0 ? { errors: regenerationFailed } : recovery?.failed ? { errors: recovery.failed } : {}),
         ...(transcript !== null ? { artifact: "bitacora.md" } : {}),
       },
       {
         id: "raw_quality",
         label: "Calidad del raw",
-        status: qualityOutcome === "failure" ? "error" : qualityOutcome === "warning" || qualityWarnings > 0 ? "warning" : transcriptRaw !== null ? "completed" : transcript !== null ? "warning" : "pending",
-        details: qualityReport !== null
+        status: regenerating ? "running" : qualityOutcome === "failure" ? "error" : qualityOutcome === "warning" || qualityWarnings > 0 ? "warning" : transcriptRaw !== null ? "completed" : transcript !== null ? "warning" : "pending",
+        details: regenerating ? "El raw anterior sigue disponible mientras se procesa el nuevo" : qualityReport !== null
           ? qualityOutcome === "success" ? "Informe de calidad sin alertas" : `${qualityWarnings} elementos requieren revisión`
           : transcriptRaw !== null ? "Raw disponible; informe consolidado pendiente" : transcript !== null ? "No hay raw para auditar" : "Esperando transcripción",
         warnings: qualityWarnings,
@@ -1288,10 +1399,23 @@ export class DottySupervisor {
         label: "Publicación en Discord",
         status: published && !approved ? "warning" : published ? "completed" : approved ? "pending" : "blocked",
         details: published && !approved ? "Existe una publicación anterior; el contenido actual requiere revisión" : published ? "Publicación confirmada" : approved ? "Lista para publicar" : "Requiere aprobación previa",
+        ...(publicationAttempt !== null ? {
+          status: publicationLock ? "running" as const : "blocked" as const,
+          details: publicationLock
+            ? publicationTotal > 0 ? `${publicationSent} de ${publicationTotal} mensajes enviados a Discord` : "Preparando la publicación en Discord"
+            : "Publicación interrumpida; revisa Discord antes de reintentar",
+          ...(publicationTotal > 0 ? { current: publicationSent, total: publicationTotal, progress: Math.min(1, publicationSent / publicationTotal) } : {}),
+        } : {}),
       },
     ];
 
-    const state: SessionProcessingStatus["state"] = narrative.state === "failed"
+    const state: SessionProcessingStatus["state"] = regenerating
+      ? regenerationFailed > 0 ? "error" : "transcribing"
+      : publicationAttempt !== null && publicationLock
+      ? "publishing"
+      : publicationAttempt !== null
+        ? "error"
+      : narrative.state === "failed"
       ? "error"
       : recordingActive
         ? "recording"
@@ -1305,7 +1429,9 @@ export class DottySupervisor {
                 ? "completed"
                 : approved
                   ? "narrative_ready"
-                  : transcript !== null
+                  : recovery?.phase === "transcribing" || recovery?.phase === "enqueuing"
+                    ? "transcribing"
+                    : transcript !== null
                     ? "transcript_ready"
                     : "unknown";
     const narrativeStage = stages.find((stage) => stage.id === "verification")!;
@@ -1318,6 +1444,8 @@ export class DottySupervisor {
       narrative: { status: reviewBlocked ? "blocked" : narrative.state === "failed" ? "error" : generationRunning ? "running" : approved ? "completed" : narrativeStage.status, details: narrative.phase },
       publication: { status: publicationStage.status, details: publicationStage.details },
       stages,
+      narrativeProgress: narrative.progress,
+      narrativePhase: narrative.phase,
       updatedAt: new Date().toISOString(),
     };
   }

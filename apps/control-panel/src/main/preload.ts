@@ -33,6 +33,8 @@ const api: DottyDesktopApi = {
     ipcRenderer.invoke("dotty:read-transcript", sessionId),
   saveTranscript: (sessionId: string, content: string) =>
     ipcRenderer.invoke("dotty:save-transcript", sessionId, content),
+  regenerateRaw: (sessionId: string) =>
+    ipcRenderer.invoke("dotty:regenerate-raw", sessionId),
   saveNarrative: (sessionId: string, content: string) =>
     ipcRenderer.invoke("dotty:save-narrative", sessionId, content),
   generateNarrative: (sessionId: string) =>

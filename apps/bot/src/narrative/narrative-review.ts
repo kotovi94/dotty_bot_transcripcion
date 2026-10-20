@@ -105,12 +105,10 @@ export async function refreshNarrativeReview(
     ? "generated"
     : "manual";
   const scenes = mode === "generated" ? await readSceneReviews(exportDirectory) : [];
-  const normalizedScenes = scenes.length > 0 ? scenes : [manualSceneReview(verification)];
+  const normalizedScenes = scenes.length > 0 ? scenes : [manualSceneReview(script, verification)];
   const verificationErrors = verification.issues.filter((issue) => issue.severity === "error").length;
   const verificationWarnings = verification.issues.filter((issue) => issue.severity === "warning").length;
-  // A repeated automatic verification must not erase a human decision for the
-  // same script. Final verification still gates the overall approval below;
-  // this only preserves scene-level review work.
+  // A repeated verification must preserve a human decision for the same script.
   const canPreserveSceneApprovals = previous?.sourceHash === sourceHash;
   const scenesWithPreservedApproval = normalizedScenes.map((scene): NarrativeSceneReview => {
     const previousScene = canPreserveSceneApprovals
@@ -128,21 +126,22 @@ export async function refreshNarrativeReview(
     };
   });
   const sceneHasErrors = scenesWithPreservedApproval.some((scene) => scene.status === "NEEDS_REVIEW");
+  const verificationAccepted = verification.valid && verificationErrors === 0
+    || hasManualAcceptance(mode, scenesWithPreservedApproval);
   const stillApproved = previous?.state === "APPROVED"
     && previous.sourceHash === sourceHash
     && previous.approval?.sourceHash === sourceHash
-    && verification.valid
-    && verificationErrors === 0
+    && verificationAccepted
     && !sceneHasErrors;
   const now = new Date().toISOString();
   const state: NarrativeReviewState = stillApproved
     ? "APPROVED"
-    : verification.valid && verificationErrors === 0 && !sceneHasErrors
+    : verificationAccepted && !sceneHasErrors
       ? "READY_FOR_REVIEW"
       : "NEEDS_REVIEW";
   const reason = state === "APPROVED"
     ? "APPROVED"
-    : verificationErrors > 0 || !verification.valid
+    : !verificationAccepted && (verificationErrors > 0 || !verification.valid)
       ? "FINAL_VERIFICATION_FAILED"
       : sceneHasErrors
         ? "SCENE_REVIEW_REQUIRED"
@@ -195,9 +194,11 @@ export async function approveNarrativeReview(
   if (current.sourceHash !== sourceHash) {
     throw new Error("El guion cambió después de su última verificación. Vuelve a verificarlo antes de aprobarlo.");
   }
-  if (!current.verification.valid || current.verification.errorCount > 0) {
+  if ((!current.verification.valid || current.verification.errorCount > 0)
+    && !hasManualAcceptance(current.mode, current.scenes)) {
     throw new Error("El guion tiene errores de verificación y no puede aprobarse.");
   }
+  assertManualScriptSafe(current.mode, script);
   const structural = current.mode === "manual" ? [] : await readSceneReviews(exportDirectory);
   const blocked = structural.filter((scene) => scene.blockers.some(isHardBlocker));
   if (blocked.length > 0) {
@@ -254,17 +255,21 @@ export async function approveNarrativeScene(
   const structuralScene = current.mode === "manual"
     ? undefined
     : (await readSceneReviews(exportDirectory)).find((scene) => scene.id === sceneId);
-  const hardBlockers = structuralScene?.blockers.filter(isHardBlocker) ?? [];
+  const hardBlockers = current.mode === "manual"
+    ? current.scenes.find((scene) => scene.id === sceneId)?.blockers.filter(isHardBlocker) ?? []
+    : structuralScene?.blockers.filter(isHardBlocker) ?? [];
   if (hardBlockers.length > 0) {
     const codes = hardBlockers.map((blocker) => blocker.code).join(", ");
     throw new Error(`La escena tiene bloqueos estructurales (${codes}) y debe regenerarse o corregirse; no puede aprobarse manualmente.`);
   }
+  assertManualScriptSafe(current.mode, script);
 
   const approvedAt = new Date().toISOString();
   const scenes = current.scenes.map((scene): NarrativeSceneReview => scene.id === sceneId
     ? { ...scene, status: "APPROVED", approvedAt, approvedBy: approvedBy.slice(0, 120) || "manual" }
     : scene);
-  const verificationBlocked = !current.verification.valid || current.verification.errorCount > 0;
+  const verificationBlocked = (!current.verification.valid || current.verification.errorCount > 0)
+    && !hasManualAcceptance(current.mode, scenes);
   const sceneHasErrors = scenes.some((scene) => scene.status === "NEEDS_REVIEW");
   const { approval: _approval, ...withoutApproval } = current;
   const reviewed: NarrativeReviewManifest = {
@@ -300,9 +305,11 @@ export async function assertNarrativeApproved(
   if (review.sourceHash !== sourceHash || review.approval.sourceHash !== sourceHash) {
     throw new Error("El guion cambió después de aprobarse. Debe verificarse y aprobarse nuevamente.");
   }
-  if (!review.verification.valid || review.verification.errorCount > 0) {
+  if ((!review.verification.valid || review.verification.errorCount > 0)
+    && !hasManualAcceptance(review.mode, review.scenes)) {
     throw new Error("La aprobación del guion no es válida porque existen errores editoriales.");
   }
+  assertManualScriptSafe(review.mode, content);
   if (review.scenes.some((scene) => scene.status !== "APPROVED")) {
     throw new Error("Todas las escenas deben estar aprobadas antes de publicar.");
   }
@@ -389,21 +396,44 @@ async function readSceneReviews(exportDirectory: string): Promise<NarrativeScene
   return scenes;
 }
 
-function manualSceneReview(verification: VerificationReport): NarrativeSceneReview {
+function manualSceneReview(script: string, verification: VerificationReport): NarrativeSceneReview {
   const errorCount = verification.issues.filter((issue) => issue.severity === "error").length;
   const warningCount = verification.issues.filter((issue) => issue.severity === "warning").length;
-  const valid = verification.valid && errorCount === 0;
+  const blockers: NarrativeSceneBlocker[] = [];
+  if (script.trim() === "") blockers.push({ code: "EMPTY_SCENE", message: "El guion manual está vacío." });
+  if (looksLikeModelMeta(script)) blockers.push({ code: "MODEL_META_CONTAMINATION", message: "El guion contiene razonamiento o instrucciones del modelo." });
+  const valid = verification.valid && errorCount === 0 && blockers.length === 0;
   return {
     id: "manual",
     title: "Guion editado manualmente",
     status: valid ? "GENERATED" : "NEEDS_REVIEW",
     auditValid: valid,
-    issueCount: verification.issues.length,
-    errorCount,
+    issueCount: verification.issues.length + blockers.length,
+    errorCount: errorCount + blockers.length,
     warningCount,
     evidenceIds: [],
-    blockers: [],
+    blockers,
   };
+}
+
+function hasManualAcceptance(
+  mode: NarrativeReviewManifest["mode"],
+  scenes: readonly NarrativeSceneReview[],
+): boolean {
+  return mode === "manual"
+    && scenes.length === 1
+    && scenes[0]?.id === "manual"
+    && scenes[0].status === "APPROVED"
+    && !scenes[0].blockers.some(isHardBlocker)
+    && typeof scenes[0].approvedAt === "string";
+}
+
+function assertManualScriptSafe(mode: NarrativeReviewManifest["mode"], script: string): void {
+  if (mode !== "manual") return;
+  if (script.trim() === "") throw new Error("El guion manual está vacío y no puede aprobarse.");
+  if (looksLikeModelMeta(script)) {
+    throw new Error("El guion manual contiene instrucciones o razonamiento del modelo. Corrígelo antes de aprobarlo.");
+  }
 }
 
 function structuralBlockers(

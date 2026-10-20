@@ -97,6 +97,7 @@ export interface ProcessingStage {
   details: string;
   current?: number;
   total?: number;
+  progress?: number;
   errors?: number;
   warnings?: number;
   artifact?: string;
@@ -110,6 +111,8 @@ export interface SessionProcessingStatus {
   narrative: { status: ProcessingStageStatus; details?: string };
   publication: { status: ProcessingStageStatus; details?: string };
   stages: ProcessingStage[];
+  narrativeProgress?: number;
+  narrativePhase?: string;
   updatedAt?: string | null;
 }
 
@@ -353,6 +356,7 @@ export interface DottyDesktopApi {
   listTranscripts(): Promise<TranscriptSummary[]>;
   readTranscript(sessionId: string): Promise<TranscriptDetail>;
   saveTranscript(sessionId: string, content: string): Promise<SaveResult>;
+  regenerateRaw(sessionId: string): Promise<OperationResult>;
   saveNarrative(sessionId: string, content: string): Promise<SaveResult>;
   generateNarrative(sessionId: string): Promise<NarrativeOperationResult>;
   verifyNarrative(sessionId: string): Promise<NarrativeOperationResult>;

@@ -9,7 +9,7 @@ import { after, describe, it } from "node:test";
 import type { Logger } from "pino";
 import type { Guild } from "discord.js";
 import { VoiceConnectionStatus, type VoiceConnection } from "@discordjs/voice";
-import type prism from "prism-media";
+import prism from "prism-media";
 import type { PersistedSession } from "../sessions/session-repository.ts";
 import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts";
 import { WavFileWriter } from "./wav-writer.ts";
@@ -130,6 +130,34 @@ describe("capture cancellation identity", () => {
 });
 
 describe("interrupted recording recovery", () => {
+  it("stores the configured character for a speaker at capture time", async () => {
+    const root = await mkdtemp(join(tmpdir(), "dotty-speaker-name-"));
+    temporaryDirectories.push(root);
+    const speaking = new EventEmitter();
+    const source = new PassThrough();
+    const connection = Object.assign(new EventEmitter(), {
+      state: { status: VoiceConnectionStatus.Ready },
+      receiver: { speaking, subscribe: () => source },
+      destroy() { this.state = { status: VoiceConnectionStatus.Destroyed }; },
+    });
+    const manager = new VoiceCaptureManager(root, { info() {}, error() {}, warn() {} } as unknown as Logger, options, {
+      connect: () => connection as unknown as VoiceConnection,
+      decoder: () => new PassThrough() as unknown as prism.opus.Decoder,
+    }, {
+      listMembersByCampaignId: async () => [{ discordUserId: "speaker", playerName: "Jugadora", characterName: "Personaje" }],
+    });
+    const guild = { id: "guild", voiceAdapterCreator: {}, members: { cache: new Map([
+      ["speaker", { displayName: "Apodo de Discord", user: { bot: false } }],
+    ]) } } as unknown as Guild;
+    await manager.start(guild, { id: "named", campaignId: "campaign", sequenceNumber: 1,
+      voiceChannelId: "voice", startedAt: new Date() } as PersistedSession);
+    speaking.emit("start", "speaker");
+    source.write(Buffer.alloc(960));
+    await manager.finish("guild");
+    const manifest = JSON.parse(await readFile(join(root, "recordings", "named", "manifest.json"), "utf8"));
+    assert.equal(manifest.chunks[0].speakerName, "Personaje");
+  });
+
   it("preserves all PCM through four hours of simulated clip rotation with four speakers", async (test) => {
     const root = await mkdtemp(join(tmpdir(), "dotty-long-capture-"));
     temporaryDirectories.push(root);
@@ -209,9 +237,9 @@ describe("interrupted recording recovery", () => {
       assert.equal(interrupted.status, failure === "writer" ? "recording" : "interrupted");
       if (failure === "disconnect") assert.match(interrupted.interruptionReason, /disconnected/iu);
       const endedAt = interrupted.endedAt;
-      assert.deepEqual(await manager.recoverInterrupted(), ["session"]);
+      assert.deepEqual(await manager.recoverInterrupted(), failure === "writer" ? ["session"] : []);
       const recovered = JSON.parse(await readFile(path, "utf8"));
-      assert.equal(recovered.status, "completed");
+      assert.equal(recovered.status, "interrupted");
       if (endedAt === null) assert.ok(recovered.endedAt);
       else assert.equal(recovered.endedAt, endedAt);
       assert.equal(recovered.chunks.length, 1);
@@ -259,7 +287,7 @@ describe("interrupted recording recovery", () => {
       chunks: unknown[];
     };
     const wav = await readFile(wavPath);
-    assert.equal(manifest.status, "completed");
+    assert.equal(manifest.status, "interrupted");
     assert.equal(manifest.chunks.length, 1);
     assert.equal(wav.toString("ascii", 0, 4), "RIFF");
     assert.equal(wav.readUInt32LE(40), pcm.length);
@@ -295,6 +323,7 @@ async function closureFixture(
   test: { after(callback: () => Promise<void>): void },
   setup: {
     writer?: (path: string) => WavFileWriter;
+    decoder?: () => prism.opus.Decoder;
     writerCloseTimeoutMs?: number;
     writeManifest?: (path: string, value: unknown) => Promise<void>;
   } = {},
@@ -317,7 +346,7 @@ async function closureFixture(
   });
   const adapters = {
     connect: () => connection as unknown as VoiceConnection,
-    decoder: () => new PassThrough() as unknown as prism.opus.Decoder,
+    decoder: setup.decoder ?? (() => new PassThrough() as unknown as prism.opus.Decoder),
     ...(setup.writer === undefined ? {} : { writer: setup.writer }),
     ...(setup.writeManifest === undefined ? {} : { writeManifest: setup.writeManifest }),
     writerCloseTimeoutMs: setup.writerCloseTimeoutMs ?? 1_000,
@@ -371,6 +400,48 @@ class HeldFinalWavWriter extends WavFileWriter {
 }
 
 describe("capture closure barrier", () => {
+  it("preserves decoded PCM and continues after one invalid Opus packet", async (test) => {
+    const f = await closureFixture(test, {
+      decoder: () => new prism.opus.Decoder({ rate: 48_000, channels: 1, frameSize: 960 }),
+    });
+    const source = f.startSpeaker();
+    source.write(Buffer.from([0xf8, 0xff, 0xfe]));
+    source.write(Buffer.from([3]));
+    let replacement = f.subscriptions.get("speaker");
+    for (let attempt = 0; attempt < 40 && replacement === source; attempt++) {
+      await new Promise((done) => setTimeout(done, 10));
+      replacement = f.subscriptions.get("speaker");
+    }
+    assert.notEqual(replacement, source);
+    replacement!.write(Buffer.from([0xf8, 0xff, 0xfe]));
+    await f.manager.finish("guild");
+    const manifest = JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8"));
+    assert.equal(manifest.status, "completed");
+    assert.ok(manifest.chunks[0].bytes > 44);
+    assert.ok(manifest.chunks[1].bytes > 44);
+  });
+
+  it("interrupts when invalid Opus packets continue", async (test) => {
+    const f = await closureFixture(test, {
+      decoder: () => new prism.opus.Decoder({ rate: 48_000, channels: 1, frameSize: 960 }),
+    });
+    for (let failure = 0; failure < 3; failure++) {
+      const source = failure === 0 ? f.startSpeaker() : f.subscriptions.get("speaker")!;
+      source.write(Buffer.from([3]));
+      if (failure < 2) {
+        for (let attempt = 0; attempt < 40 && f.subscriptions.get("speaker") === source; attempt++) {
+          await new Promise((done) => setTimeout(done, 10));
+        }
+        assert.notEqual(f.subscriptions.get("speaker"), source);
+      }
+    }
+    await new Promise((done) => setTimeout(done, 50));
+    await f.manager.shutdown();
+    const manifest = JSON.parse(await readFile(join(f.directory, "manifest.json"), "utf8"));
+    assert.equal(manifest.status, "interrupted");
+    assert.match(manifest.interruptionReason, /Invalid packet/u);
+  });
+
   it("reports absence or drains only the matching active capture", async (test) => {
     const f = await closureFixture(test);
     assert.equal(await f.manager.cancelIfActive("other-guild", "session"), false);

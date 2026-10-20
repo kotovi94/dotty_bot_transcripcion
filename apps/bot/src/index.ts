@@ -78,7 +78,7 @@ const recordings = new VoiceCaptureManager(environment.DOTTY_DATA_DIR, logger, {
   searchStartMs: environment.RECORDING_CLIP_SEARCH_START_MINUTES * 60_000,
   maxMs: environment.RECORDING_CLIP_MAX_MINUTES * 60_000,
   overlapMs: environment.RECORDING_CLIP_OVERLAP_SECONDS * 1_000,
-});
+}, {}, campaigns);
 const sessionLifecycle = new SessionLifecycleCoordinator(sessions, sessionCoordinator, recordings);
 const transcriberSecret = resolveTranscriberSecret(
   environment.DOTTY_DATA_DIR,
@@ -101,10 +101,10 @@ const transcriptions = new TranscriptionDispatcher(
 );
 const recoveredRecordings = await recordings.recoverInterrupted();
 if (recoveredRecordings.length > 0) {
-  await sessions.recoverInterrupted(recoveredRecordings, new Date());
+  await sessions.failInterrupted(recoveredRecordings, new Date());
   logger.warn(
     { count: recoveredRecordings.length },
-    "Grabaciones interrumpidas cerradas y enviadas a recuperacion automatica",
+    "Grabaciones interrumpidas cerradas; sesiones marcadas como fallidas para preservar el audio",
   );
 }
 const client = new Client({

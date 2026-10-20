@@ -33,7 +33,9 @@ $botStdout = Join-Path $dataDirectory "dotty.stdout.log"
 $botStderr = Join-Path $dataDirectory "dotty.stderr.log"
 $startLogPath = Join-Path $dataDirectory "startup.log"
 $transcriberPidPath = Join-Path $dataDirectory "transcriber.pid"
+$transcriberLaunchIdPath = Join-Path $dataDirectory "transcriber.launch-id"
 $botPidPath = Join-Path $dataDirectory "dotty.pid"
+$botStatusPath = Join-Path $dataDirectory "dotty.status.json"
 $botStartupTimeoutSeconds = 300
 $transcriberUri = $null
 if (-not [Uri]::TryCreate($configuredTranscriberBaseUrl, [UriKind]::Absolute, [ref]$transcriberUri) -or
@@ -54,18 +56,58 @@ function Write-LogLine([string]$path, [string]$message) {
   Add-Content -LiteralPath $path -Value ("[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $message) -Encoding UTF8
 }
 
-function Test-PidFile([string]$path) {
-  if (-not (Test-Path -LiteralPath $path)) { return $false }
-  $processId = 0
-  if (-not [int]::TryParse((Get-Content -LiteralPath $path -Raw).Trim(), [ref]$processId)) {
-    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+function Test-BotRunning([datetime]$since = [datetime]::MinValue) {
+  if (-not (Test-Path -LiteralPath $botStatusPath)) { return $false }
+  try {
+    $status = Get-Content -LiteralPath $botStatusPath -Raw | ConvertFrom-Json
+    # ConvertFrom-Json may already turn the ISO timestamp into DateTime. Its
+    # localized string representation is not reliably parseable again.
+    $connectedAt = if ($status.connectedAt -is [datetime]) {
+      [datetime]$status.connectedAt
+    } else {
+      [datetime]::Parse([string]$status.connectedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+    }
+    $botProcessId = [int]$status.pid
+    if ($status.status -ne "ready" -or $connectedAt.ToUniversalTime() -lt $since.ToUniversalTime() -or $botProcessId -le 0) { return $false }
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$botProcessId" -ErrorAction Stop
+    if ($null -eq $process -or ([datetime]$process.CreationDate).ToUniversalTime() -gt $connectedAt.ToUniversalTime().AddSeconds(5) -or
+        [string]$process.CommandLine -notmatch '(?i)(?:src[\\/])?index\.ts') { return $false }
+    Set-Content -LiteralPath $botPidPath -Value $botProcessId -Encoding ASCII
+    return $true
+  } catch {
     return $false
   }
-  if ($null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
-    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+}
+
+function Test-TranscriberCommand([string]$command, [int]$port) {
+  return $command -match '(?i)(?:^|\s)-m\s+uvicorn\s+dotty_transcriber\.main:app(?:\s|$)' -and
+    $command -match '(?i)(?:^|\s)--host\s+127\.0\.0\.1(?:\s|$)' -and
+    $command -match "(?i)(?:^|\s)--port\s+$port(?:\s|$)"
+}
+
+function Test-ExistingTranscriber([object[]]$listeners) {
+  if ($listeners.Count -eq 0) { return $false }
+  $ownerPid = [int]$listeners[0].OwningProcess
+  if (@($listeners | Where-Object { $_.OwningProcess -ne $ownerPid }).Count -gt 0) { return $false }
+  try {
+    $health = Invoke-RestMethod -Uri $transcriberHealthUrl -TimeoutSec 2
+    if ($health.status -ne "ok" -or ($null -ne $health.pid -and [int]$health.pid -ne $ownerPid)) { return $false }
+    $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction Stop
+    if ($null -eq $owner -or -not (Test-TranscriberCommand ([string]$owner.CommandLine) $transcriberPort)) { return $false }
+    if (Test-Path -LiteralPath $transcriberLaunchIdPath) {
+      $expectedId = (Get-Content -LiteralPath $transcriberLaunchIdPath -Raw).Trim()
+      return $expectedId -ne "" -and $health.launch_id -eq $expectedId
+    }
+    # Legacy launchers saved the venv redirector PID. Accept only its direct
+    # Uvicorn child, with both processes running the exact local command.
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($owner.ParentProcessId)" -ErrorAction Stop
+    return $null -ne $parent -and
+      [string]::Equals([string]$parent.ExecutablePath, $pythonPath, [StringComparison]::OrdinalIgnoreCase) -and
+      (Test-TranscriberCommand ([string]$parent.CommandLine) $transcriberPort) -and
+      ([datetime]$owner.CreationDate -ge ([datetime]$parent.CreationDate).AddSeconds(-2))
+  } catch {
     return $false
   }
-  return $true
 }
 
 Write-Host ""
@@ -87,17 +129,18 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
   throw "Falta el entorno del transcriptor. Ejecuta la preparacion indicada en services\transcriber\README.md."
 }
 
-# A health response cannot identify an existing service. Reject every listener
-# before creating directories, writing logs, or starting another process.
+# A health response alone cannot identify an existing service. Check the saved
+# launch identity or the legacy venv redirector parent before reusing it.
 try {
   $existingTranscriberListener = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
     Where-Object { $_.LocalPort -eq $transcriberPort })
 } catch {
   throw "No se pudo verificar si el puerto $transcriberPort del transcriptor esta libre; no se inicio Dotty."
 }
-if ($existingTranscriberListener.Count -gt 0) {
-  throw "El puerto $transcriberPort del transcriptor ya esta ocupado. No se reutilizara ni detendra el proceso existente."
+if ($existingTranscriberListener.Count -gt 0 -and -not (Test-ExistingTranscriber $existingTranscriberListener)) {
+  throw "El puerto $transcriberPort del transcriptor ya esta ocupado por un proceso no verificable. No se reutilizara ni detendra."
 }
+$reuseTranscriber = $existingTranscriberListener.Count -gt 0
 
 New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $ollamaModels -Force | Out-Null
@@ -153,34 +196,37 @@ if (-not $ollamaModelReady) {
 }
 Write-Host "[OK] Modelo narrativo $configuredOllamaModel disponible." -ForegroundColor Green
 
+if ($reuseTranscriber) {
+  Write-LogLine $startLogPath "Reutilizando transcriptor verificado en el puerto $transcriberPort"
+  Write-Host "[OK] Transcriptor local ya encendido." -ForegroundColor Green
+} else {
 $transcriberReady = $false
 Write-LogLine $startLogPath "Iniciando transcriptor en http://127.0.0.1:$transcriberPort"
 try {
   Set-Content -LiteralPath $transcriberStdout -Value "" -Encoding UTF8
   Set-Content -LiteralPath $transcriberStderr -Value "" -Encoding UTF8
-  $transcriberProcess = Start-Process `
-    -FilePath $pythonPath `
-    -ArgumentList @("-m", "uvicorn", "dotty_transcriber.main:app", "--host", "127.0.0.1", "--port", "$transcriberPort") `
-    -WorkingDirectory $transcriberDirectory `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $transcriberStdout `
-    -RedirectStandardError $transcriberStderr `
-    -PassThru
-  Set-Content -LiteralPath $transcriberPidPath -Value $transcriberProcess.Id -Encoding ASCII
+  $transcriberLaunchId = [guid]::NewGuid().ToString()
+  $env:DOTTY_TRANSCRIBER_LAUNCH_ID = $transcriberLaunchId
+  try {
+    $transcriberProcess = Start-Process `
+      -FilePath $pythonPath `
+      -ArgumentList @("-m", "uvicorn", "dotty_transcriber.main:app", "--host", "127.0.0.1", "--port", "$transcriberPort") `
+      -WorkingDirectory $transcriberDirectory `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $transcriberStdout `
+      -RedirectStandardError $transcriberStderr `
+      -PassThru
+  } finally {
+    Remove-Item Env:DOTTY_TRANSCRIBER_LAUNCH_ID -ErrorAction SilentlyContinue
+  }
+  $transcriberOwnerPid = $null
 
   for ($attempt = 1; $attempt -le 20; $attempt += 1) {
-    $transcriberProcess.Refresh()
-    if ($transcriberProcess.HasExited) {
-      throw "El transcriptor iniciado por Dotty termino antes de estar disponible; no se aceptara otro servicio."
-    }
     try {
       $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
         Where-Object { $_.LocalPort -eq $transcriberPort })
     } catch {
       throw "No se pudo verificar el propietario del puerto $transcriberPort tras iniciar el transcriptor."
-    }
-    if (@($listeners | Where-Object { $_.OwningProcess -ne $transcriberProcess.Id }).Count -gt 0) {
-      throw "Otro proceso ocupo el puerto $transcriberPort durante el arranque; no se aceptara como transcriptor."
     }
     Start-Sleep -Milliseconds 500
     $health = $null
@@ -189,20 +235,20 @@ try {
     } catch {
       # El servicio aun esta arrancando.
     }
-    $transcriberProcess.Refresh()
-    if ($transcriberProcess.HasExited) {
-      throw "El transcriptor iniciado por Dotty termino antes de estar disponible; no se aceptara otro servicio."
-    }
     try {
       $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
         Where-Object { $_.LocalPort -eq $transcriberPort })
     } catch {
       throw "No se pudo verificar el propietario del puerto $transcriberPort tras consultar health."
     }
-    if (@($listeners | Where-Object { $_.OwningProcess -ne $transcriberProcess.Id }).Count -gt 0) {
+    if ($listeners.Count -gt 0 -and $null -ne $health -and ($health.status -ne "ok" -or
+        $health.launch_id -ne $transcriberLaunchId -or
+        $health.pid -notin @($listeners | ForEach-Object { $_.OwningProcess }) -or
+        @($listeners | Where-Object { $_.OwningProcess -ne $health.pid }).Count -gt 0)) {
       throw "Otro proceso ocupo el puerto $transcriberPort durante el arranque; no se aceptara como transcriptor."
     }
     if ($health.status -eq "ok" -and $listeners.Count -gt 0) {
+      $transcriberOwnerPid = [int]$listeners[0].OwningProcess
       $transcriberReady = $true
       break
     }
@@ -211,6 +257,8 @@ try {
     Write-LogLine $startLogPath "El transcriptor no respondio. Revisa data/transcriber.stderr.log."
     throw "El transcriptor no respondio. Revisa data\transcriber.stderr.log."
   }
+  Set-Content -LiteralPath $transcriberLaunchIdPath -Value $transcriberLaunchId -Encoding ASCII
+  Set-Content -LiteralPath $transcriberPidPath -Value $transcriberOwnerPid -Encoding ASCII
   Write-Host "[OK] Transcriptor local encendido." -ForegroundColor Green
 } catch {
   if ($null -ne $transcriberProcess) {
@@ -225,8 +273,9 @@ try {
   }
   throw
 }
+}
 
-if (Test-PidFile $botPidPath) {
+if (Test-BotRunning) {
   Write-Host "[OK] El bot ya estaba encendido." -ForegroundColor Green
 } else {
   Write-LogLine $startLogPath "Iniciando bot de Discord"
@@ -243,16 +292,11 @@ if (Test-PidFile $botPidPath) {
   Set-Content -LiteralPath $botPidPath -Value $botProcess.Id -Encoding ASCII
 
   $botReady = $false
+  $botLaunchedAt = Get-Date
   $botStartupAttempts = $botStartupTimeoutSeconds * 2
   for ($attempt = 1; $attempt -le $botStartupAttempts; $attempt += 1) {
     Start-Sleep -Milliseconds 500
-    if (Test-Path -LiteralPath $botStdout) {
-      $recentLog = Get-Content -LiteralPath $botStdout -Tail 30 -ErrorAction SilentlyContinue
-      if ($recentLog -match "Dotty conectado a Discord") {
-        $botReady = $true
-        break
-      }
-    }
+    if (Test-BotRunning $botLaunchedAt.AddSeconds(-2)) { $botReady = $true; break }
     if ($botProcess.HasExited) { break }
   }
   if (-not $botReady) {
@@ -263,16 +307,6 @@ if (Test-PidFile $botPidPath) {
     }
     Write-LogLine $startLogPath "El bot no confirmo su conexion en $botStartupTimeoutSeconds segundos."
     throw "El bot sigue abierto, pero no confirmo su conexion a Discord en $botStartupTimeoutSeconds segundos. Revisa tu conexion y data\dotty.stdout.log."
-  }
-  if (Test-Path -LiteralPath (Join-Path $dataDirectory "dotty.status.json")) {
-    try {
-      $actualBotPid = (Get-Content -LiteralPath (Join-Path $dataDirectory "dotty.status.json") -Raw | ConvertFrom-Json).pid
-      if ($actualBotPid -is [int] -or $actualBotPid -is [long]) {
-        Set-Content -LiteralPath $botPidPath -Value $actualBotPid -Encoding ASCII
-      }
-    } catch {
-      # El PID inicial sigue permitiendo detectar un arranque incompleto.
-    }
   }
   Write-Host "[OK] Bot conectado a Discord." -ForegroundColor Green
 }

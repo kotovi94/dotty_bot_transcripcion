@@ -132,6 +132,9 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .work-title span { color: #9b92ff; font-weight: 700; }
 .progress-track { height: 8px; margin-top: 12px; border-radius: 999px; overflow: hidden; background: #232836; }
 .progress-track div { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #6d5efc, #9a8fff); box-shadow: 0 0 14px rgba(109, 94, 252, .45); transition: width .4s ease; }
+.progress-track.indeterminate div { width: 35% !important; animation: process-pulse 1.5s ease-in-out infinite alternate; }
+.operation-progress { margin: 0 18px 12px; padding: 12px 16px 15px; border: 1px solid rgba(109,94,252,.35); border-radius: 12px; background: #141726; }
+.operation-progress .work-title { margin-top: 0; }
 .processing-panel p { color: #747d90; font-size: 11px; }
 .empty-inline { display: flex; align-items: center; gap: 14px; min-height: 120px; color: #596276; }
 .empty-inline div { display: grid; gap: 4px; }
@@ -242,6 +245,13 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .process-summary { min-height: 180px; }
 .process-map .panel-heading p { margin: 6px 0 0; color: #7f899d; font-size: 12px; }
 .process-stage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+.process-overall { margin-top: 16px; }
+.process-overall .work-title { margin-top: 14px; }
+.process-stage-track { height: 5px; overflow: hidden; border-radius: 99px; background: #28303e; }
+.process-stage-track > div { height: 100%; border-radius: inherit; background: #7468f5; transition: width .4s ease; }
+.process-stage-card.completed .process-stage-track > div { background: #43d68a; }
+.process-stage-track.indeterminate > div { width: 35% !important; animation: process-pulse 1.5s ease-in-out infinite alternate; }
+@keyframes process-pulse { from { transform: translateX(0); } to { transform: translateX(185%); } }
 .process-stage-card { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 82px; padding: 13px; border: 1px solid #252d3b; border-radius: 12px; background: #10161f; }
 .process-stage-card.blocked, .process-stage-card.error { border-color: rgba(232,93,104,.38); background: rgba(94,26,35,.14); }
 .process-stage-card.warning { border-color: rgba(255,191,96,.3); }

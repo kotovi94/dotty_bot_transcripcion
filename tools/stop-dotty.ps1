@@ -4,14 +4,31 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $stopped = 0
 $environmentPath = Join-Path $projectRoot ".env"
 $configuredDataDirectory = "./data"
+$configuredTranscriberBaseUrl = "http://127.0.0.1:8765"
 if (Test-Path -LiteralPath $environmentPath) {
   foreach ($environmentLine in Get-Content -LiteralPath $environmentPath) {
     if ($environmentLine -match '^DOTTY_DATA_DIR=(.*)$') { $configuredDataDirectory = $Matches[1].Trim() }
+    if ($environmentLine -match '^TRANSCRIBER_BASE_URL=(.*)$') { $configuredTranscriberBaseUrl = $Matches[1].Trim() }
   }
 }
 $dataDirectory = if ([System.IO.Path]::IsPathRooted($configuredDataDirectory)) { $configuredDataDirectory } else { Join-Path $projectRoot $configuredDataDirectory }
+$venvConfig = Join-Path $projectRoot "services\transcriber\.venv\pyvenv.cfg"
+$basePython = $null
+if (Test-Path -LiteralPath $venvConfig) {
+  $basePythonLine = Get-Content -LiteralPath $venvConfig | Where-Object { $_ -match '^executable\s*=' } | Select-Object -First 1
+  if ($basePythonLine) { $basePython = ($basePythonLine -split '=', 2)[1].Trim() }
+}
 $stopLogPath = Join-Path $dataDirectory "shutdown.log"
 $botStatusPath = Join-Path $dataDirectory "dotty.status.json"
+$transcriberLaunchIdPath = Join-Path $dataDirectory "transcriber.launch-id"
+$transcriberUri = [uri]$configuredTranscriberBaseUrl
+$transcriberPort = $transcriberUri.Port
+
+function Test-TranscriberCommand([string]$command, [int]$port) {
+  return $command -match '(?i)(?:^|\s)-m\s+uvicorn\s+dotty_transcriber\.main:app(?:\s|$)' -and
+    $command -match '(?i)(?:^|\s)--host\s+127\.0\.0\.1(?:\s|$)' -and
+    $command -match "(?i)(?:^|\s)--port\s+$port(?:\s|$)"
+}
 
 # The script must enforce this too: .cmd callers bypass the desktop guard.
 $recordingsDirectory = Join-Path $dataDirectory "recordings"
@@ -39,6 +56,15 @@ if (Test-Path -LiteralPath $botStatusPath) {
     if (Test-Path -LiteralPath $botStatusPath) {
       throw "Dotty no confirmo el cierre ordenado. No se forzara su terminacion; revisa los registros."
     }
+    # The status file is removed before Node has fully exited. Wait for the
+    # verified process instead of treating that brief interval as a foreign PID.
+    $exitDeadline = (Get-Date).AddSeconds(15)
+    while ((Get-Process -Id $botProcessId -ErrorAction SilentlyContinue) -and (Get-Date) -lt $exitDeadline) {
+      Start-Sleep -Milliseconds 250
+    }
+    if (Get-Process -Id $botProcessId -ErrorAction SilentlyContinue) {
+      throw "Dotty confirmo el cierre, pero su proceso sigue activo; revisa los registros."
+    }
   }
 }
 
@@ -51,6 +77,7 @@ Write-Host "Deteniendo Dotty..." -ForegroundColor Cyan
 Write-LogLine $stopLogPath "Deteniendo Dotty"
 
 $servicePids = @()
+$verifiedTranscriberPid = $null
 if (Test-Path -LiteralPath $botStatusPath) {
   try {
     $statusPid = (Get-Content -LiteralPath $botStatusPath -Raw | ConvertFrom-Json).pid
@@ -65,6 +92,37 @@ foreach ($pidFile in @("dotty.pid", "transcriber.pid", "ollama.pid")) {
   if (-not (Test-Path -LiteralPath $path)) { continue }
   $processId = 0
   if ([int]::TryParse((Get-Content -LiteralPath $path -Raw).Trim(), [ref]$processId)) {
+    if ($pidFile -eq "transcriber.pid" -and (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+      $health = Invoke-RestMethod -Uri "$($configuredTranscriberBaseUrl.TrimEnd('/'))/health" -TimeoutSec 2
+      $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+        Where-Object { $_.LocalPort -eq $transcriberPort })
+      $ownerPid = if ($listeners.Count -gt 0) { [int]$listeners[0].OwningProcess } else { 0 }
+      if ($health.status -ne "ok" -or $ownerPid -eq 0 -or
+          @($listeners | Where-Object { $_.OwningProcess -ne $ownerPid }).Count -gt 0) {
+        throw "La identidad del transcriptor no coincide con el puerto; no se terminara."
+      }
+      if (Test-Path -LiteralPath $transcriberLaunchIdPath) {
+        $expectedLaunchId = (Get-Content -LiteralPath $transcriberLaunchIdPath -Raw).Trim()
+        if ($expectedLaunchId -eq "" -or $health.launch_id -ne $expectedLaunchId -or
+            $health.pid -ne $processId -or $ownerPid -ne $processId) {
+          throw "La identidad del transcriptor no coincide con el puerto; no se terminara."
+        }
+      } else {
+        # The old launcher stored the venv redirector PID, not its Uvicorn child.
+        $wrapper = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction Stop
+        $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction Stop
+        $venvPython = Join-Path $projectRoot "services\transcriber\.venv\Scripts\python.exe"
+        if ($null -eq $wrapper -or $null -eq $owner -or
+            $owner.ParentProcessId -ne $processId -or
+            -not [string]::Equals([string]$wrapper.ExecutablePath, $venvPython, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-TranscriberCommand ([string]$wrapper.CommandLine) $transcriberPort) -or
+            -not (Test-TranscriberCommand ([string]$owner.CommandLine) $transcriberPort) -or
+            ($null -ne $health.pid -and $health.pid -ne $ownerPid)) {
+          throw "La identidad heredada del transcriptor no pudo verificarse; no se terminara."
+        }
+      }
+      $verifiedTranscriberPid = $processId
+    }
     $servicePids += $processId
   }
 }
@@ -78,7 +136,11 @@ foreach ($processId in ($servicePids | Select-Object -Unique)) {
     if ($commandLine -notmatch 'dotty_transcriber\.main:app|ollama(?:\.exe)?["\s]+serve') {
       throw "El PID $processId no corresponde a un servicio verificable de Dotty. No se terminara."
     }
-    if (-not $executablePath.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+    $insideProject = $executablePath.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+    $matchesVenvBase = $processId -eq $verifiedTranscriberPid -and $basePython -and
+      [string]::Equals($executablePath, $basePython, [StringComparison]::OrdinalIgnoreCase) -and
+      $commandLine -match 'dotty_transcriber\.main:app'
+    if (-not $insideProject -and -not $matchesVenvBase) {
       throw "El PID $processId pertenece a otra instalacion. No se terminara."
     }
     & taskkill.exe /PID $processId /T /F 2>$null | Out-Null
@@ -90,6 +152,7 @@ foreach ($processId in ($servicePids | Select-Object -Unique)) {
 foreach ($pidFile in @("dotty.pid", "transcriber.pid", "ollama.pid")) {
   Remove-Item -LiteralPath (Join-Path $dataDirectory $pidFile) -Force -ErrorAction SilentlyContinue
 }
+Remove-Item -LiteralPath $transcriberLaunchIdPath -Force -ErrorAction SilentlyContinue
 
 # El cierre forzado del arbol de procesos no permite que Node limpie su propio
 # archivo de estado. Se elimina aqui para que el panel nunca muestre un estado

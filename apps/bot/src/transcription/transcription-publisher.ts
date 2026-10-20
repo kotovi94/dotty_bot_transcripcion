@@ -406,6 +406,17 @@ export class TranscriptionPublisher {
       join(directory, "manifest.json"),
       `${JSON.stringify(manifest, null, 2)}\n`,
     );
+    if (await exists(join(directory, ".transcription-regenerating"))) {
+      await fs.rm(join(exportDirectory, "guion.revision.json"), { force: true });
+      await writeAtomically(join(exportDirectory, "guion.estado.json"), `${JSON.stringify({
+        state: "missing",
+        sessionId: manifest.sessionId,
+        model: "",
+        progress: 0,
+        phase: "Transcripción rehecha; regenera el guion antes de publicar",
+        updatedAt: new Date().toISOString(),
+      }, null, 2)}\n`);
+    }
     const activatedTerms = await this.adaptiveVocabulary.observe(
       manifest.campaignId, manifest.sessionId, lines,
       [...chronicleTerms, ...baseTranscriptionVocabulary().split(",")],
@@ -414,6 +425,7 @@ export class TranscriptionPublisher {
       this.logger.info({ campaignId: manifest.campaignId, terms: activatedTerms }, "Vocabulario adaptativo actualizado");
     }
     await fs.writeFile(readyMarker, `${new Date().toISOString()}\n`, { flag: "wx" });
+    await fs.rm(join(directory, ".transcription-regenerating"), { force: true });
     this.logger.info(
       { sessionId: manifest.sessionId },
       "Transcripcion preparada; queda pendiente generar y publicar el guion manualmente",

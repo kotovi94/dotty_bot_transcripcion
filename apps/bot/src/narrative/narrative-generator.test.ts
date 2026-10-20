@@ -142,6 +142,10 @@ describe("NarrativeGenerator", () => {
   });
 
   it("stops before Ollama inference if Whisper cannot release the GPU", async () => {
+    await mkdir(join(root, "exports", "gpu-busy"), { recursive: true });
+    await writeFile(join(root, "exports", "gpu-busy", "transcript.raw.json"), JSON.stringify({
+      lines: [{ startMs: 1_000, speakerName: "Ada", text: "Encontramos una pista." }],
+    }));
     const request: typeof fetch = async (input) => {
       const path = new URL(String(input)).pathname;
       if (path === "/api/tags") return new Response(JSON.stringify({ models: [{ name: "qwen3:8b" }] }));
@@ -151,6 +155,17 @@ describe("NarrativeGenerator", () => {
     };
     const generator = new NarrativeGenerator(join(root, "recordings"), join(root, "exports"), baseUrl, "qwen3:8b", baseUrl, "synthetic", undefined, request);
     await assert.rejects(generator.generate("gpu-busy"), /No se pudo liberar Whisper/u);
+  });
+
+  it("reports a missing transcript before contacting Ollama", async () => {
+    let requests = 0;
+    const request: typeof fetch = async () => {
+      requests += 1;
+      throw new Error("The model should not be contacted without a transcript");
+    };
+    const generator = new NarrativeGenerator(join(root, "recordings"), join(root, "exports"), baseUrl, "qwen3:8b", undefined, undefined, undefined, request);
+    await assert.rejects(generator.generate("no-transcript"), /todavía no tiene una transcripción exportada/u);
+    assert.equal(requests, 0);
   });
 
   it("serializes different sessions so one cannot unload the other's model", async () => {

@@ -8,6 +8,21 @@ from dotty_transcriber.instance_lock import TranscriberInstanceLock
 from dotty_transcriber.storage import JobInput, JobStore, PROVENANCE_PROTOCOL_VERSION
 
 
+def test_retranscribe_session_requeues_completed_audio_and_is_idempotent_while_running(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "queue.db")
+    store.enqueue(JobInput("session-one:chunk-a", "a.wav", "speaker", 0, "es"))
+    store.enqueue(JobInput("session-two:chunk-a", "b.wav", "speaker", 0, "es"))
+    store._connection().execute(
+        "UPDATE transcription_job SET status='completed', phase='completed', result_json='{}' WHERE id LIKE 'session-%'"
+    )
+
+    assert store.retranscribe_session("session-one") == {"state": "queued", "queued": 1, "total": 1}
+    assert store.get("session-one:chunk-a")["result"] is None
+    assert store.get("session-two:chunk-a")["status"] == "completed"
+    assert store.retranscribe_session("session-one") == {"state": "running", "queued": 0, "total": 1}
+    assert store.session_progress("session-one") == {"queued": 1, "processing": 0, "completed": 0, "failed": 0, "total": 1}
+
+
 def test_job_provenance_uses_the_held_lock_identity_and_does_not_retrofit_old_jobs(
     tmp_path: Path,
 ) -> None:

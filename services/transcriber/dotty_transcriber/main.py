@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -191,6 +193,8 @@ app = FastAPI(title="Dotty Transcriber", version="0.1.0", lifespan=lifespan)
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
+        "pid": os.getpid(),
+        "launch_id": os.environ.get("DOTTY_TRANSCRIBER_LAUNCH_ID"),
         "model": settings.model,
         "configured_device": settings.device,
         "active_device": engine.active_device,
@@ -303,6 +307,11 @@ def session_diagnostics(session_id: str) -> dict[str, Any]:
     return {"session_id": session_id, "report": diagnostics.read_session_report(session_id)}
 
 
+@app.get("/v1/sessions/{session_id}/progress", dependencies=[Depends(authorize)])
+def session_progress(session_id: str) -> dict[str, Any]:
+    return {"session_id": session_id, **store.session_progress(session_id)}
+
+
 @app.post("/v1/sessions/{session_id}/job-deletions", status_code=202,
           dependencies=[Depends(authorize)])
 def prepare_session_job_deletion(session_id: str, request: JobDeletionRequest) -> dict[str, Any]:
@@ -345,6 +354,59 @@ def retry_session_jobs(session_id: str) -> dict[str, Any]:
         metrics={"retried_jobs": retried},
     )
     return {"session_id": session_id, "retried": retried}
+
+
+@app.post("/v1/sessions/{session_id}/retranscribe", dependencies=[Depends(authorize)])
+def retranscribe_session(session_id: str) -> dict[str, Any]:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id) is None:
+        raise HTTPException(status_code=422, detail="Sesión inválida")
+    recording_dir = settings.recordings_dir / session_id
+    manifest_path = recording_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise HTTPException(status_code=404, detail="No se encontró la grabación de la sesión") from error
+    if manifest.get("sessionId") != session_id or manifest.get("status") not in ("completed", "interrupted"):
+        raise HTTPException(status_code=409, detail="Termina la grabación antes de rehacer la transcripción")
+    jobs = store.list_for_session(session_id)
+    if not jobs:
+        raise HTTPException(status_code=404, detail="No hay fragmentos para volver a transcribir")
+    regeneration_marker = recording_dir / ".transcription-regenerating"
+    already_running = any(job["status"] in ("queued", "processing") for job in jobs)
+    if already_running and not regeneration_marker.is_file():
+        raise HTTPException(status_code=409, detail="La transcripción de esta sesión ya está en curso")
+    allowed_audio_roots = (recording_dir.resolve(), (settings.data_dir / "recovered-audio" / session_id).resolve())
+    for job in jobs:
+        audio_path = Path(job["audio_path"]).resolve()
+        if not any(audio_path.is_relative_to(root) for root in allowed_audio_roots) or not audio_path.is_file():
+            raise HTTPException(status_code=409, detail="Falta audio original para rehacer esta sesión")
+
+    export_dir = settings.data_dir / "exports" / session_id
+    raw_path = export_dir / "transcript.raw.json"
+    backup_created = False
+    if not already_running and raw_path.is_file():
+        backup_path = export_dir / "transcript.raw.respaldo.json"
+        temporary = export_dir / f".transcript.raw.respaldo-{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copyfile(raw_path, temporary)
+            os.replace(temporary, backup_path)
+            backup_created = True
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    if not regeneration_marker.is_file():
+        regeneration_marker.write_text(f"{time.time()}\n", encoding="utf-8")
+    try:
+        result = store.retranscribe_session(session_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    for marker in (".transcription-ready", ".transcription-published", ".transcription-failed"):
+        (recording_dir / marker).unlink(missing_ok=True)
+    _record_diagnostic(
+        session_id, "retranscribe", "info", "Fragmentos de audio reenviados para rehacer el raw.",
+        metrics={"queued_jobs": result["queued"], "total_jobs": result["total"]},
+    )
+    return {"session_id": session_id, **result, "backup": backup_created}
 
 
 def _worker_loop() -> None:

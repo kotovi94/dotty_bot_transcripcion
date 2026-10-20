@@ -60,6 +60,10 @@ export class NarrativePublicationService {
     discordGuildId?: string,
   ): Promise<{ threadId?: string; messageCount: number; updated: boolean }> {
     const manifestPath = join(this.sessionDirectory(sessionId), "manifest.json");
+    if (await fs.access(join(this.sessionDirectory(sessionId), ".transcription-regenerating")).then(() => true).catch(() => false)
+      && !await fs.access(join(this.sessionDirectory(sessionId), ".transcription-ready")).then(() => true).catch(() => false)) {
+      throw new Error("La transcripción se está rehaciendo. Espera al nuevo raw y vuelve a generar el guion antes de publicar.");
+    }
     const attemptPath = join(this.sessionDirectory(sessionId), ".publication-attempt.json");
     if (await fs.access(attemptPath).then(() => true).catch(() => false)) {
       throw new Error("La publicación anterior quedó interrumpida. Comprueba los mensajes y el registro de publicación antes de reintentar para evitar duplicados.");
@@ -105,7 +109,7 @@ export class NarrativePublicationService {
     const existing = manifest.publication;
     // Discord and local disk cannot commit atomically. Preserve an intent before
     // the first mutation and fail closed after an ambiguous network outcome.
-    await writeFileAtomically(attemptPath, JSON.stringify({ sessionId, startedAt: new Date().toISOString(), state: "pending", publication: existing ?? null }));
+    await writeFileAtomically(attemptPath, JSON.stringify({ sessionId, startedAt: new Date().toISOString(), state: "pending", totalMessages: chunks.length, publication: existing ?? null }));
 
     if (existing !== undefined) {
       const updated = await this.updateExisting(existing, chunks, scriptAttachment, sessionId);
@@ -164,6 +168,7 @@ export class NarrativePublicationService {
           await message.edit(chunk);
         }
         nextIds.push(message.id);
+        await this.recordProgress(sessionId, { messageId: message.id });
       } else {
         const message = index === 0
           ? await channel.send({ content: chunk, files: [{ attachment: scriptAttachment, name: "guion.md" }] })
@@ -242,9 +247,11 @@ export class NarrativePublicationService {
       }
     }
 
+    const directMessages = splitMessage(`🎬 **${title} — Sesión ${manifest.sequenceNumber}**\n${chunks.join("\n")}`, 1_900);
+    await this.recordPublicationTotal(manifest.sessionId, directMessages.length);
     const messageIds = await sendChunks(
       voiceChannel as GuildTextBasedChannel,
-      splitMessage(`🎬 **${title} — Sesión ${manifest.sequenceNumber}**\n${chunks.join("\n")}`, 1_900),
+      directMessages,
       scriptAttachment,
       (id) => this.recordProgress(manifest.sessionId, { channelId: voiceChannel.id, messageId: id }),
     );
@@ -271,6 +278,12 @@ export class NarrativePublicationService {
     const attempt = JSON.parse(await fs.readFile(path, "utf8")) as { steps?: unknown[] };
     attempt.steps = [...(attempt.steps ?? []), progress];
     await writeFileAtomically(path, JSON.stringify(attempt));
+  }
+
+  private async recordPublicationTotal(sessionId: string, totalMessages: number): Promise<void> {
+    const path = join(this.sessionDirectory(sessionId), ".publication-attempt.json");
+    const attempt = JSON.parse(await fs.readFile(path, "utf8")) as Record<string, unknown>;
+    await writeFileAtomically(path, JSON.stringify({ ...attempt, totalMessages }));
   }
 
   private sessionDirectory(sessionId: string): string {

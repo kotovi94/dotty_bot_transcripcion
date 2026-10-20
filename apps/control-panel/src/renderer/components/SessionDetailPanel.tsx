@@ -34,6 +34,7 @@ interface SessionDetailPanelProps {
   setDraft: (value: string) => void;
   setEditing: (value: boolean) => void;
   narrativeBusy: "generate" | "verify" | "approve" | "publish" | null;
+  rawBusy: boolean;
   reviewSceneBusy: string | null;
   editorialState: EditorialLearningState | null;
   editorialComment: string;
@@ -43,6 +44,7 @@ interface SessionDetailPanelProps {
   onDecideEditorialRule: (ruleId: string, decision: "approve" | "reject" | "deprecate", scope?: EditorialScope) => void;
   onRollbackEditorialRule: (ruleId: string) => void;
   onGenerateNarrative: () => void;
+  onRegenerateRaw: () => void;
   onVerifyNarrative: () => void;
   onApproveNarrative: () => void;
   onApproveNarrativeScene: (sceneId: string) => void;
@@ -70,8 +72,9 @@ function reviewLabel(state: TranscriptDetail["narrativeReviewState"]): string {
   return "Sin verificar";
 }
 
-function reviewDescription(state: TranscriptDetail["narrativeReviewState"], pending: number): string {
+function reviewDescription(state: TranscriptDetail["narrativeReviewState"], pending: number, manualOverride: boolean): string {
   if (state === "APPROVED") return "El contenido está aprobado y puede publicarse en Discord.";
+  if (state === "READY_FOR_REVIEW" && manualOverride) return "Aceptaste la revisión manual de esta versión. La verificación automática aún señala errores; puedes aprobar el texto que revisaste para publicarlo.";
   if (state === "READY_FOR_REVIEW") return "Pasó los controles automáticos. Revisa los hechos, nombres y cantidades con la transcripción o el audio antes de aprobar: la verificación no garantiza fidelidad.";
   if (state === "NEEDS_REVIEW") return `${pending} ${pending === 1 ? "escena requiere" : "escenas requieren"} corrección o revisión antes de aprobar.`;
   return "Ejecuta la verificación editorial para preparar el guion.";
@@ -119,6 +122,7 @@ export function SessionDetailPanel({
   setDraft,
   setEditing,
   narrativeBusy,
+  rawBusy,
   reviewSceneBusy,
   editorialState,
   editorialComment,
@@ -128,6 +132,7 @@ export function SessionDetailPanel({
   onDecideEditorialRule,
   onRollbackEditorialRule,
   onGenerateNarrative,
+  onRegenerateRaw,
   onVerifyNarrative,
   onApproveNarrative,
   onApproveNarrativeScene,
@@ -167,10 +172,20 @@ export function SessionDetailPanel({
   }
 
   const narrativeAvailable = selected.narrativeContent !== null;
+  const rawStage = selected.processing?.stages.find((stage) => stage.id === "transcription");
   const review = selected.narrativeReview;
   const pendingScenes = review?.scenes.filter((scene) => scene.status === "NEEDS_REVIEW").length ?? 0;
   const approvedScenes = review?.scenes.filter((scene) => scene.status === "APPROVED").length ?? 0;
-  const reviewStateClass = review?.state === "APPROVED" ? "approved" : review?.state === "READY_FOR_REVIEW" ? "ready" : "blocked";
+  const manualAccepted = review?.mode === "manual"
+    && review.scenes.length === 1
+    && review.scenes[0]?.id === "manual"
+    && review.scenes[0].status === "APPROVED"
+    && !review.scenes[0].blockers.some((blocker) => blocker.code === "EMPTY_SCENE" || blocker.code === "MODEL_META_CONTAMINATION");
+  const effectiveReviewState = review?.state === "NEEDS_REVIEW" && manualAccepted
+    ? "READY_FOR_REVIEW"
+    : review?.state ?? null;
+  const reviewStateClass = effectiveReviewState === "APPROVED" ? "approved" : effectiveReviewState === "READY_FOR_REVIEW" ? "ready" : "blocked";
+  const manualOverride = review?.mode === "manual" && (!review.verification.valid || review.verification.errorCount > 0);
 
   const detailTabs: SessionDetailTab[] = ["summary", "transcript", "log", "narrative", "files"]; 
   if (selected.narrativeError) detailTabs.push("errors");
@@ -212,7 +227,7 @@ export function SessionDetailPanel({
                   <button disabled={narrativeBusy !== null || reviewSceneBusy !== null || !narrativeAvailable} onClick={onVerifyNarrative}>
                     <ClipboardCheck size={17} /> {narrativeBusy === "verify" ? "Verificando..." : "Verificar"}
                   </button>
-                  <button disabled={narrativeBusy !== null || reviewSceneBusy !== null || review?.state !== "READY_FOR_REVIEW"} onClick={onApproveNarrative}>
+                  <button disabled={narrativeBusy !== null || reviewSceneBusy !== null || effectiveReviewState !== "READY_FOR_REVIEW"} onClick={onApproveNarrative}>
                     <ShieldCheck size={17} /> {narrativeBusy === "approve" ? "Aprobando..." : "Aprobar"}
                   </button>
                   <button disabled={narrativeBusy !== null || reviewSceneBusy !== null || review?.state !== "APPROVED"} className="primary" onClick={onPublishNarrative}>
@@ -221,6 +236,11 @@ export function SessionDetailPanel({
                 </div>
               )}
               <div className="reader-action-group utility-actions">
+                {detailTab === "transcript" && (
+                  <button disabled={rawBusy || narrativeBusy !== null || selected.status !== "completed" && selected.status !== "interrupted" || selected.processing?.transcription.status === "running"} onClick={onRegenerateRaw} title="Volver a transcribir el audio original y conservar un solo respaldo del raw anterior">
+                    <RotateCcw size={17} /> {rawBusy ? "Iniciando..." : "Rehacer raw"}
+                  </button>
+                )}
                 {(detailTab === "transcript" || detailTab === "log" || detailTab === "narrative") && (
                   <button onClick={() => { if (detailTab === "narrative") onSwitchReaderMode("narrative"); setEditing(true); }}>
                     <Pencil size={17} /> Editar
@@ -264,6 +284,19 @@ export function SessionDetailPanel({
 
           {detailTab === "transcript" && (
             <div className="detail-content transcript-reader">
+              {rawStage?.status === "running" && rawStage.details.startsWith("Rehaciendo raw") && (
+                <div className="operation-progress" role="status">
+                  <div className="work-title"><strong>{rawStage.details}</strong><span>{rawStage.progress !== undefined ? `${Math.round(rawStage.progress * 100)}%` : "En curso"}</span></div>
+                  <div className="progress-track"><div style={{ width: `${Math.round((rawStage.progress ?? 0) * 100)}%` }} /></div>
+                  <small>El raw anterior permanece disponible. Al terminar, se reemplazará y el guion requerirá nueva revisión.</small>
+                </div>
+              )}
+              {rawStage?.status === "error" && rawStage.details.startsWith("Rehaciendo raw") && (
+                <div className="operation-progress" role="alert">
+                  <strong>La nueva transcripción encontró {rawStage.errors ?? 1} fragmento(s) con error.</strong>
+                  <small>El raw anterior sigue disponible. Cuando termine la cola, puedes volver a pulsar Rehacer raw.</small>
+                </div>
+              )}
               <div className="transcript-toolbar-inline">
                 <input value={transcriptSearch} onChange={(event) => onTranscriptSearchChange(event.target.value)} placeholder="Buscar texto o speaker..." />
                 <select value={speakerFilter} onChange={(event) => onSpeakerFilterChange(event.target.value)}>
@@ -303,12 +336,12 @@ export function SessionDetailPanel({
               {narrativeAvailable && (
                 <section className={`review-overview ${reviewStateClass}`}>
                   <div className="review-overview-icon">
-                    {review?.state === "APPROVED" ? <CheckCircle2 size={24} /> : review?.state === "READY_FOR_REVIEW" ? <ShieldCheck size={24} /> : <AlertTriangle size={24} />}
+                    {effectiveReviewState === "APPROVED" ? <CheckCircle2 size={24} /> : effectiveReviewState === "READY_FOR_REVIEW" ? <ShieldCheck size={24} /> : <AlertTriangle size={24} />}
                   </div>
                   <div className="review-overview-copy">
                     <span className="eyebrow">REVISIÓN DEL GUION</span>
-                    <h3>{reviewLabel(review?.state ?? null)}</h3>
-                    <p>{reviewDescription(review?.state ?? null, pendingScenes)}</p>
+                    <h3>{reviewLabel(effectiveReviewState)}</h3>
+                    <p>{reviewDescription(effectiveReviewState, pendingScenes, manualOverride)}</p>
                   </div>
                   <div className="review-overview-metrics">
                     <span><strong>{review?.scenes.length ?? 0}</strong> escenas</span>
@@ -343,7 +376,7 @@ export function SessionDetailPanel({
                             ) : scene.status === "NEEDS_REVIEW" ? (
                               <p className="scene-review-note">La auditoría no devolvió detalles estructurados o faltan evidencias trazables. Comprueba esta escena en el guion antes de aceptarla.</p>
                             ) : null}
-                            {scene.status === "NEEDS_REVIEW" && !scene.blockers.some((blocker) => blocker.code === "EMPTY_SCENE" || blocker.code === "MODEL_META_CONTAMINATION") && <button className="review-scene-button" disabled={reviewSceneBusy !== null || narrativeBusy !== null} onClick={() => onApproveNarrativeScene(scene.id)}><CheckCircle2 size={15} /> {reviewSceneBusy === scene.id ? "Guardando..." : scene.blockers.length > 0 ? "Aceptar con revisión humana" : "Aceptar revisión editorial"}</button>}
+                            {scene.status === "NEEDS_REVIEW" && !scene.blockers.some((blocker) => blocker.code === "EMPTY_SCENE" || blocker.code === "MODEL_META_CONTAMINATION") && <button className="review-scene-button" disabled={reviewSceneBusy !== null || narrativeBusy !== null} onClick={() => onApproveNarrativeScene(scene.id)}><CheckCircle2 size={15} /> {reviewSceneBusy === scene.id ? "Guardando..." : scene.id === "manual" ? "Aceptar revisión manual" : scene.blockers.length > 0 ? "Aceptar con revisión humana" : "Aceptar revisión editorial"}</button>}
                             {scene.status === "NEEDS_REVIEW" && scene.blockers.some((blocker) => blocker.code === "EMPTY_SCENE" || blocker.code === "MODEL_META_CONTAMINATION") && <p className="scene-regeneration-note"><AlertTriangle size={15} /> Edita y guarda el guion para revisarlo como versión manual, o regenera el guion completo.</p>}
                           </div>
                         </details>

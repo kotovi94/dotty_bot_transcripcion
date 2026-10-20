@@ -4,6 +4,9 @@ export function createLogger(level: string): pino.Logger {
   return pino({
     level,
     base: null,
+    serializers: {
+      error: pino.stdSerializers.err,
+    },
     redact: {
       paths: ["token", "DISCORD_TOKEN", "authorization", "req.headers.authorization"],
       censor: "[REDACTED]",

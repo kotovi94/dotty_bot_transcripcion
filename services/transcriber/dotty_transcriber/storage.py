@@ -939,6 +939,37 @@ class JobStore:
             connection.execute("ROLLBACK")
             raise
 
+    def retranscribe_session(self, session_id: str) -> dict[str, Any]:
+        """Queue every terminal job again, keeping the existing job identities."""
+        _validate_session_id(session_id)
+        escaped = session_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._assert_open(connection, session_id)
+            rows = connection.execute(
+                "SELECT status FROM transcription_job WHERE id LIKE ? ESCAPE '\\'",
+                (f"{escaped}:%",),
+            ).fetchall()
+            if not rows:
+                raise ValueError("No hay fragmentos de audio registrados para esta sesión")
+            if any(row["status"] in ("queued", "processing") for row in rows):
+                connection.execute("COMMIT")
+                return {"state": "running", "queued": 0, "total": len(rows)}
+            now = _now()
+            result = connection.execute(
+                """UPDATE transcription_job SET status='queued', phase='queued', progress=0,
+                processed_audio_seconds=0, audio_duration_seconds=NULL, attempts=0, error=NULL,
+                claim_token=NULL, started_at=NULL, completed_at=NULL, result_json=NULL, updated_at=?
+                WHERE id LIKE ? ESCAPE '\\' AND status IN ('completed','failed')""",
+                (now, f"{escaped}:%"),
+            )
+            connection.execute("COMMIT")
+            return {"state": "queued", "queued": result.rowcount, "total": len(rows)}
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
     def failed_sessions(self) -> list[dict[str, Any]]:
         rows = self._connection().execute(
             """SELECT substr(id,1,instr(id,':')-1) AS session_id,
@@ -956,6 +987,17 @@ class JobStore:
             (f"{escaped}:%",),
         ).fetchall()
         return [_serialize(row) for row in rows]
+
+    def session_progress(self, session_id: str) -> dict[str, int]:
+        _validate_session_id(session_id)
+        escaped = session_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self._connection().execute(
+            "SELECT status, COUNT(*) AS count FROM transcription_job WHERE id LIKE ? ESCAPE '\\' GROUP BY status",
+            (f"{escaped}:%",),
+        ).fetchall()
+        counts = {"queued": 0, "processing": 0, "completed": 0, "failed": 0}
+        counts.update({row["status"]: row["count"] for row in rows})
+        return {**counts, "total": sum(counts.values())}
 
     def delete_for_session(self, session_id: str) -> int:
         escaped = session_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

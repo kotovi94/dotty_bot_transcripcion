@@ -143,6 +143,7 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [readerMode, setReaderMode] = useState<"narrative" | "transcript">("narrative");
   const [narrativeBusy, setNarrativeBusy] = useState<"generate" | "verify" | "approve" | "publish" | null>(null);
+  const [rawBusy, setRawBusy] = useState(false);
   const [reviewSceneBusy, setReviewSceneBusy] = useState<string | null>(null);
   const [logKind, setLogKind] = useState<LogKind>("bot");
   const [logs, setLogs] = useState("Cargando actividad...");
@@ -233,17 +234,29 @@ export function App() {
   }, [page, logKind]);
 
   useEffect(() => {
-    if (!selected?.sessionId || (page !== "processing" && narrativeBusy !== "generate")) return;
+    if (!selected?.sessionId || (page !== "processing" && page !== "sessions" && narrativeBusy === null)) return;
     let active = true;
+    let sawRawRegeneration = false;
     const refreshProcessing = async () => {
       const processing = await window.dotty.getSessionProcessingStatus(selected.sessionId);
       if (!active) return;
+      const rawStage = processing.stages.find((stage) => stage.id === "transcription");
+      const regenerating = rawStage?.details.startsWith("Rehaciendo raw") ?? false;
+      if (regenerating) sawRawRegeneration = true;
       setSelected((current) => current?.sessionId === selected.sessionId
         ? { ...current, processing }
         : current);
       setSessionDetails((current) => current?.id === selected.sessionId
         ? { ...current, processing }
         : current);
+      if (sawRawRegeneration && !regenerating) {
+        sawRawRegeneration = false;
+        const refreshed = await window.dotty.readTranscript(selected.sessionId).catch(() => null);
+        if (active && refreshed) {
+          setSelected((current) => current?.sessionId === selected.sessionId ? refreshed : current);
+          setNotice("Raw actualizado. Revisa la nueva transcripción y regenera el guion si corresponde.");
+        }
+      }
     };
     void refreshProcessing();
     const timer = window.setInterval(() => void refreshProcessing(), 2_000);
@@ -379,6 +392,22 @@ export function App() {
     }
   };
 
+  const regenerateRaw = async () => {
+    if (!selected || rawBusy || narrativeBusy !== null) return;
+    setRawBusy(true);
+    try {
+      const result = await window.dotty.regenerateRaw(selected.sessionId);
+      setNotice(result.message);
+      const detail = await window.dotty.readTranscript(selected.sessionId);
+      setSelected(detail);
+      await loadTranscripts();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "No se pudo rehacer el raw.");
+    } finally {
+      setRawBusy(false);
+    }
+  };
+
   const verifyNarrative = async () => {
     if (!selected || narrativeBusy !== null) return;
     setNarrativeBusy("verify");
@@ -495,12 +524,23 @@ export function App() {
     ? state.operation.kind === "restart" ? "REINICIANDO" : state.operation.kind === "disconnect" || state.operation.kind === "stop" ? "DETENIENDO" : "INICIANDO"
     : systemOperational ? "OPERATIVO" : partiallyReady ? "ERROR" : "APAGADO";
 
-  const processingStages = useMemo(() => {
+  const processingStages = useMemo<Array<{ id: string; label: string; status: string; details: string; progress: number | undefined; current: number | undefined; total: number | undefined; errors: number; warnings: number; artifact: string | undefined }>>(() => {
     if (selected?.processing?.stages?.length) {
       return selected.processing.stages.map((stage) => ({
+        id: stage.id,
         label: stage.label,
-        status: stageStatusLabel(stage.status),
-        details: stage.details,
+        status: stage.id === "transcription" && working?.session_id === selected.sessionId && stage.status !== "completed"
+          ? "PROCESANDO" : stageStatusLabel(stage.status),
+        details: stage.id === "transcription" && working?.session_id === selected.sessionId && (working.session_total_jobs ?? 0) > 0
+          ? `${working.session_completed_jobs ?? 0} de ${working.session_total_jobs} fragmentos · ${working.session_failed_jobs ?? 0} fallidos`
+          : stage.details,
+        progress: stage.id === "transcription" && working?.session_id === selected.sessionId
+          ? working.session_progress ?? working.progress
+          : stage.progress,
+        current: stage.id === "transcription" && working?.session_id === selected.sessionId
+          ? working.session_completed_jobs : stage.current,
+        total: stage.id === "transcription" && working?.session_id === selected.sessionId
+          ? working.session_total_jobs : stage.total,
         errors: stage.errors ?? 0,
         warnings: stage.warnings ?? 0,
         artifact: stage.artifact,
@@ -517,13 +557,17 @@ export function App() {
     const publicationStatus = selected?.canOpenDiscord ? "COMPLETADO" : selected?.narrativeContent ? "PENDIENTE" : "DESCONOCIDO";
 
     return [
-      { label: "Grabación", status: state.bot.connected ? "COMPLETADO" : state.bot.running ? "PROCESANDO" : "DESCONOCIDO", details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
-      { label: "Transcripción", status: transcribeStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
-      { label: "Bitácora", status: logStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
-      { label: "Narrativa", status: narrativeStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
-      { label: "Publicación", status: publicationStatus, details: "Estado general", errors: 0, warnings: 0, artifact: undefined },
+      { id: "capture", label: "Grabación", status: state.bot.connected ? "COMPLETADO" : state.bot.running ? "PROCESANDO" : "DESCONOCIDO", details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
+      { id: "transcription", label: "Transcripción", status: transcribeStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
+      { id: "raw_quality", label: "Bitácora", status: logStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
+      { id: "assembly", label: "Narrativa", status: narrativeStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
+      { id: "publication", label: "Publicación", status: publicationStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
     ];
   }, [selected, state.bot.connected, state.bot.running, state.transcriber.available, transcripts, working]);
+  const completedStages = processingStages.filter((stage) => stage.status === "COMPLETADO").length;
+  const narrativeProgress = selected?.processing?.narrativeProgress ?? selected?.narrativeProgress ?? 0;
+  const narrativePhase = selected?.processing?.narrativePhase ?? selected?.narrativePhase ?? "Sin generar";
+  const publicationStage = selected?.processing?.stages.find((stage) => stage.id === "publication");
 
   if (!setupStatus) return <div className="setup-loading">Cargando configuración de Dotty...</div>;
   if (!setupStatus.configured) return <SetupWizard status={setupStatus} onComplete={(next) => { setSetupStatus(next); setPage("dashboard"); }} />;
@@ -554,6 +598,10 @@ export function App() {
         </header>
 
         {notice && <div className="notice"><Check size={17} /><span>{notice}</span><button aria-label="Cerrar aviso" onClick={() => setNotice("")}><X size={14} /></button></div>}
+        {narrativeBusy && selected && <div className="operation-progress" role="status">
+          <div className="work-title"><strong>{narrativeBusy === "generate" ? `Generando guion · ${narrativePhase}` : narrativeBusy === "publish" ? publicationStage?.details ?? "Publicando en Discord" : narrativeBusy === "verify" ? "Verificando el guion" : "Aprobando el guion"}</strong><span>{narrativeBusy === "generate" ? `${Math.round(narrativeProgress * 100)}%` : narrativeBusy === "publish" && publicationStage?.total ? `${publicationStage.current ?? 0}/${publicationStage.total}` : "En curso"}</span></div>
+          <div className={`progress-track ${narrativeBusy !== "generate" && !(narrativeBusy === "publish" && publicationStage?.progress !== undefined) ? "indeterminate" : ""}`}><div style={{ width: `${Math.round((narrativeBusy === "generate" ? narrativeProgress : publicationStage?.progress ?? 0) * 100)}%` }} /></div>
+        </div>}
 
         {page === "dashboard" && (
           <section className="page-content dashboard-page">
@@ -666,6 +714,7 @@ export function App() {
                 setDraft={setDraft}
                 setEditing={setEditing}
                 narrativeBusy={narrativeBusy}
+                rawBusy={rawBusy}
                 editorialState={editorialState}
                 editorialComment={editorialComment}
                 setEditorialComment={setEditorialComment}
@@ -674,6 +723,7 @@ export function App() {
                 onDecideEditorialRule={(ruleId, decision, scope) => void decideEditorialRule(ruleId, decision, scope)}
                 onRollbackEditorialRule={(ruleId) => void rollbackEditorialRule(ruleId)}
                 onGenerateNarrative={() => void generateNarrative()}
+                onRegenerateRaw={() => void regenerateRaw()}
                 onVerifyNarrative={() => void verifyNarrative()}
                 onApproveNarrative={() => void approveNarrative()}
                 onApproveNarrativeScene={(sceneId) => void approveNarrativeScene(sceneId)}
@@ -698,12 +748,20 @@ export function App() {
           <section className="page-content processing-page">
             <div className="panel compact-panel process-summary process-map">
               <div className="panel-heading"><div><span className="eyebrow">MAPA OPERATIVO</span><h3>{selected?.title ?? "Procesamiento del bot"}</h3><p>{selected ? `Sesión ${selected.sequenceNumber ?? selected.sessionId} · ${processingStages.length} controles visibles` : "Selecciona una sesión para inspeccionar cada etapa con datos reales."}</p></div><Activity size={18} /></div>
+              {selected && <div className="process-overall">
+                <div className="work-title"><strong>Avance de la sesión</strong><span>{completedStages} de {processingStages.length} etapas completadas</span></div>
+                <div className="progress-track" role="progressbar" aria-label="Etapas completadas" aria-valuenow={completedStages} aria-valuemin={0} aria-valuemax={processingStages.length}><div style={{ width: `${completedStages / processingStages.length * 100}%` }} /></div>
+                {(selected.processing ? selected.processing.state === "generating_narrative" : selected.narrativeState === "generating") && <>
+                  <div className="work-title"><strong>Guion · {narrativePhase}</strong><span>{Math.round(narrativeProgress * 100)}%</span></div>
+                  <div className="progress-track" role="progressbar" aria-label="Generación del guion" aria-valuenow={Math.round(narrativeProgress * 100)} aria-valuemin={0} aria-valuemax={100}><div style={{ width: `${narrativeProgress * 100}%` }} /></div>
+                </>}
+              </div>}
               <div className="process-stage-grid">
                 {processingStages.map((stage, index) => (
                   <article key={stage.label} className={`process-stage-card ${stage.status.toLowerCase()}`}>
                     <div className="process-stage-index">{String(index + 1).padStart(2, "0")}</div>
-                    <div className="process-stage-copy"><strong>{stage.label}</strong><span>{stage.details}</span>{stage.artifact && <code>{stage.artifact}</code>}</div>
-                    <div className="process-stage-state"><strong className={`badge ${stage.status.toLowerCase()}`}>{stage.status}</strong>{(stage.errors > 0 || stage.warnings > 0) && <small>{stage.errors > 0 ? `${stage.errors} errores` : ""}{stage.errors > 0 && stage.warnings > 0 ? " · " : ""}{stage.warnings > 0 ? `${stage.warnings} avisos` : ""}</small>}</div>
+                    <div className="process-stage-copy"><strong>{stage.label}</strong><span>{stage.details}</span><div className={`process-stage-track ${stage.status === "PROCESANDO" && stage.progress === undefined ? "indeterminate" : ""}`} role="progressbar" aria-label={stage.label} aria-valuenow={stage.status === "COMPLETADO" ? 100 : stage.progress === undefined ? undefined : Math.round(stage.progress * 100)} aria-valuemin={0} aria-valuemax={100}><div style={{ width: stage.status === "COMPLETADO" ? "100%" : `${Math.round(Math.max(0, Math.min(1, stage.progress ?? 0)) * 100)}%` }} /></div>{stage.artifact && <code>{stage.artifact}</code>}</div>
+                    <div className="process-stage-state"><strong className={`badge ${stage.status.toLowerCase()}`}>{stage.status}</strong>{stage.total !== undefined && stage.total > 0 && <small>{stage.current ?? 0}/{stage.total}</small>}{(stage.errors > 0 || stage.warnings > 0) && <small>{stage.errors > 0 ? `${stage.errors} errores` : ""}{stage.errors > 0 && stage.warnings > 0 ? " · " : ""}{stage.warnings > 0 ? `${stage.warnings} avisos` : ""}</small>}</div>
                   </article>
                 ))}
               </div>
@@ -751,7 +809,7 @@ export function App() {
                       </div>
                       <div className="issue-actions">
                         {issue.canRetry && <button disabled={maintenanceBusy !== null} onClick={() => void runMaintenance("retry-failed", issue.sessionId)}>Reintentar</button>}
-                        {issue.canRecover && <button className="primary" disabled={maintenanceBusy !== null} onClick={() => void runMaintenance("recover-session", issue.sessionId)}>Recuperar</button>}
+                        {issue.canRecover && <button className="primary" disabled={maintenanceBusy !== null} onClick={() => void runMaintenance("recover-session", issue.sessionId)}>Recuperar y transcribir</button>}
                       </div>
                     </div>
                   ))

@@ -160,6 +160,59 @@ describe("narrative review gate", () => {
     }
   });
 
+  it("allows an explicitly reviewed manual guion despite a format verification error", async () => {
+    const invalidVerification: VerificationReport = {
+      valid: false,
+      checkedAt: "2026-10-20T08:00:00.000Z",
+      issues: [{
+        type: "format",
+        severity: "error",
+        fragment: "Introducción",
+        reason: "Falta la estructura obligatoria de título y escenas.",
+        evidenceLevel: "explicit",
+        confidence: 1,
+      }],
+    };
+    const root = await createFixture({ auditValid: true, verification: invalidVerification });
+    const manualScript = "Introducción a la sesión.\n\nAda abre la puerta y el grupo continúa con la historia revisada manualmente.";
+    try {
+      await writeFile(join(root, "guion.md"), manualScript, "utf8");
+      const initial = await refreshNarrativeReview(root, "session-manual", invalidVerification);
+      assert.equal(initial.mode, "manual");
+      assert.equal(initial.state, "NEEDS_REVIEW");
+      await assert.rejects(() => approveNarrativeReview(root, "session-manual", "test"), /errores de verificación/u);
+
+      const reviewed = await approveNarrativeScene(root, "session-manual", "manual", "test-reviewer");
+      assert.equal(reviewed.state, "READY_FOR_REVIEW");
+      assert.equal(reviewed.scenes[0]?.approvedBy, "test-reviewer");
+      const reverified = await refreshNarrativeReview(root, "session-manual", invalidVerification);
+      assert.equal(reverified.state, "READY_FOR_REVIEW");
+
+      const approved = await approveNarrativeReview(root, "session-manual", "test");
+      assert.equal(approved.state, "APPROVED");
+      await assertNarrativeApproved(root, "session-manual");
+      assert.equal((await refreshNarrativeReview(root, "session-manual", invalidVerification)).state, "APPROVED");
+
+      await writeFile(join(root, "guion.md"), `${manualScript}\nCambio posterior.`, "utf8");
+      await assert.rejects(() => assertNarrativeApproved(root, "session-manual"), /cambió después de aprobarse/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps model reasoning blocked in a manually edited guion", async () => {
+    const root = await createFixture({ auditValid: true, verification: validVerification });
+    try {
+      await writeFile(join(root, "guion.md"), "The user provided a transcript. I need to analyze it before writing the answer.", "utf8");
+      const review = await refreshNarrativeReview(root, "session-manual-meta", validVerification);
+      assert.equal(review.state, "NEEDS_REVIEW");
+      assert.ok(review.scenes[0]?.blockers.some((blocker) => blocker.code === "MODEL_META_CONTAMINATION"));
+      await assert.rejects(() => approveNarrativeScene(root, "session-manual-meta", "manual", "test"), /bloqueos estructurales/u);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps an existing approval when verification is repeated without changing the script", async () => {
     const root = await createFixture({ auditValid: true, verification: validVerification });
     try {
