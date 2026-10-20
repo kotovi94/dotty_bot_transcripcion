@@ -80,7 +80,7 @@ export class DottySupervisor {
     process: ChildProcessWithoutNullStreams;
   } | null = null;
 
-  constructor(readonly projectRoot: string) {
+  constructor(readonly projectRoot: string, private readonly spawnOperation: typeof spawn = spawn) {
     this.dataRoot = join(projectRoot, "data");
     this.exportsRoot = join(this.dataRoot, "exports");
     this.recordingsRoot = join(this.dataRoot, "recordings");
@@ -237,7 +237,7 @@ export class DottySupervisor {
       disconnect: "stop-dotty.ps1",
     };
     const scriptPath = join(this.projectRoot, "tools", scriptNames[kind]);
-    const child = spawn(
+    const child = this.spawnOperation(
       "powershell.exe",
       ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
       {
@@ -268,7 +268,7 @@ export class DottySupervisor {
       await writeFile(join(this.dataRoot, "desktop-panel.log"), output, "utf8").catch(
         () => undefined,
       );
-      if (kind === "disconnect") await this.cleanDottyArtifacts();
+      if (kind === "disconnect" && code === 0) await this.cleanDottyArtifacts();
       this.operation = null;
     });
     child.once("error", async (error) => {
@@ -300,12 +300,8 @@ export class DottySupervisor {
   }
 
   private async cleanDottyArtifacts(): Promise<void> {
-    await Promise.all([
-      "dotty.pid",
-      "transcriber.pid",
-      "ollama.pid",
-      "dotty.status.json",
-    ].map((name) => rm(join(this.dataRoot, name), { force: true })));
+    // stop-dotty.ps1 owns process references and removes them only after
+    // verifying that the corresponding shutdown completed.
     await rm(join(this.exportsRoot, ".narrative-engine.lock"), { force: true });
     const entries = await readdir(this.exportsRoot, { withFileTypes: true }).catch(() => [] as Dirent[]);
     await Promise.all(

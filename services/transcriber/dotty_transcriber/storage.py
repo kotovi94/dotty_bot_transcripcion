@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .instance_lock import TranscriberInstanceLock
 
@@ -939,7 +939,9 @@ class JobStore:
             connection.execute("ROLLBACK")
             raise
 
-    def retranscribe_session(self, session_id: str) -> dict[str, Any]:
+    def retranscribe_session(
+        self, session_id: str, *, on_accepted: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         """Queue every terminal job again, keeping the existing job identities."""
         _validate_session_id(session_id)
         escaped = session_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -953,9 +955,19 @@ class JobStore:
             ).fetchall()
             if not rows:
                 raise ValueError("No hay fragmentos de audio registrados para esta sesión")
+            if connection.execute(
+                """SELECT 1 FROM worker_occupation WHERE released_at IS NULL
+                AND (session_id=? OR job_id LIKE ? ESCAPE '\\') LIMIT 1""",
+                (session_id, f"{escaped}:%"),
+            ).fetchone() is not None:
+                raise ValueError("Hay una ocupación activa; se requiere reconciliación antes de retranscribir")
             if any(row["status"] in ("queued", "processing") for row in rows):
                 connection.execute("COMMIT")
                 return {"state": "running", "queued": 0, "total": len(rows)}
+            if any(row["status"] not in ("completed", "failed") for row in rows):
+                raise ValueError("La sesión contiene trabajos en un estado no retranscribible")
+            if on_accepted is not None:
+                on_accepted()
             now = _now()
             result = connection.execute(
                 """UPDATE transcription_job SET status='queued', phase='queued', progress=0,

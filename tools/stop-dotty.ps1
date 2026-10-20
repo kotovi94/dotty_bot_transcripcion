@@ -128,7 +128,8 @@ foreach ($pidFile in @("dotty.pid", "transcriber.pid", "ollama.pid")) {
 }
 
 foreach ($processId in ($servicePids | Select-Object -Unique)) {
-  if ($null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+  $processToStop = Get-Process -Id $processId -ErrorAction SilentlyContinue
+  if ($null -ne $processToStop) {
     # Never trust a PID alone: Windows may have reused it for another program.
     $ownedProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$processId"
     $commandLine = [string]$ownedProcess.CommandLine
@@ -145,6 +146,11 @@ foreach ($processId in ($servicePids | Select-Object -Unique)) {
     }
     & taskkill.exe /PID $processId /T /F 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "No se pudo detener el servicio $processId." }
+    # Wait on the original process handle: a successful taskkill invocation or
+    # a later PID lookup does not prove that this process has exited.
+    if (-not $processToStop.WaitForExit(15000) -or -not $processToStop.HasExited) {
+      throw "El servicio $processId sigue activo tras solicitar su terminacion; se conservaran las referencias."
+    }
     $stopped += 1
   }
 }

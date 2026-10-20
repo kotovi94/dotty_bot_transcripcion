@@ -375,6 +375,8 @@ def retranscribe_session(session_id: str) -> dict[str, Any]:
     already_running = any(job["status"] in ("queued", "processing") for job in jobs)
     if already_running and not regeneration_marker.is_file():
         raise HTTPException(status_code=409, detail="La transcripción de esta sesión ya está en curso")
+    if not already_running and regeneration_marker.is_file():
+        raise HTTPException(status_code=409, detail="La regeneración anterior aún no terminó")
     allowed_audio_roots = (recording_dir.resolve(), (settings.data_dir / "recovered-audio" / session_id).resolve())
     for job in jobs:
         audio_path = Path(job["audio_path"]).resolve()
@@ -384,24 +386,50 @@ def retranscribe_session(session_id: str) -> dict[str, Any]:
     export_dir = settings.data_dir / "exports" / session_id
     raw_path = export_dir / "transcript.raw.json"
     backup_created = False
-    if not already_running and raw_path.is_file():
-        backup_path = export_dir / "transcript.raw.respaldo.json"
-        temporary = export_dir / f".transcript.raw.respaldo-{uuid.uuid4().hex}.tmp"
+    stale_markers = {}
+    for name in (".transcription-ready", ".transcription-published", ".transcription-failed"):
+        path = recording_dir / name
         try:
-            shutil.copyfile(raw_path, temporary)
-            os.replace(temporary, backup_path)
-            backup_created = True
-        finally:
-            temporary.unlink(missing_ok=True)
+            stale_markers[path] = path.stat()
+        except FileNotFoundError:
+            pass
 
-    if not regeneration_marker.is_file():
-        regeneration_marker.write_text(f"{time.time()}\n", encoding="utf-8")
+    def prepare_artifacts() -> None:
+        nonlocal backup_created
+        marker_content = f"{time.time()}-{uuid.uuid4().hex}\n"
+        try:
+            with regeneration_marker.open("x", encoding="utf-8") as marker:
+                marker.write(marker_content)
+        except FileExistsError as error:
+            raise ValueError("La regeneración anterior aún no terminó") from error
+        try:
+            if raw_path.is_file():
+                backup_path = export_dir / "transcript.raw.respaldo.json"
+                temporary = export_dir / f".transcript.raw.respaldo-{uuid.uuid4().hex}.tmp"
+                try:
+                    shutil.copyfile(raw_path, temporary)
+                    os.replace(temporary, backup_path)
+                    backup_created = True
+                finally:
+                    temporary.unlink(missing_ok=True)
+            for path, observed in stale_markers.items():
+                try:
+                    current = path.stat()
+                except FileNotFoundError:
+                    continue
+                if (current.st_ino, current.st_ctime_ns, current.st_mtime_ns, current.st_size) == (
+                    observed.st_ino, observed.st_ctime_ns, observed.st_mtime_ns, observed.st_size
+                ):
+                    path.unlink(missing_ok=True)
+        except BaseException:
+            if regeneration_marker.read_text(encoding="utf-8") == marker_content:
+                regeneration_marker.unlink(missing_ok=True)
+            raise
+
     try:
-        result = store.retranscribe_session(session_id)
+        result = store.retranscribe_session(session_id, on_accepted=prepare_artifacts)
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    for marker in (".transcription-ready", ".transcription-published", ".transcription-failed"):
-        (recording_dir / marker).unlink(missing_ok=True)
     _record_diagnostic(
         session_id, "retranscribe", "info", "Fragmentos de audio reenviados para rehacer el raw.",
         metrics={"queued_jobs": result["queued"], "total_jobs": result["total"]},
