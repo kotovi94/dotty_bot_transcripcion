@@ -130,23 +130,18 @@ describe("coordinated transcription dispatch", () => {
     });
   }
 
-  it("keeps delete behind POST and its accepted marker", async (test) => {
+  it("releases the session lock during POST while retaining uncertain dispatch evidence", async (test) => {
     const f = await fixture(test);
     const posted = gate(); const release = gate();
     test.mock.method(globalThis, "fetch", async () => { posted.release(); await release.promise; return new Response(null, { status: 200 }); });
     const dispatching = f.dispatcher.dispatchCompleted();
     await posted.promise;
-    let deleted = false;
-    const deleting = f.coordinator.runExclusive("session-1", async () => {
-      await access(f.path("session-1", ".transcription-jobs/chunk-1"));
-      f.sessions.delete("session-1");
-      await rm(join(f.recordings, "session-1"), { recursive: true });
-      deleted = true;
+    await f.coordinator.runExclusive("session-1", async () => {
+      await access(f.path("session-1", ".transcription-jobs/chunk-1.posting"));
     });
-    assert.equal(deleted, false);
-    release.release(); await dispatching; await deleting;
-    assert.equal(deleted, true);
-    await assert.rejects(access(join(f.recordings, "session-1")));
+    await assert.rejects(f.admin.delete("session-1", "guild-1"), /aceptación incierta/);
+    release.release(); await dispatching;
+    await access(f.path("session-1", ".transcription-jobs/chunk-1"));
   });
 
   it("makes administrative delete wait for the accepted POST, then preserves WAV", async (test) => {
@@ -161,7 +156,7 @@ describe("coordinated transcription dispatch", () => {
     const dispatching = f.dispatcher.dispatchCompleted();
     await posted.promise;
     const deleting = f.admin.delete("session-1", "guild-1");
-    const deletionResult = assert.rejects(deleting, /protocolo de inactividad Python/);
+    const deletionResult = assert.rejects(deleting, /aceptación incierta/);
     assert.deepEqual(calls, ["POST"]);
     release.release(); await dispatching; await deletionResult;
     assert.deepEqual(calls, ["POST"]);
@@ -170,11 +165,11 @@ describe("coordinated transcription dispatch", () => {
 
   it("makes reprocess wait for a POST", async (test) => {
     const f = await fixture(test);
-    const posted = gate(); const releasePost = gate(); const preparing = gate(); const releasePrepare = gate();
+    const posted = gate(); const releasePost = gate();
     const calls: string[] = [];
     test.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       if (String(input).endsWith("/job-deletions")) {
-        calls.push("PREPARE"); preparing.release(); await releasePrepare.promise;
+        calls.push("PREPARE");
         return prepared(init);
       }
       calls.push("POST"); posted.release(); await releasePost.promise;
@@ -184,10 +179,9 @@ describe("coordinated transcription dispatch", () => {
     await posted.promise;
     const reprocessing = f.admin.reprocess("session-1", "guild-1");
     assert.deepEqual(calls, ["POST"]);
-    releasePost.release(); await firstDispatch; await preparing.promise;
-    assert.deepEqual(calls, ["POST", "PREPARE"]);
-    releasePrepare.release(); await reprocessing;
-    assert.deepEqual(calls, ["POST", "PREPARE"]);
+    await assert.rejects(reprocessing, /aceptación incierta/);
+    releasePost.release(); await firstDispatch;
+    assert.deepEqual(calls, ["POST"]);
     await access(f.path("session-1", ".transcription-enqueued"));
   });
 
@@ -211,24 +205,60 @@ describe("coordinated transcription dispatch", () => {
   });
 
   for (const outcome of ["timeout", "conflict"] as const) {
-    it(`blocks rebuilt POST after ${outcome}`, async (test) => {
+    it(`replays the durable identical POST after ${outcome}`, async (test) => {
       const f = await fixture(test);
-      let posts = 0;
-      test.mock.method(globalThis, "fetch", async () => {
-        posts++;
+      const bodies: string[] = [];
+      test.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        bodies.push(String(init?.body));
         if (outcome === "timeout") throw new DOMException("timeout", "TimeoutError");
         return new Response(null, { status: 409 });
       });
       await f.dispatcher.dispatchCompleted();
       await access(f.path("session-1", ".transcription-jobs/chunk-1.posting"));
       await f.restart().dispatchCompleted();
-      assert.equal(posts, 1);
+      assert.equal(bodies.length, 2);
+      assert.equal(bodies[0], bodies[1]);
       await assert.rejects(access(f.path("session-1", ".transcription-enqueued")));
       await assert.rejects(f.admin.delete("session-1", "guild-1"), /aceptación incierta/);
       await assert.rejects(f.admin.reprocess("session-1", "guild-1"), /aceptación incierta/);
       assert.equal((await readFile(f.path("session-1", "audio.wav"))).length, 48);
     });
   }
+
+  it("reconciles a lost HTTP response after restart without duplicating the job", async (test) => {
+    const f = await fixture(test);
+    const accepted = new Map<string, string>();
+    let attempts = 0;
+    test.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const body = String(init?.body);
+      const id = (JSON.parse(body) as { id: string }).id;
+      const previous = accepted.get(id);
+      if (previous !== undefined) assert.equal(body, previous);
+      accepted.set(id, body);
+      attempts++;
+      if (attempts === 1) throw new DOMException("lost response", "TimeoutError");
+      return new Response(null, { status: 200 });
+    });
+    await f.dispatcher.dispatchCompleted();
+    await access(f.path("session-1", ".transcription-jobs/chunk-1.posting"));
+    await f.restart().dispatchCompleted();
+    assert.equal(attempts, 2);
+    assert.equal(accepted.size, 1);
+    await access(f.path("session-1", ".transcription-jobs/chunk-1"));
+    await access(f.path("session-1", ".transcription-enqueued"));
+    await assert.rejects(access(f.path("session-1", ".transcription-jobs/chunk-1.posting")));
+  });
+
+  it("never guesses the request behind a legacy date-only posting marker", async (test) => {
+    const f = await fixture(test);
+    await mkdir(f.path("session-1", ".transcription-jobs"));
+    await writeFile(f.path("session-1", ".transcription-jobs/chunk-1.posting"), "2026-01-01T00:00:00.000Z\n");
+    let posts = 0;
+    test.mock.method(globalThis, "fetch", async () => { posts++; return new Response(null, { status: 200 }); });
+    await f.dispatcher.dispatchCompleted();
+    assert.equal(posts, 0);
+    await access(f.path("session-1", ".transcription-jobs/chunk-1.posting"));
+  });
 
   it("keeps .posting if an accepted job marker cannot be persisted, including after restart", async (test) => {
     const f = await fixture(test);

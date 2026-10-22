@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -24,6 +24,10 @@ from .engine import WhisperEngine
 from .error_codes import classify_transcription_error
 from .storage import JobInput, JobStore
 from .instance_lock import InstanceLockError, TranscriberInstanceLock, reject_unsupported_process_mode
+from .session_file_coordinator import (
+    SessionCoordinationError, SessionFileCoordinator, SessionLockConflict,
+    SessionLockPermissionError, SessionLockTimeout,
+)
 from .voice_processing import AdaptiveVoiceProcessor, VoiceAnalysis
 
 logger = logging.getLogger("dotty.transcriber")
@@ -218,8 +222,9 @@ def enqueue(request: JobRequest) -> dict[str, Any]:
     try:
         payload = request.model_dump()
         payload["audio_path"] = str(audio_path)
-        job = store.enqueue(JobInput(**payload))
         session_id = _session_id(request.id)
+        with _session_mutation_lock(session_id):
+            job = store.enqueue(JobInput(**payload))
         _record_diagnostic(
             session_id,
             "queue",
@@ -257,7 +262,8 @@ def get_job_diagnostics(job_id: str) -> dict[str, Any]:
 
 @app.post("/v1/jobs/{job_id}/retry", dependencies=[Depends(authorize)])
 def retry_job(job_id: str) -> dict[str, Any]:
-    job = store.retry(job_id)
+    with _session_mutation_lock(_session_id(job_id)):
+        job = store.retry(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     _record_diagnostic(
@@ -318,9 +324,12 @@ def prepare_session_job_deletion(session_id: str, request: JobDeletionRequest) -
     if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id) is None:
         raise HTTPException(status_code=422, detail={"code": "INVALID_SESSION_ID"})
     try:
-        operation = store.prepare_job_deletion(
-            request.operation_id, session_id, request.operation_type, request.parameters,
-        )
+        with _session_mutation_lock(session_id):
+            operation = store.prepare_job_deletion(
+                request.operation_id, session_id, request.operation_type, request.parameters,
+            )
+    except HTTPException:
+        raise
     except Exception as error:
         raise _deletion_store_error(error) from error
     return _deletion_projection(operation)
@@ -345,7 +354,8 @@ def delete_session_jobs(session_id: str) -> dict[str, Any]:
 
 @app.post("/v1/sessions/{session_id}/retry", dependencies=[Depends(authorize)])
 def retry_session_jobs(session_id: str) -> dict[str, Any]:
-    retried = store.retry_failed_for_session(session_id)
+    with _session_mutation_lock(session_id):
+        retried = store.retry_failed_for_session(session_id)
     _record_diagnostic(
         session_id,
         "retry",
@@ -360,6 +370,27 @@ def retry_session_jobs(session_id: str) -> dict[str, Any]:
 def retranscribe_session(session_id: str) -> dict[str, Any]:
     if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id) is None:
         raise HTTPException(status_code=422, detail="Sesión inválida")
+    with _session_mutation_lock(session_id):
+        return _retranscribe_session_locked(session_id)
+
+
+@contextmanager
+def _session_mutation_lock(session_id: str):
+    try:
+        coordinator = SessionFileCoordinator(settings.data_dir, node_data_dir=configured_data_dir())
+        with coordinator.acquire(session_id, timeout_ms=4_000):
+            yield
+    except SessionLockTimeout as error:
+        raise HTTPException(status_code=423, detail={"code": "SESSION_LOCK_TIMEOUT"}) from error
+    except SessionLockConflict as error:
+        raise HTTPException(status_code=409, detail={"code": "SESSION_LOCK_CONFLICT"}) from error
+    except SessionLockPermissionError as error:
+        raise HTTPException(status_code=503, detail={"code": "SESSION_LOCK_PERMISSION"}) from error
+    except SessionCoordinationError as error:
+        raise HTTPException(status_code=503, detail={"code": "SESSION_LOCK_CONFIGURATION"}) from error
+
+
+def _retranscribe_session_locked(session_id: str) -> dict[str, Any]:
     recording_dir = settings.recordings_dir / session_id
     manifest_path = recording_dir / "manifest.json"
     try:

@@ -20,6 +20,7 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
 let pollTimer: NodeJS.Timeout | null = null;
+let statePollRunning = false;
 let progressPollTimer: NodeJS.Timeout | null = null;
 let progressPollRunning = false;
 let progressBaselineReady = false;
@@ -115,7 +116,7 @@ function createWindow(): void {
       sandbox: true,
     },
   });
-  void mainWindow.loadFile(resolve(__dirname, "../../renderer/index.html"));
+  void mainWindow.loadFile(resolve(__dirname, "../../../../../renderer/index.html"));
   mainWindow.once("ready-to-show", () => mainWindow?.show());
   mainWindow.on("close", (event) => {
     if (!quitting) {
@@ -239,6 +240,7 @@ function registerIpc(): void {
     },
   );
   ipcMain.handle("dotty:setup-status", () => setupManager.getStatus());
+  ipcMain.handle("dotty:setup-safety", (_event, config: SetupConfig) => setupManager.getSafety(config));
   ipcMain.handle("dotty:setup-browse", async (_event, kind: SetupBrowseKind) => {
     if (!['python', 'npm', 'data'].includes(kind)) throw new Error("Selector no permitido.");
     const options: Electron.OpenDialogOptions = {
@@ -266,9 +268,13 @@ function registerIpc(): void {
 }
 
 async function broadcastState(): Promise<void> {
-  const state = await supervisor.getState();
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("dotty:state", state);
+  if (statePollRunning) return;
+  statePollRunning = true;
+  try {
+    const state = await supervisor.getState();
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("dotty:state", state);
+  } finally {
+    statePollRunning = false;
   }
 }
 

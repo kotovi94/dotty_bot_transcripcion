@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
@@ -28,10 +29,12 @@ import {
 import type { AdaptiveVocabularyStore } from "./adaptive-vocabulary.ts";
 import { baseTranscriptionVocabulary } from "./base-vocabulary.ts";
 import { writeFileAtomically } from "../recording/atomic-json-file.ts";
+import { createReadyMarker, jobsDigest, parseReadyMarker, serializeReadyMarker, transcriptDigest, verifyReadyMarker } from "../../../../packages/shared/src/transcription-ready.ts";
 
 interface TranscriptionJob {
   readonly id: string;
   readonly status: string;
+  readonly completed_at: string | null;
   readonly speaker_user_id: string;
   readonly start_offset_ms: number;
   readonly error?: string | null;
@@ -142,8 +145,6 @@ export class TranscriptionPublisher {
     const failedMarker = join(directory, ".transcription-failed");
     if (
       await exists(publishedMarker) ||
-      await exists(readyMarker) ||
-      await exists(failedMarker) ||
       !(await exists(join(directory, ".transcription-enqueued")))
     ) return;
     const manifestText = await fs.readFile(join(directory, "manifest.json"), "utf8");
@@ -179,6 +180,7 @@ export class TranscriptionPublisher {
       });
       const failedJobs = payload.jobs.filter((job) => job.status === "failed");
       if (failedJobs.length > 0) {
+        if (await markerExists(failedMarker)) return;
         this.logger.error(
           { sessionId: manifest.sessionId, failedJobs: failedJobs.map((j) => ({ id: j.id, error: j.error })) },
           "Transcription jobs failed; abandoning session",
@@ -206,6 +208,25 @@ export class TranscriptionPublisher {
         return;
       }
       if (payload.jobs.some((job) => job.status !== "completed" || job.result === null)) return;
+      const publishedJobsDigest = jobsDigest(sessionId, payload.jobs);
+      const existingReady = await fs.readFile(readyMarker, "utf8").catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
+      const regenerating = await markerExists(join(directory, ".transcription-regenerating"));
+      if (existingReady !== null) {
+        const parsed = parseReadyMarker(existingReady);
+        if (parsed.kind !== "verifiable" && !regenerating) return;
+        if (parsed.kind === "verifiable" && parsed.marker.session_id !== sessionId) return;
+        const existingTranscript = await fs.readFile(join(this.exportsRoot, sessionId, "bitacora.md")).catch(() => null);
+        if (parsed.kind === "verifiable" && existingTranscript !== null &&
+          verifyReadyMarker(existingReady, sessionId, payload.jobs, existingTranscript) === "verified" && !regenerating) return;
+        if (parsed.kind === "verifiable" && existingTranscript !== null &&
+          transcriptDigest(existingTranscript) !== parsed.marker.transcript_digest && !regenerating) return;
+        // A changed bitácora with unchanged jobs may contain a manual revision.
+        if (parsed.kind === "verifiable" && parsed.marker.jobs_digest === publishedJobsDigest && !regenerating) return;
+        await preservePriorPublication(this.exportsRoot, sessionId, existingReady);
+      }
 
     const corrections = [
       ...(await loadTranscriptCorrections(join(dirname(this.recordingsRoot), "campaigns", manifest.campaignId))),
@@ -424,7 +445,20 @@ export class TranscriptionPublisher {
     if (activatedTerms.length > 0) {
       this.logger.info({ campaignId: manifest.campaignId, terms: activatedTerms }, "Vocabulario adaptativo actualizado");
     }
-    await fs.writeFile(readyMarker, `${new Date().toISOString()}\n`, { flag: "wx" });
+    // The artifacts above and the marker below must describe the same job snapshot.
+    // Python may accept a direct retry while the bot holds its own session lock.
+    const latestResponse = await fetch(new URL(`/v1/sessions/${encodeURIComponent(sessionId)}`, this.baseUrl), {
+      headers: { authorization: `Bearer ${this.secret}` },
+      signal: AbortSignal.timeout(4_000),
+    });
+    if (!latestResponse.ok) throw new Error(`Could not recheck transcription jobs: HTTP ${latestResponse.status}`);
+    const latestPayload = (await latestResponse.json()) as { jobs?: TranscriptionJob[] };
+    if (!Array.isArray(latestPayload.jobs) || jobsDigest(sessionId, latestPayload.jobs) !== publishedJobsDigest) {
+      throw new Error("Transcription jobs changed during publication");
+    }
+    const finalTranscriptBytes = await fs.readFile(markdownPath);
+    const marker = createReadyMarker(sessionId, payload.jobs, finalTranscriptBytes, new Date().toISOString());
+    await writeReadyMarker(readyMarker, serializeReadyMarker(marker), existingReady);
     await fs.rm(join(directory, ".transcription-regenerating"), { force: true });
     this.logger.info(
       { sessionId: manifest.sessionId },
@@ -479,8 +513,6 @@ export class TranscriptionPublisher {
       !Array.isArray(manifest.clips) ||
       !Array.isArray(payload.jobs) || payload.jobs.length !== manifest.chunks.length) return false;
     if (!(await markerExists(join(directory, ".transcription-enqueued"))) ||
-      await markerExists(join(directory, ".transcription-ready")) ||
-      await markerExists(join(directory, ".transcription-failed")) ||
       await markerExists(join(directory, ".transcription-published"))) return false;
     const jobDirectory = join(directory, ".transcription-jobs");
     const entries = await fs.readdir(jobDirectory).catch((error: NodeJS.ErrnoException) => {
@@ -498,7 +530,7 @@ export class TranscriptionPublisher {
       const job = payload.jobs.find((candidate) => candidate.id === id);
       if (job === undefined || job.speaker_user_id !== chunk.speakerUserId ||
         job.start_offset_ms !== chunk.startedOffsetMs ||
-        !(await markerExists(join(jobDirectory, chunk.id)))) return false;
+        !(await regularMarkerExists(join(jobDirectory, chunk.id)))) return false;
     }
     return payload.jobs.every((job) => ids.has(job.id));
   }
@@ -762,6 +794,76 @@ async function markerExists(path: string): Promise<boolean> {
   }
 }
 
+async function regularMarkerExists(path: string): Promise<boolean> {
+  try { return (await fs.lstat(path)).isFile(); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function writeAtomically(path: string, content: string): Promise<void> {
   await writeFileAtomically(path, content);
+}
+
+async function writeReadyMarker(path: string, content: string, expectedPrevious: string | null): Promise<void> {
+  const temporary = `${path}.${process.pid}-${randomUUID()}.tmp`;
+  await fs.writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+  try {
+    const current = await fs.readFile(path, "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (current !== expectedPrevious) throw new Error("Transcription ready marker changed during publication");
+    // The shared session lock excludes cooperative Node and Python mutators.
+    // Same-directory rename replaces the marker atomically where supported.
+    await fs.rename(temporary, path);
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+async function preservePriorPublication(exportsRoot: string, sessionId: string, marker: string): Promise<void> {
+  const exported = join(exportsRoot, sessionId);
+  const identity = createHash("sha256").update(marker).digest("hex");
+  const history = join(exported, "publication-history", identity);
+  await fs.mkdir(join(exported, "publication-history"), { recursive: true });
+  try { await fs.mkdir(history); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (await fs.readFile(join(history, ".complete"), "utf8").catch(() => null) !== `${identity}\n` ||
+      await fs.readFile(join(history, ".transcription-ready"), "utf8").catch(() => null) !== marker) {
+      throw new Error("Incomplete historical publication backup requires inspection");
+    }
+    // A panel edit made after an interrupted attempt is also retained before retry.
+    for (const [name, extension] of [["bitacora.md", "md"], ["transcript.raw.json", "json"]] as const) {
+      const current = await fs.readFile(join(exported, name)).catch((readError: NodeJS.ErrnoException) => {
+        if (readError.code === "ENOENT") return null;
+        throw readError;
+      });
+      if (current === null) continue;
+      const digest = createHash("sha256").update(current).digest("hex");
+      const snapshot = join(history, `${name}.${digest}.${extension}`);
+      try { await fs.writeFile(snapshot, current, { flag: "wx" }); }
+      catch (writeError) {
+        if ((writeError as NodeJS.ErrnoException).code !== "EEXIST" ||
+          !(await fs.readFile(snapshot)).equals(current)) throw writeError;
+      }
+    }
+    return;
+  }
+  for (const [source, name] of [
+    [null, ".transcription-ready"],
+    [join(exported, "bitacora.md"), "bitacora.md"],
+    [join(exported, "transcript.raw.json"), "transcript.raw.json"],
+  ] as const) {
+    const content = source === null ? Buffer.from(marker, "utf8") : await fs.readFile(source).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (content === null) continue;
+    const destination = join(history, name);
+    await fs.writeFile(destination, content, { flag: "wx" });
+  }
+  await fs.writeFile(join(history, ".complete"), `${identity}\n`, { flag: "wx" });
 }

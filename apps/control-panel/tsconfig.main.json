@@ -4,7 +4,7 @@
     "target": "ES2022",
     "module": "CommonJS",
     "moduleResolution": "Node",
-    "rootDir": "src",
+    "rootDir": "../..",
     "outDir": "dist/main",
     "types": ["node", "electron"],
     "esModuleInterop": true,

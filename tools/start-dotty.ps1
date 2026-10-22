@@ -7,6 +7,19 @@ Remove-Item Env:Path -ErrorAction SilentlyContinue
 [Environment]::SetEnvironmentVariable("Path", $inheritedPath, "Process")
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$setupLockPath = Join-Path $projectRoot ".setup-operation.lock"
+$setupOwner = [guid]::NewGuid().ToString("N")
+try {
+  $setupLock = [System.IO.File]::Open($setupLockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  try {
+    $ownerBytes = [System.Text.Encoding]::UTF8.GetBytes($setupOwner)
+    $setupLock.Write($ownerBytes, 0, $ownerBytes.Length)
+    $setupLock.Flush($true)
+  } finally { $setupLock.Dispose() }
+} catch {
+  throw "No se puede iniciar Dotty mientras hay una operación de configuración o un candado pendiente de revisión."
+}
+try {
 $environmentPath = Join-Path $projectRoot ".env"
 $configuredDataDirectory = "./data"
 $configuredTranscriberBaseUrl = "http://127.0.0.1:8765"
@@ -68,9 +81,13 @@ function Test-BotRunning([datetime]$since = [datetime]::MinValue) {
       [datetime]::Parse([string]$status.connectedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
     }
     $botProcessId = [int]$status.pid
-    if ($status.status -ne "ready" -or $connectedAt.ToUniversalTime() -lt $since.ToUniversalTime() -or $botProcessId -le 0) { return $false }
+    if ($status.version -ne 1 -or -not $status.instanceId -or $status.status -ne "ready" -or $connectedAt.ToUniversalTime() -lt $since.ToUniversalTime() -or $botProcessId -le 0) { return $false }
+    $heartbeatAt = ([datetime]$status.heartbeatAt).ToUniversalTime()
+    $startedAt = ([datetime]$status.processStartedAt).ToUniversalTime()
+    if ([Math]::Abs(((Get-Date).ToUniversalTime() - $heartbeatAt).TotalSeconds) -gt 7) { return $false }
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$botProcessId" -ErrorAction Stop
-    if ($null -eq $process -or ([datetime]$process.CreationDate).ToUniversalTime() -gt $connectedAt.ToUniversalTime().AddSeconds(5) -or
+    if ($null -eq $process -or [Math]::Abs((([datetime]$process.CreationDate).ToUniversalTime() - $startedAt).TotalSeconds) -gt 2 -or
+        [string]$process.Name -notmatch '^node(\.exe)?$' -or
         [string]$process.CommandLine -notmatch '(?i)(?:src[\\/])?index\.ts') { return $false }
     Set-Content -LiteralPath $botPidPath -Value $botProcessId -Encoding ASCII
     return $true
@@ -316,3 +333,9 @@ Write-Host ""
 Write-Host "Dotty esta listo. Puedes cerrar esta ventana." -ForegroundColor Cyan
 Write-Host "Para apagarlo, abre 'Detener Dotty.cmd'."
 Start-Sleep -Seconds 3
+} finally {
+  if ((Test-Path -LiteralPath $setupLockPath) -and
+      ((Get-Content -LiteralPath $setupLockPath -Raw -ErrorAction SilentlyContinue) -eq $setupOwner)) {
+    Remove-Item -LiteralPath $setupLockPath -Force
+  }
+}

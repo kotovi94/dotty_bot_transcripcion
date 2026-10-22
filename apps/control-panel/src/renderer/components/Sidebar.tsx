@@ -75,7 +75,7 @@ export function Sidebar({
         <div className="sidebar-status-row">
           <StatusDot active={fullyReady} warning={partiallyReady && !fullyReady} />
           <div>
-            <strong>{fullyReady ? "Dotty operativo" : partiallyReady ? "Inicio parcial" : "Dotty apagado"}</strong>
+            <strong>{fullyReady ? "Dotty operativo" : state.bot.status === "unknown" ? "Estado desconocido" : partiallyReady ? "Inicio parcial" : "Dotty apagado"}</strong>
             <span>{state.transcriber.activeDevice === "cuda" ? "GPU CUDA" : state.transcriber.available ? "CPU" : "Sin transcriptor"}</span>
           </div>
         </div>

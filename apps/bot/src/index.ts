@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 
 import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 
@@ -10,6 +10,7 @@ import { AutomaticBackups } from "./backup/automatic-backups.ts";
 import { readEnvironment } from "./config/environment.ts";
 import { createDatabaseClient } from "./database/client.ts";
 import { DottyDiagnostics } from "./diagnostics/dotty-diagnostics.ts";
+import { BotStatusPublisher } from "./diagnostics/bot-status-publisher.ts";
 import { TranscriptionReportService } from "./diagnostics/transcription-report-service.ts";
 import {
   handleDottyAutocomplete,
@@ -31,6 +32,7 @@ import { ReprocessIntentEligibility } from "./sessions/reprocess-intent-eligibil
 import { SessionFileCoordinator } from "./sessions/session-file-coordinator.ts";
 import { CampaignFileCoordinator } from "./sessions/campaign-file-coordinator.ts";
 import { SessionLifecycleCoordinator } from "./sessions/session-lifecycle-coordinator.ts";
+import { recoverClosedRecordings } from "./sessions/closed-recording-recovery.ts";
 import {
   handleCampaignDeleteButton,
   handleSessionDeleteButton,
@@ -52,7 +54,6 @@ import { runShutdownActions } from "./shutdown.ts";
 const environment = readEnvironment();
 const logger = createLogger(environment.DOTTY_LOG_LEVEL);
 const botStatusPath = resolve(environment.DOTTY_DATA_DIR, "dotty.status.json");
-await rm(botStatusPath, { force: true });
 const database = createDatabaseClient(environment.DATABASE_URL);
 const editorialLearning = new EditorialLearningService(database);
 await editorialLearning.ensureCriticalRules();
@@ -107,9 +108,19 @@ if (recoveredRecordings.length > 0) {
     "Grabaciones interrumpidas cerradas; sesiones marcadas como fallidas para preservar el audio",
   );
 }
+const closedRecovery = await recoverClosedRecordings(
+  sessions,
+  sessionCoordinator,
+  resolve(environment.DOTTY_DATA_DIR, "recordings"),
+);
+if (closedRecovery.recovered.length > 0 || closedRecovery.skipped.length > 0) {
+  logger.warn({ ...closedRecovery }, "Conciliación de sesiones con manifiestos cerrados");
+}
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
+const botStatus = new BotStatusPublisher(botStatusPath, () => client.isReady());
+await botStatus.start();
 const narrativeGenerator = new NarrativeGenerator(
   resolve(environment.DOTTY_DATA_DIR, "recordings"),
   resolve(environment.DOTTY_DATA_DIR, "exports"),
@@ -180,21 +191,20 @@ audioRetention.start();
 
 client.once(Events.ClientReady, async (readyClient) => {
   logger.info({ userId: readyClient.user.id }, "Dotty conectado a Discord");
-  await writeFile(
-    botStatusPath,
-    JSON.stringify(
-      {
-        status: "ready",
-        pid: process.pid,
-        connectedAt: new Date().toISOString(),
-        userId: readyClient.user.id,
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  ).catch((error) => logger.warn({ error }, "No se pudo guardar el estado del bot"));
+  await botStatus.setPhase("ready", readyClient.user.id).catch((error) => logger.warn({ error }, "No se pudo guardar el estado del bot"));
   publisher.start();
+});
+function updateBotPhase(phase: "ready" | "disconnected" | "reconnecting"): void {
+  void botStatus.setPhase(phase, client.user?.id).catch((error) =>
+    logger.warn({ error }, "No se pudo actualizar el estado de Discord"));
+}
+client.on(Events.ShardDisconnect, () => updateBotPhase("disconnected"));
+client.on(Events.ShardReconnecting, () => updateBotPhase("reconnecting"));
+client.on(Events.ShardResume, () => updateBotPhase("ready"));
+client.on(Events.ShardReady, () => updateBotPhase("ready"));
+client.on(Events.Error, (error) => {
+  logger.warn({ error }, "Error del cliente Discord");
+  if (!client.isReady()) void botStatus.setPhase("error").catch(() => undefined);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -350,8 +360,8 @@ let shuttingDown = false;
 const stopRequestPath = resolve(environment.DOTTY_DATA_DIR, "dotty.stop-request.json");
 const stopRequestTimer = setInterval(() => {
   void readFile(stopRequestPath, "utf8").then(async (content) => {
-    const request = JSON.parse(content) as { pid?: number };
-    if (request.pid !== process.pid) return;
+    const request = JSON.parse(content) as { pid?: number; instanceId?: string };
+    if (request.pid !== process.pid || request.instanceId !== botStatus.instanceId) return;
     await shutdown("local-stop-request");
     await rm(stopRequestPath, { force: true });
   }).catch((error) => {
@@ -364,6 +374,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   clearInterval(stopRequestTimer);
   logger.info({ signal }, "Cerrando Dotty");
+  await botStatus.stop().catch((error) => logger.warn({ error }, "No se pudo actualizar el estado de cierre"));
   let lifecycleReport: Awaited<ReturnType<typeof sessionLifecycle.shutdown>> | undefined;
   const failures = await runShutdownActions([
     { resource: "transcriptions", run: () => transcriptions.stop() },
@@ -381,13 +392,14 @@ async function shutdown(signal: string): Promise<void> {
   const clean = lifecycleReport?.clean === true && failures.length === 0;
   if (clean) {
     failures.push(...await runShutdownActions([
-      { resource: "botStatus", run: () => rm(botStatusPath, { force: true }) },
+      { resource: "botStatus", run: () => botStatus.removeIfOwned() },
     ], (failure, error) => {
       logger.error({ signal, resource: failure.resource, error }, "No se pudo limpiar el estado del bot");
     }));
   }
   if (!clean || failures.length > 0) {
     const report = {
+      ...botStatus.snapshot(),
       status: "shutdown-incomplete",
       pid: process.pid,
       signal,
@@ -396,7 +408,7 @@ async function shutdown(signal: string): Promise<void> {
       failures,
     };
     const reportWriteFailures = await runShutdownActions([
-      { resource: "botStatus", run: () => writeFile(botStatusPath, JSON.stringify(report, null, 2), "utf8") },
+      { resource: "botStatus", run: () => botStatus.reportIfOwned(report) },
     ], (failure, error) => {
       logger.error({ signal, resource: failure.resource, error }, "No se pudo persistir el diagnóstico de apagado");
     });
@@ -410,4 +422,9 @@ async function shutdown(signal: string): Promise<void> {
 process.once("SIGINT", () => void shutdown("SIGINT"));
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
-await client.login(environment.DISCORD_TOKEN);
+try {
+  await client.login(environment.DISCORD_TOKEN);
+} catch (error) {
+  await botStatus.setPhase("error");
+  throw error;
+}

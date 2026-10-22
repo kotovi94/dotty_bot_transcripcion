@@ -136,6 +136,10 @@ export class SessionService {
     return this.sessions.findById(sessionId);
   }
 
+  listActive() {
+    return this.sessions.listActive();
+  }
+
   findActive(discordGuildId: string, campaignName: string) {
     return this.sessions.findActive(discordGuildId, campaignName);
   }

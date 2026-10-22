@@ -1,6 +1,9 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { saveTranscriptRevision } from "./transcript-edits.js";
 import { writeFileAtomically } from "./atomic-file.js";
+import { FailureTracker } from "./maintenance-failures.js";
+import { SetupOperationLock } from "./setup-operation-lock.js";
+import { evaluateBotHealth, inspectBotProcess, recentBotIdentity, type CachedBotIdentity } from "./bot-health.js";
 import { promisify } from "node:util";
 import {
   copyFile,
@@ -16,6 +19,8 @@ import { readFileSync, type Dirent } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
 import { shell } from "electron";
+import { parseReadyMarker, verifyReadyMarker, type PublicationJob } from "../../../../packages/shared/src/transcription-ready.js";
+import { SessionFileCoordinator } from "../../../bot/src/sessions/session-file-coordinator.js";
 
 import type {
   DottyOperationError,
@@ -44,12 +49,6 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
-interface BotStatusFile {
-  status?: string;
-  pid?: number;
-  connectedAt?: string;
-}
-
 interface HealthPayload {
   status?: string;
   model?: string;
@@ -73,6 +72,8 @@ export class DottySupervisor {
   dataRoot: string;
   exportsRoot: string;
   recordingsRoot: string;
+  private readonly failureTracker = new FailureTracker();
+  private lastBotProcess: CachedBotIdentity | null = null;
 
   private operation: {
     kind: OperationKind;
@@ -391,11 +392,14 @@ export class DottySupervisor {
   }
 
   async saveTranscript(sessionId: string, content: string): Promise<SaveResult> {
-    return saveTranscriptRevision(this.transcriptPath(sessionId), sessionId, content,
-      () => this.invalidateNarrativeAfterTranscriptEdit(sessionId));
+    const path = this.transcriptPath(sessionId);
+    return new SessionFileCoordinator(join(this.dataRoot, "session-locks")).runExclusive(sessionId,
+      () => saveTranscriptRevision(path, sessionId, content,
+        () => this.invalidateNarrativeAfterTranscriptEdit(sessionId)), { timeoutMs: 5_000 });
   }
 
   async regenerateRaw(sessionId: string): Promise<OperationResult> {
+    return new SetupOperationLock(this.projectRoot).run(async () => {
     this.validateSessionId(sessionId);
     const manifest = await this.readManifest(sessionId);
     const result = await this.transcriberRequest(
@@ -423,6 +427,7 @@ export class DottySupervisor {
         ? "La transcripción ya se está rehaciendo. El raw actual sigue disponible hasta completar el nuevo."
         : `${Number(result.queued ?? 0)} de ${Number(result.total ?? 0)} fragmentos enviados de nuevo al transcriptor. ${result.backup ? "Se guardó un único respaldo del raw anterior." : "No había raw anterior para respaldar."}`,
     };
+    });
   }
 
   async saveNarrative(sessionId: string, content: string): Promise<SaveResult> {
@@ -629,36 +634,27 @@ export class DottySupervisor {
   }
 
   async getMaintenanceState(): Promise<MaintenanceState> {
-    const failures = new Map<string, { failedJobs: number; lastError: string | null }>();
-    try {
-      const payload = await this.transcriberRequest("/v1/failures") as {
-        sessions?: Array<{ session_id?: string; failed_jobs?: number; last_error?: string }>;
-      };
-      for (const item of payload.sessions ?? []) {
-        if (typeof item.session_id !== "string") continue;
-        failures.set(item.session_id, {
-          failedJobs: Number(item.failed_jobs ?? 0),
-          lastError: typeof item.last_error === "string" ? item.last_error : null,
-        });
-      }
-    } catch {
-      // El panel sigue mostrando manifiestos recuperables aunque el transcriptor esté apagado.
-    }
+    const snapshot = await this.failureTracker.query(() => this.transcriberRequest("/v1/failures"));
+    const failures = new Map(snapshot.sessions.map((item) => [item.sessionId, item]));
 
     const bot = await this.readBotState();
     let entries: Dirent[];
+    let localScanAvailable = true;
     try {
       entries = await readdir(this.recordingsRoot, { withFileTypes: true });
     } catch {
       entries = [];
+      localScanAvailable = false;
     }
     const issues = [];
+    const matchedFailures = new Set<string>();
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const manifest = await this.readManifest(entry.name);
       if (!manifest) continue;
       const status = typeof manifest.status === "string" ? manifest.status : "desconocido";
       const failed = failures.get(entry.name);
+      if (failed) matchedFailures.add(entry.name);
       const failedMarker = await this.pathExists(join(this.recordingsRoot, entry.name, ".transcription-failed"));
       let recovery: { phase?: string; enqueued?: number; completed?: number; total?: number; failed?: number; error?: string } | null = null;
       try {
@@ -687,13 +683,27 @@ export class DottySupervisor {
         canRetry: (failed?.failedJobs ?? 0) > 0,
       });
     }
-    return { checkedAt: new Date().toISOString(), issues };
+    for (const failed of snapshot.sessions) {
+      if (matchedFailures.has(failed.sessionId)) continue;
+      issues.push({
+        sessionId: failed.sessionId,
+        title: `Sesión ${failed.sessionId}`,
+        status: "transcripción fallida",
+        chunks: 0,
+        failedJobs: failed.failedJobs,
+        lastError: failed.lastError,
+        canRecover: false,
+        canRetry: /^[a-zA-Z0-9_-]+$/u.test(failed.sessionId),
+      });
+    }
+    return { checkedAt: new Date().toISOString(), issues, localScanAvailable, failureQuery: snapshot.query };
   }
 
   async runMaintenanceAction(
     action: MaintenanceAction,
     sessionId: string,
   ): Promise<OperationResult> {
+    return new SetupOperationLock(this.projectRoot).run(async () => {
     if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) throw new Error("Sesión inválida.");
     if (action === "retry-failed") {
       const result = await this.transcriberRequest(
@@ -733,31 +743,36 @@ export class DottySupervisor {
     });
     worker.unref();
     return { accepted: true, message: `Recuperación iniciada: Dotty transcribirá los fragmentos conservados. El avance aparecerá en Herramientas y el texto en ${output}.` };
+    });
   }
 
   private async readBotState(): Promise<DottyState["bot"]> {
     try {
       const payload = JSON.parse(
         await readFile(join(this.dataRoot, "dotty.status.json"), "utf8"),
-      ) as BotStatusFile;
-      const pid = Number(payload.pid);
-      const running = Number.isInteger(pid) && this.isProcessRunning(pid);
-      return {
-        running,
-        connected: running && payload.status === "ready",
-        pid: running ? pid : null,
-        connectedAt: running ? payload.connectedAt ?? null : null,
-      };
-    } catch {
+      ) as Record<string, unknown>;
+      const pid = payload.pid;
+      if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return evaluateBotHealth(payload, null);
       try {
-        const pid = Number(
-          (await readFile(join(this.dataRoot, "dotty.pid"), "utf8")).trim(),
-        );
-        const running = Number.isInteger(pid) && this.isProcessRunning(pid);
-        return { running, connected: false, pid: running ? pid : null, connectedAt: null };
+        const identity = await inspectBotProcess(pid as number);
+        if (identity) this.lastBotProcess = { identity, at: Date.now() };
+        else this.lastBotProcess = null;
+        return evaluateBotHealth(payload, identity);
       } catch {
-        return { running: false, connected: false, pid: null, connectedAt: null };
+        const previous = recentBotIdentity(this.lastBotProcess, pid as number);
+        return previous ? evaluateBotHealth(payload, previous) :
+          { running: false, connected: false, pid: null, connectedAt: null, status: "unknown",
+            reason: "No se pudo consultar la identidad del proceso Node." };
       }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        const oldPid = await readFile(join(this.dataRoot, "dotty.pid"), "utf8").catch(() => "");
+        return oldPid.trim() ? { running: false, connected: false, pid: null, connectedAt: null,
+          status: "unknown", reason: "Existe un PID anterior sin señal verificable del bot." } :
+          { running: false, connected: false, pid: null, connectedAt: null, status: "stopped", reason: null };
+      }
+      return { running: false, connected: false, pid: null, connectedAt: null,
+        status: "unknown", reason: "El estado del bot no se pudo leer." };
     }
   }
 
@@ -836,7 +851,7 @@ export class DottySupervisor {
     }
   }
 
-  private async transcriberRequest(path: string, method = "GET"): Promise<unknown> {
+  private async transcriberRequest(path: string, method = "GET", timeoutMs = 10_000): Promise<unknown> {
     const configured = this.readEnvironmentValue("TRANSCRIBER_SHARED_SECRET");
     const secret = configured && configured !== "replace-with-a-long-random-local-secret"
       ? configured
@@ -845,12 +860,12 @@ export class DottySupervisor {
     const response = await fetch(new URL(path, baseUrl), {
       method,
       headers: { authorization: `Bearer ${secret}` },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => null) as { detail?: unknown } | null;
       const detail = typeof payload?.detail === "string" ? payload.detail : `HTTP ${response.status}`;
-      throw new Error(`El transcriptor rechazó la operación: ${detail}.`);
+      throw new Error(`El transcriptor rechazó la operación (HTTP ${response.status}): ${detail}.`);
     }
     return response.json();
   }
@@ -1239,9 +1254,111 @@ export class DottySupervisor {
     return errors;
   }
 
+  private async readTranscriptionEvidence(
+    sessionId: string, manifest: Record<string, unknown> | null, hasTranscript: boolean,
+  ): Promise<NonNullable<SessionProcessingStatus["transcriptionEvidence"]>> {
+    try {
+      return await new SessionFileCoordinator(join(this.dataRoot, "session-locks")).runExclusive(
+        sessionId, () => this.readTranscriptionEvidenceLocked(sessionId, manifest, hasTranscript),
+        { timeoutMs: 250 },
+      );
+    } catch {
+      return { availability: "unavailable", publication: "unavailable", total: null,
+        queued: null, processing: null, completed: null, failed: null };
+    }
+  }
+
+  private async readTranscriptionEvidenceLocked(
+    sessionId: string, manifest: Record<string, unknown> | null, hasTranscript: boolean,
+  ): Promise<NonNullable<SessionProcessingStatus["transcriptionEvidence"]>> {
+    type Evidence = NonNullable<SessionProcessingStatus["transcriptionEvidence"]>;
+    const empty = (availability: Evidence["availability"], publication: Evidence["publication"]): Evidence => ({
+      availability, publication, total: null, queued: null, processing: null, completed: null, failed: null,
+    });
+    const directory = join(this.recordingsRoot, sessionId);
+    const existsStrict = async (path: string): Promise<boolean> => {
+      try { await stat(path); return true; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+    };
+    let entries: string[];
+    let regenerating: boolean;
+    let enqueued: boolean;
+    let intentText: string | null;
+    let intentEntries: string[];
+    const intentPrefix = `${Buffer.from(sessionId, "utf8").toString("hex")}.reprocess-intent.json`;
+    try { [entries, regenerating, enqueued, intentText, intentEntries] = await Promise.all([
+      readdir(join(directory, ".transcription-jobs")).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [] as string[];
+        throw error;
+      }),
+      existsStrict(join(directory, ".transcription-regenerating")),
+      existsStrict(join(directory, ".transcription-enqueued")),
+      readFile(join(this.dataRoot, "reprocess-intents", intentPrefix), "utf8")
+        .catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error)),
+      readdir(join(this.dataRoot, "reprocess-intents")).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [] as string[];
+        throw error;
+      }),
+    ]); } catch { return empty("unavailable", "unavailable"); }
+    let intentPending = false;
+    if (intentText !== null) {
+      try {
+        const intent = JSON.parse(intentText) as { sessionId?: string; phase?: string };
+        intentPending = intent.sessionId !== sessionId || intent.phase !== "completed";
+      } catch { intentPending = true; }
+    }
+    const intentUncertain = intentEntries.some((entry) => entry.startsWith(`${intentPrefix}.`));
+    const pendingMutation = entries.some((entry) => entry.endsWith(".posting")) || regenerating || intentPending || intentUncertain ||
+      (manifest?.status === "completed" && !enqueued);
+    let payload: unknown;
+    try {
+      payload = await this.transcriberRequest(`/v1/sessions/${encodeURIComponent(sessionId)}`, "GET", 1_500);
+    } catch { return { ...empty("unavailable", "unavailable"), pendingMutation }; }
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      return { ...empty("invalid", "unavailable"), pendingMutation };
+    }
+    const response = payload as { session_id?: unknown; jobs?: unknown };
+    if (response.session_id !== sessionId || !Array.isArray(response.jobs) || response.jobs.some((job) =>
+      job === null || typeof job !== "object" || typeof (job as Record<string, unknown>).id !== "string" ||
+      !(job as { id: string }).id.startsWith(`${sessionId}:`) ||
+      !["queued", "processing", "completed", "failed"].includes((job as { status: string }).status))) {
+      return { ...empty("invalid", "unavailable"), pendingMutation };
+    }
+    const jobs = response.jobs as PublicationJob[];
+    const counts = {
+      total: jobs.length,
+      queued: jobs.filter((job) => job.status === "queued").length,
+      processing: jobs.filter((job) => job.status === "processing").length,
+      completed: jobs.filter((job) => job.status === "completed").length,
+      failed: jobs.filter((job) => job.status === "failed").length,
+    };
+    const markerPath = join(directory, ".transcription-ready");
+    let marker: string | null;
+    try { marker = await readFile(markerPath, "utf8"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { availability: "available", publication: "unavailable", ...counts, pendingMutation };
+      marker = null;
+    }
+    if (marker === null) return { availability: "available", publication: "missing", ...counts, pendingMutation };
+    const parsed = parseReadyMarker(marker);
+    if (parsed.kind !== "verifiable") return { availability: "available", publication: parsed.kind, ...counts, pendingMutation };
+    if (parsed.marker.session_id !== sessionId) return { availability: "available", publication: "stale", ...counts, pendingMutation };
+    if (!hasTranscript) return { availability: "available", publication: "stale", ...counts, pendingMutation };
+    const chunks = manifest?.chunks;
+    if (!Array.isArray(chunks) || chunks.length !== jobs.length || chunks.some((chunk) =>
+      chunk === null || typeof chunk !== "object" ||
+      !jobs.some((job) => job.id === `${sessionId}:${(chunk as { id?: unknown }).id}`))) {
+      return { availability: "available", publication: "stale", ...counts, pendingMutation };
+    }
+    try {
+      const bytes = await readFile(this.transcriptPath(sessionId));
+      return { availability: "available", publication: verifyReadyMarker(marker, sessionId, jobs, bytes) === "verified" ? "verified" : "stale", ...counts, pendingMutation };
+    } catch { return { availability: "available", publication: "unavailable", ...counts, pendingMutation }; }
+  }
+
   private async computeProcessingStatus(sessionId: string, manifest: Record<string, unknown> | null): Promise<SessionProcessingStatus> {
     const exportDirectory = join(this.exportsRoot, sessionId);
-    const [transcript, script, narrative, review, evidenceBundle, transcriptRaw, qualityReport, generationState, recovery, publicationAttempt, publicationLock, regenerationMarker, readyMarker] = await Promise.all([
+    const [transcript, script, narrative, review, evidenceBundle, transcriptRaw, qualityReport, generationState, recovery, publicationAttempt, publicationLock, regenerationMarker] = await Promise.all([
       readFile(this.transcriptPath(sessionId), "utf8").catch(() => null),
       readFile(this.narrativePath(sessionId), "utf8").catch(() => null),
       this.readNarrativeStatus(sessionId),
@@ -1266,19 +1383,15 @@ export class DottySupervisor {
         .catch(() => null),
       this.pathExists(join(this.recordingsRoot, sessionId, ".publication.lock")),
       this.pathExists(join(this.recordingsRoot, sessionId, ".transcription-regenerating")),
-      this.pathExists(join(this.recordingsRoot, sessionId, ".transcription-ready")),
     ]);
-    const regenerating = regenerationMarker && !readyMarker;
-    const regenerationProgress = regenerating
-      ? await this.transcriberRequest(`/v1/sessions/${encodeURIComponent(sessionId)}/progress`)
-        .catch(() => null) as { completed?: number; failed?: number; total?: number } | null
-      : null;
-    const regenerationTotal = Number(regenerationProgress?.total ?? 0);
-    const regenerationCompleted = Number(regenerationProgress?.completed ?? 0);
-    const regenerationFailed = Number(regenerationProgress?.failed ?? 0);
+    const regenerating = regenerationMarker;
+    const transcriptionEvidence = await this.readTranscriptionEvidence(sessionId, manifest, Boolean(transcript?.trim()));
+    const regenerationTotal = transcriptionEvidence.total ?? 0;
+    const regenerationCompleted = transcriptionEvidence.completed ?? 0;
+    const regenerationFailed = transcriptionEvidence.failed ?? 0;
     const recordingStatus = typeof manifest?.status === "string" ? String(manifest.status) : "unknown";
     const recordingActive = ["recording", "paused", "finalizing"].includes(recordingStatus);
-    const recordingComplete = ["completed", "failed", "interrupted"].includes(recordingStatus);
+    const recordingComplete = recordingStatus === "completed";
     const publication = manifest?.publication as { threadId?: unknown; messageIds?: unknown } | undefined;
     const published = typeof publication?.threadId === "string"
       || (Array.isArray(publication?.messageIds) && publication.messageIds.length > 0);
@@ -1305,28 +1418,48 @@ export class DottySupervisor {
     const recoveryCompleted = Number(recovery?.completed ?? 0);
     const publicationTotal = Number(publicationAttempt?.totalMessages ?? 0);
     const publicationSent = publicationAttempt?.steps?.filter((step) => typeof step.messageId === "string").length ?? 0;
+    const transcriptVerified = Boolean(transcript?.trim()) && transcriptionEvidence.availability === "available" &&
+      transcriptionEvidence.publication === "verified" && transcriptionEvidence.pendingMutation !== true &&
+      transcriptionEvidence.total !== null && transcriptionEvidence.total > 0 &&
+      transcriptionEvidence.completed === transcriptionEvidence.total &&
+      transcriptionEvidence.failed === 0 && transcriptionEvidence.processing === 0 && transcriptionEvidence.queued === 0;
 
     const stages: ProcessingStage[] = [
       {
         id: "capture",
         label: "Captura de audio",
-        status: recordingActive ? "running" : recordingComplete ? "completed" : "unknown",
-        details: recordingActive ? `Sesión ${recordingStatus}` : recordingComplete ? "Grabación cerrada" : "Sin estado de grabación",
+        status: recordingActive ? "running" : recordingComplete ? "completed" : recordingStatus === "interrupted" ? "warning" : recordingStatus === "failed" ? "error" : "unknown",
+        details: recordingActive ? `Sesión ${recordingStatus}` : recordingComplete ? "Grabación cerrada" : recordingStatus === "interrupted" ? "Grabación interrumpida" : recordingStatus === "failed" ? "Grabación fallida" : "Sin estado de grabación",
         artifact: "manifest.json",
       },
       {
         id: "transcription",
         label: "Transcripción",
-        status: regenerating ? regenerationFailed > 0 ? "error" : "running" : transcript !== null ? "completed" : recovery?.phase === "failed" || recovery?.phase === "error" ? "error" : recovery?.phase === "transcribing" || recovery?.phase === "enqueuing" ? "running" : recordingActive ? "pending" : "unknown",
-        details: regenerating ? regenerationTotal > 0 ? `Rehaciendo raw: ${regenerationCompleted} de ${regenerationTotal} fragmentos` : "Preparando nueva transcripción" : transcript !== null ? "Bitácora generada" : recoveryTotal > 0 ? `${recoveryCompleted} de ${recoveryTotal} fragmentos recuperados` : "Esperando texto consolidado",
+        status: transcriptionEvidence.failed && transcriptionEvidence.failed > 0 || recovery?.phase === "failed" || recovery?.phase === "error" ? "error"
+          : transcriptionEvidence.processing && transcriptionEvidence.processing > 0 || regenerating || recovery?.phase === "transcribing" || recovery?.phase === "enqueuing" ? "running"
+          : transcriptionEvidence.queued && transcriptionEvidence.queued > 0 ? "pending"
+          : transcriptionEvidence.pendingMutation ? "pending"
+          : transcriptVerified ? "completed"
+          : transcriptionEvidence.publication === "stale" || transcriptionEvidence.publication === "legacy-unverifiable" ? "warning"
+          : transcriptionEvidence.availability === "unavailable" || transcriptionEvidence.availability === "invalid" ? "unknown"
+          : transcriptionEvidence.publication === "missing" ? "pending"
+          : transcriptionEvidence.total === 0 || recordingActive ? "pending" : "unknown",
+        details: regenerating ? regenerationTotal > 0 ? `Rehaciendo raw: ${regenerationCompleted} de ${regenerationTotal} fragmentos` : "Preparando nueva transcripción"
+          : transcriptionEvidence.publication === "verified" ? "Publicación y trabajos vigentes verificados"
+          : transcriptionEvidence.publication === "legacy-unverifiable" ? "Bitácora histórica sin huellas verificables"
+          : transcriptionEvidence.publication === "stale" ? "Bitácora anterior o modificada; publicación pendiente"
+          : transcriptionEvidence.availability !== "available" ? "No se pudo verificar el estado de los trabajos"
+          : transcriptionEvidence.publication === "missing" && transcriptionEvidence.total &&
+            transcriptionEvidence.completed === transcriptionEvidence.total ? "Trabajos terminados; publicación pendiente"
+          : transcriptionEvidence.total ? `${transcriptionEvidence.completed} de ${transcriptionEvidence.total} trabajos completados` : "Sin trabajos verificables",
         ...(regenerating && regenerationTotal > 0 ? { current: regenerationCompleted, total: regenerationTotal, progress: regenerationCompleted / regenerationTotal } : recoveryTotal > 0 ? { current: recoveryCompleted, total: recoveryTotal, progress: recoveryCompleted / recoveryTotal } : {}),
         ...(regenerating && regenerationFailed > 0 ? { errors: regenerationFailed } : recovery?.failed ? { errors: recovery.failed } : {}),
-        ...(transcript !== null ? { artifact: "bitacora.md" } : {}),
+        ...(transcript?.trim() ? { artifact: "bitacora.md" } : {}),
       },
       {
         id: "raw_quality",
         label: "Calidad del raw",
-        status: regenerating ? "running" : qualityOutcome === "failure" ? "error" : qualityOutcome === "warning" || qualityWarnings > 0 ? "warning" : transcriptRaw !== null ? "completed" : transcript !== null ? "warning" : "pending",
+        status: regenerating ? "running" : !transcriptVerified && transcriptRaw !== null ? "warning" : qualityOutcome === "failure" ? "error" : qualityOutcome === "warning" || qualityWarnings > 0 ? "warning" : transcriptRaw !== null ? "completed" : transcript !== null ? "warning" : "pending",
         details: regenerating ? "El raw anterior sigue disponible mientras se procesa el nuevo" : qualityReport !== null
           ? qualityOutcome === "success" ? "Informe de calidad sin alertas" : `${qualityWarnings} elementos requieren revisión`
           : transcriptRaw !== null ? "Raw disponible; informe consolidado pendiente" : transcript !== null ? "No hay raw para auditar" : "Esperando transcripción",
@@ -1393,7 +1526,7 @@ export class DottySupervisor {
       {
         id: "publication",
         label: "Publicación en Discord",
-        status: published && !approved ? "warning" : published ? "completed" : approved ? "pending" : "blocked",
+        status: published && (!approved || !transcriptVerified) ? "warning" : published ? "completed" : approved ? "pending" : "blocked",
         details: published && !approved ? "Existe una publicación anterior; el contenido actual requiere revisión" : published ? "Publicación confirmada" : approved ? "Lista para publicar" : "Requiere aprobación previa",
         ...(publicationAttempt !== null ? {
           status: publicationLock ? "running" as const : "blocked" as const,
@@ -1421,19 +1554,20 @@ export class DottySupervisor {
             ? "review_blocked"
             : readyForApproval
               ? "awaiting_approval"
-              : approved && published
+                : approved && published && stages[1]!.status === "completed"
                 ? "completed"
                 : approved
                   ? "narrative_ready"
                   : recovery?.phase === "transcribing" || recovery?.phase === "enqueuing"
                     ? "transcribing"
-                    : transcript !== null
+                    : transcriptionEvidence.publication === "verified" && stages[1]!.status === "completed"
                     ? "transcript_ready"
                     : "unknown";
     const narrativeStage = stages.find((stage) => stage.id === "verification")!;
     const publicationStage = stages.find((stage) => stage.id === "publication")!;
     return {
       sessionId,
+      transcriptionEvidence,
       state,
       audio: { status: stages[0]!.status, details: stages[0]!.details },
       transcription: { status: stages[1]!.status, details: stages[1]!.details },
@@ -1450,15 +1584,6 @@ export class DottySupervisor {
     const normalized = String(sessionId ?? "").trim();
     if (!/^[a-zA-Z0-9_-]+$/.test(normalized)) throw new Error("Sesión inválida.");
     return normalized;
-  }
-
-  private isProcessRunning(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
   }
 
   private async readTail(path: string, maxBytes = 160_000): Promise<string> {

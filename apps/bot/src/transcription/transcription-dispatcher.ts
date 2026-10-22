@@ -135,37 +135,58 @@ export class TranscriptionDispatcher {
     const eligible = manifest.chunks.filter((chunk) => isEligible(manifest, chunk));
     let newlyQueued = 0;
     for (const chunk of eligible) {
-      await this.coordinator.runExclusive(sessionId, async () => {
+      const jobMarkers = join(directory, ".transcription-jobs");
+      const jobMarker = join(jobMarkers, chunk.id);
+      const postingMarker = join(jobMarkers, `${chunk.id}.posting`);
+      const body = await this.coordinator.runExclusive(sessionId, async () => {
         if (!(await this.validate(directory, manifestText, chunk.id))) return;
-        const jobMarkers = join(directory, ".transcription-jobs");
-        const jobMarker = join(jobMarkers, chunk.id);
-        const postingMarker = join(jobMarkers, `${chunk.id}.posting`);
-        if (await markerExists(jobMarker) || await markerExists(postingMarker)) return;
+        if (await jobMarkerExists(jobMarker)) return;
         await fs.mkdir(jobMarkers).catch((error: NodeJS.ErrnoException) => {
           if (error.code !== "EEXIST") throw error;
         });
-        // A surviving .posting file means the POST may have been accepted. Never rebuild its payload and retry blindly.
-        await writeSyncedMarker(postingMarker);
-        await syncDirectory(jobMarkers);
-        const queuedAt = performance.now();
-        const response = await fetch(new URL("/v1/jobs", this.baseUrl), {
-          method: "POST",
-          headers: { authorization: `Bearer ${this.secret}`, "content-type": "application/json" },
-          body: JSON.stringify({
-            id: `${sessionId}:${chunk.id}`,
-            audio_path: resolve(directory, chunk.file),
-            speaker_user_id: chunk.speakerUserId,
-            start_offset_ms: chunk.startedOffsetMs,
-            language: "es",
-            initial_prompt: transcriptionContext.initialPrompt,
-            hotwords: transcriptionContext.hotwords,
-          }),
-          signal: AbortSignal.timeout(4_000),
+        if (await markerExists(postingMarker)) {
+          // Legacy date-only markers cannot be replayed: their original request is unknown.
+          const saved = await fs.readFile(postingMarker, "utf8");
+          try {
+            const parsed = JSON.parse(saved) as { version?: number; body?: string };
+            if (parsed.version !== 1 || typeof parsed.body !== "string") return;
+            const request = JSON.parse(parsed.body) as { id?: string };
+            return request.id === `${sessionId}:${chunk.id}` ? parsed.body : undefined;
+          } catch { return; }
+        }
+        const requestBody = JSON.stringify({
+          id: `${sessionId}:${chunk.id}`,
+          audio_path: resolve(directory, chunk.file),
+          speaker_user_id: chunk.speakerUserId,
+          start_offset_ms: chunk.startedOffsetMs,
+          language: "es",
+          initial_prompt: transcriptionContext.initialPrompt,
+          hotwords: transcriptionContext.hotwords,
         });
-        if (!response.ok) throw new Error(`Transcriber rejected or could not reconcile job: HTTP ${response.status}.`);
+        await writeSyncedMarker(postingMarker, `${JSON.stringify({ version: 1, body: requestBody })}\n`);
+        await syncDirectory(jobMarkers);
+        return requestBody;
+      });
+      if (body === undefined) continue;
+      // Python may now acquire the same session lock before its SQLite transaction.
+      const queuedAt = performance.now();
+      const response = await fetch(new URL("/v1/jobs", this.baseUrl), {
+        method: "POST",
+        headers: { authorization: `Bearer ${this.secret}`, "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(4_000),
+      });
+      if (!response.ok) throw new Error(`Transcriber rejected or could not reconcile job: HTTP ${response.status}.`);
+      await this.coordinator.runExclusive(sessionId, async () => {
+        // Keep the durable request if the manifest changed while POST was in flight.
+        if (!(await this.validate(directory, manifestText, chunk.id))) return;
+        if (await jobMarkerExists(jobMarker)) return;
+        const saved = JSON.parse(await fs.readFile(postingMarker, "utf8")) as { version?: number; body?: string };
+        if (saved.version !== 1 || saved.body !== body) return;
         await writeSyncedMarker(jobMarker);
         await syncDirectory(jobMarkers);
         await fs.rm(postingMarker);
+        await syncDirectory(jobMarkers);
         newlyQueued += 1;
         await this.report({
           sessionId, component: "transcription", process: "enqueue_job", outcome: "success",
@@ -186,7 +207,7 @@ export class TranscriptionDispatcher {
       const finalWritten = await this.coordinator.runExclusive(sessionId, async () => {
         if (!(await this.validate(directory, manifestText))) return false;
         for (const chunk of manifest.chunks) {
-          if (!(await markerExists(join(directory, ".transcription-jobs", chunk.id)))) return false;
+          if (!(await jobMarkerExists(join(directory, ".transcription-jobs", chunk.id)))) return false;
         }
         await fs.writeFile(join(directory, ".transcription-enqueued"), `${new Date().toISOString()}\n`, { flag: "wx" });
         return true;
@@ -311,10 +332,10 @@ export class TranscriptionDispatcher {
   }
 }
 
-async function writeSyncedMarker(path: string): Promise<void> {
+async function writeSyncedMarker(path: string, content = `${new Date().toISOString()}\n`): Promise<void> {
   const handle = await fs.open(path, "wx");
   try {
-    await handle.writeFile(`${new Date().toISOString()}\n`, "utf8");
+    await handle.writeFile(content, "utf8");
     await handle.sync();
   } finally {
     await handle.close();
@@ -324,6 +345,17 @@ async function writeSyncedMarker(path: string): Promise<void> {
 async function markerExists(path: string): Promise<boolean> {
   try { await fs.lstat(path); return true; }
   catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function jobMarkerExists(path: string): Promise<boolean> {
+  try {
+    const entry = await fs.lstat(path);
+    if (!entry.isFile()) throw new Error(`Job marker is not a regular file: ${path}`);
+    return true;
+  } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }

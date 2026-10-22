@@ -32,3 +32,7 @@ logs/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Dotty - datos y pruebas locales
+/prueba 1.mp3
+/pruebas-locales/

@@ -1,5 +1,7 @@
 import json
+import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 import uuid
 
@@ -8,6 +10,7 @@ from fastapi import HTTPException
 
 from dotty_transcriber import main
 from dotty_transcriber.storage import JobInput, JobStore
+from dotty_transcriber.session_file_coordinator import SessionFileCoordinator
 
 
 def _fixture(tmp_path: Path, monkeypatch):
@@ -28,6 +31,7 @@ def _fixture(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(main, "settings", SimpleNamespace(
         data_dir=tmp_path, recordings_dir=tmp_path / "recordings", secret="fixture-secret",
     ), raising=False)
+    monkeypatch.setattr(main, "configured_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main, "store", store, raising=False)
     monkeypatch.setattr(main, "_record_diagnostic", lambda *args, **kwargs: None)
     return store, recording, exported
@@ -174,6 +178,7 @@ def test_retranscription_rotates_one_raw_backup_and_keeps_current_until_replaced
     store.enqueue(JobInput(f"{session_id}:chunk-a", str(audio), "speaker", 0, "es"))
     store._connection().execute("UPDATE transcription_job SET status='completed', result_json='{}'")
     monkeypatch.setattr(main, "settings", SimpleNamespace(data_dir=tmp_path, recordings_dir=tmp_path / "recordings"), raising=False)
+    monkeypatch.setattr(main, "configured_data_dir", lambda: tmp_path)
     monkeypatch.setattr(main, "store", store, raising=False)
     monkeypatch.setattr(main, "_record_diagnostic", lambda *args, **kwargs: None)
 
@@ -190,3 +195,136 @@ def test_retranscription_rotates_one_raw_backup_and_keeps_current_until_replaced
     assert second["queued"] == 1
     assert backup.read_text(encoding="utf-8") == '{"version":2}\n'
     assert len(list(exported.glob("*respaldo*"))) == 1
+
+
+def _completed_fixture(tmp_path: Path, monkeypatch):
+    store, recording, exported = _fixture(tmp_path, monkeypatch)
+    store._connection().execute("UPDATE transcription_job SET status='completed', result_json='{}'")
+    return store, recording, exported
+
+
+def test_retranscription_holds_lock_through_requeue_and_releases_it(tmp_path: Path, monkeypatch) -> None:
+    store, _, _ = _completed_fixture(tmp_path, monkeypatch)
+    path = SessionFileCoordinator(tmp_path, node_data_dir=tmp_path).path_for("session-one")
+    original = store.retranscribe_session
+
+    def observed(session_id: str, *, on_accepted):
+        assert path.is_file()
+        result = original(session_id, on_accepted=on_accepted)
+        assert path.is_file()
+        return result
+
+    monkeypatch.setattr(store, "retranscribe_session", observed)
+    assert main.retranscribe_session("session-one")["queued"] == 1
+    assert _job_row(store)["status"] == "queued"
+    assert not path.exists()
+
+
+def test_node_lock_blocks_retranscription_without_changing_jobs_or_markers(tmp_path: Path, monkeypatch) -> None:
+    store, recording, exported = _completed_fixture(tmp_path, monkeypatch)
+    before = _job_row(store)
+    ready = recording / ".transcription-ready"
+    ready.write_text("old marker", encoding="utf-8")
+    script = (
+        f"import {{ SessionFileCoordinator }} from "
+        f"{json.dumps((Path(__file__).resolve().parents[3] / 'apps/bot/src/sessions/session-file-coordinator.ts').as_uri())};"
+        f"await new SessionFileCoordinator({json.dumps(str(tmp_path / 'session-locks'))}).runExclusive("
+        "'session-one',async()=>{console.log('READY');await new Promise(done=>process.stdin.once('data',done));});"
+    )
+    process = subprocess.Popen(
+        ["node", "--import", "tsx", "--input-type=module", "-e", script],
+        cwd=Path(__file__).resolve().parents[3], text=True, encoding="utf-8",
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "READY"
+        with pytest.raises(HTTPException) as rejected:
+            main.retranscribe_session("session-one")
+        assert rejected.value.status_code == 423
+        assert rejected.value.detail == {"code": "SESSION_LOCK_TIMEOUT"}
+        assert _job_row(store) == before
+        assert ready.read_text(encoding="utf-8") == "old marker"
+        assert not (recording / ".transcription-regenerating").exists()
+        assert not (exported / "transcript.raw.respaldo.json").exists()
+    finally:
+        assert process.stdin is not None
+        process.stdin.write("release\n")
+        process.stdin.flush()
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == 0, (stdout, stderr)
+
+
+def test_permission_error_has_no_partial_effects(tmp_path: Path, monkeypatch) -> None:
+    store, recording, exported = _completed_fixture(tmp_path, monkeypatch)
+    before = _job_row(store)
+    ready = recording / ".transcription-ready"
+    ready.write_text("old marker", encoding="utf-8")
+    original_open = os.open
+
+    def denied(path, *args, **kwargs):
+        if str(path).endswith(".session.lock"):
+            raise PermissionError("synthetic denial")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", denied)
+    with pytest.raises(HTTPException) as rejected:
+        main.retranscribe_session("session-one")
+    assert rejected.value.status_code == 503
+    assert rejected.value.detail == {"code": "SESSION_LOCK_PERMISSION"}
+    assert _job_row(store) == before
+    assert ready.read_text(encoding="utf-8") == "old marker"
+    assert not (exported / "transcript.raw.respaldo.json").exists()
+
+
+def test_preparation_failure_rolls_back_sqlite_and_releases_lock(tmp_path: Path, monkeypatch) -> None:
+    store, recording, exported = _completed_fixture(tmp_path, monkeypatch)
+    before = _job_row(store)
+    path = SessionFileCoordinator(tmp_path, node_data_dir=tmp_path).path_for("session-one")
+
+    def failed_copy(*args, **kwargs):
+        assert path.exists()
+        raise OSError("synthetic copy failure")
+
+    monkeypatch.setattr(main.shutil, "copyfile", failed_copy)
+    with pytest.raises(OSError, match="synthetic copy failure"):
+        main.retranscribe_session("session-one")
+    assert _job_row(store) == before
+    assert not path.exists()
+    assert not (recording / ".transcription-regenerating").exists()
+    assert not (exported / "transcript.raw.respaldo.json").exists()
+
+
+def test_other_session_can_retranscribe_while_first_is_locked(tmp_path: Path, monkeypatch) -> None:
+    store, _, _ = _completed_fixture(tmp_path, monkeypatch)
+    other = tmp_path / "recordings" / "session-two"
+    other.mkdir()
+    (other / "manifest.json").write_text('{"sessionId":"session-two","status":"completed"}', encoding="utf-8")
+    audio = other / "chunk.wav"
+    audio.write_bytes(b"RIFF" + b"\0" * 48)
+    store.enqueue(JobInput("session-two:chunk-a", str(audio), "speaker", 0, "es"))
+    store._connection().execute("UPDATE transcription_job SET status='completed', result_json='{}' WHERE id='session-two:chunk-a'")
+    owner = SessionFileCoordinator(tmp_path, node_data_dir=tmp_path)
+    with owner.acquire("session-one"):
+        assert main.retranscribe_session("session-two")["queued"] == 1
+    assert store.list_for_session("session-two")[0]["status"] == "queued"
+
+
+def test_surviving_lock_and_different_data_dir_fail_before_changes(tmp_path: Path, monkeypatch) -> None:
+    store, recording, exported = _completed_fixture(tmp_path, monkeypatch)
+    before = _job_row(store)
+    path = SessionFileCoordinator(tmp_path, node_data_dir=tmp_path).path_for("session-one")
+    path.parent.mkdir()
+    path.write_text("abandoned", encoding="utf-8")
+    with pytest.raises(HTTPException) as rejected:
+        main.retranscribe_session("session-one")
+    assert rejected.value.status_code == 423
+    assert path.read_text(encoding="utf-8") == "abandoned"
+    monkeypatch.setattr(main, "configured_data_dir", lambda: tmp_path / "other-data")
+    with pytest.raises(HTTPException) as rejected:
+        main.retranscribe_session("session-one")
+    assert rejected.value.status_code == 503
+    assert rejected.value.detail == {"code": "SESSION_LOCK_CONFIGURATION"}
+    assert _job_row(store) == before
+    assert not (recording / ".transcription-regenerating").exists()
+    assert not (exported / "transcript.raw.respaldo.json").exists()

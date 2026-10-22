@@ -39,6 +39,14 @@ export interface RecoveryIssue {
 export interface MaintenanceState {
   checkedAt: string;
   issues: RecoveryIssue[];
+  localScanAvailable?: boolean;
+  failureQuery?: {
+    status: "current" | "stale" | "unavailable";
+    lastSuccessAt: string | null;
+    reason: "network" | "timeout" | "http" | "invalid" | null;
+    detail: string | null;
+    action: string | null;
+  };
 }
 
 export interface DottyState {
@@ -48,6 +56,9 @@ export interface DottyState {
     connected: boolean;
     pid: number | null;
     connectedAt: string | null;
+    status?: "stopped" | "starting" | "active" | "connected" | "disconnected" | "reconnecting" | "error" | "unknown";
+    reason?: string | null;
+    heartbeatAt?: string;
   };
   transcriber: {
     available: boolean;
@@ -105,6 +116,16 @@ export interface ProcessingStage {
 
 export interface SessionProcessingStatus {
   sessionId: string;
+  transcriptionEvidence?: {
+    availability: "available" | "unavailable" | "invalid";
+    publication: "verified" | "missing" | "legacy-unverifiable" | "stale" | "unavailable" | "invalid";
+    total: number | null;
+    queued: number | null;
+    processing: number | null;
+    completed: number | null;
+    failed: number | null;
+    pendingMutation?: boolean;
+  };
   state: "idle" | "recording" | "transcribing" | "transcript_ready" | "generating_narrative" | "review_blocked" | "awaiting_approval" | "narrative_ready" | "publishing" | "completed" | "error" | "unknown";
   audio: { status: ProcessingStageStatus; details?: string };
   transcription: { status: ProcessingStageStatus; details?: string };
@@ -299,6 +320,12 @@ export interface SetupResult {
   details?: string[];
 }
 
+export interface SetupSafetyStatus {
+  status: "allowed" | "blocked" | "unknown";
+  message: string;
+  action: string;
+}
+
 export type SetupBrowseKind = "python" | "npm" | "data";
 
 export type EditorialScope = "session" | "campaign" | "user" | "global";
@@ -371,6 +398,7 @@ export interface DottyDesktopApi {
   getMaintenanceState(): Promise<MaintenanceState>;
   runMaintenanceAction(action: MaintenanceAction, sessionId: string): Promise<OperationResult>;
   getSetupStatus(): Promise<SetupStatus>;
+  getSetupSafety(config: SetupConfig): Promise<SetupSafetyStatus>;
   browseSetupPath(kind: SetupBrowseKind): Promise<string | null>;
   validateDiscord(config: SetupConfig): Promise<SetupResult>;
   saveSetup(config: SetupConfig): Promise<SetupResult>;

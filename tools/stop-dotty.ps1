@@ -1,6 +1,19 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$setupLockPath = Join-Path $projectRoot ".setup-operation.lock"
+$setupOwner = [guid]::NewGuid().ToString("N")
+try {
+  $setupLock = [System.IO.File]::Open($setupLockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  try {
+    $ownerBytes = [System.Text.Encoding]::UTF8.GetBytes($setupOwner)
+    $setupLock.Write($ownerBytes, 0, $ownerBytes.Length)
+    $setupLock.Flush($true)
+  } finally { $setupLock.Dispose() }
+} catch {
+  throw "No se puede detener Dotty mientras hay una operación de configuración o un candado pendiente de revisión."
+}
+try {
 $stopped = 0
 $environmentPath = Join-Path $projectRoot ".env"
 $configuredDataDirectory = "./data"
@@ -47,8 +60,16 @@ if (Test-Path -LiteralPath $botStatusPath) {
   $status = Get-Content -LiteralPath $botStatusPath -Raw | ConvertFrom-Json
   $botProcessId = [int]$status.pid
   if (Get-Process -Id $botProcessId -ErrorAction SilentlyContinue) {
+    $botProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$botProcessId" -ErrorAction Stop
+    $startedAt = ([datetime]$status.processStartedAt).ToUniversalTime()
+    if ($status.version -ne 1 -or -not $status.instanceId -or $null -eq $botProcess -or
+        [string]$botProcess.Name -notmatch '^node(\.exe)?$' -or
+        [string]$botProcess.CommandLine -notmatch '(?i)(?:src[\\/])?index\.ts' -or
+        [Math]::Abs((([datetime]$botProcess.CreationDate).ToUniversalTime() - $startedAt).TotalSeconds) -gt 2) {
+      throw "La identidad del bot no coincide con su estado. No se enviara una solicitud de cierre."
+    }
     $requestPath = Join-Path $dataDirectory "dotty.stop-request.json"
-    @{ pid = $botProcessId } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -Encoding ASCII
+    @{ pid = $botProcessId; instanceId = [string]$status.instanceId } | ConvertTo-Json | Set-Content -LiteralPath $requestPath -Encoding ASCII
     $deadline = (Get-Date).AddSeconds(45)
     while ((Test-Path -LiteralPath $botStatusPath) -and (Get-Date) -lt $deadline) {
       Start-Sleep -Milliseconds 250
@@ -187,4 +208,10 @@ if ($stopped -eq 0) {
 } else {
   Write-LogLine $stopLogPath "Dotty fue detenido."
   Write-Host "[OK] Dotty fue detenido." -ForegroundColor Green
+}
+} finally {
+  if ((Test-Path -LiteralPath $setupLockPath) -and
+      ((Get-Content -LiteralPath $setupLockPath -Raw -ErrorAction SilentlyContinue) -eq $setupOwner)) {
+    Remove-Item -LiteralPath $setupLockPath -Force
+  }
 }

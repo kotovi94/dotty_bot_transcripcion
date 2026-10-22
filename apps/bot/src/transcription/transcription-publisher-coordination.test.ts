@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import { SessionFileCoordinator } from "../sessions/session-file-coordinator.ts"
 import { CampaignFileCoordinator } from "../sessions/campaign-file-coordinator.ts";
 import { SessionAdministration } from "../sessions/session-administration.ts";
 import { TranscriptionPublisher } from "./transcription-publisher.ts";
+import { jobsDigest, parseReadyMarker, transcriptDigest, verifyReadyMarker } from "../../../../packages/shared/src/transcription-ready.ts";
 
 function gate() {
   let release!: () => void;
@@ -31,7 +33,8 @@ function prepared(init: RequestInit | undefined): Response {
 }
 
 const job = (id: string) => ({ id: `${id}:chunk-1`, status: "completed", speaker_user_id: "user-1",
-  start_offset_ms: 0, result: { language: "es", segments: [] } });
+  start_offset_ms: 0, completed_at: "2026-01-01T01:00:01+00:00",
+  result: { language: "es", segments: [] } });
 
 async function fixture(test: { after(callback: () => Promise<void>): void }, ids = ["session-1"]) {
   const root = await mkdtemp(join(tmpdir(), "dotty-publisher-lock-"));
@@ -262,5 +265,208 @@ describe("coordinated transcription publication", () => {
     test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [job("session-1")] }), { status: 200 }));
     await f.publisher.publishReady();
     await access(f.path("session-1", ".transcription-ready"));
+  });
+
+  it("writes a verifiable v1 marker for exactly the published jobs and final transcript bytes", async (test) => {
+    const f = await fixture(test);
+    const publishedJob = { ...job("session-1"), result: { language: "es", segments: [{
+      start_ms: 0, end_ms: 1200, text: "Hola al grupo.",
+      words: [{ text: " Hola", start_ms: 0, end_ms: 300, probability: 0.9 },
+        { text: " al", start_ms: 301, end_ms: 500, probability: 0.9 },
+        { text: " grupo.", start_ms: 501, end_ms: 1200, probability: 0.9 }],
+    }] } };
+    let requests = 0;
+    test.mock.method(globalThis, "fetch", async () => {
+      requests++;
+      return new Response(JSON.stringify({ jobs: [publishedJob] }), { status: 200 });
+    });
+    await f.publisher.publishReady();
+    const content = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    const transcript = await readFile(join(f.exports, "session-1", "bitacora.md"));
+    assert.match(transcript.toString("utf8"), /Hola al grupo/u);
+    const parsed = parseReadyMarker(content);
+    assert.equal(parsed.kind, "verifiable");
+    if (parsed.kind !== "verifiable") return;
+    assert.equal(parsed.marker.jobs_digest, jobsDigest("session-1", [publishedJob]));
+    assert.equal(parsed.marker.transcript_digest, transcriptDigest(transcript));
+    assert.equal(verifyReadyMarker(content, "session-1", [publishedJob], transcript), "verified");
+    assert.equal(requests, 2);
+    assert.equal(content.endsWith("\n"), true);
+  });
+
+  it("does not create a marker when writing the transcript fails", async (test) => {
+    const f = await fixture(test);
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [job("session-1")] })));
+    const original = fs.rename.bind(fs);
+    test.mock.method(fs, "rename", async (source: string, destination: string) => {
+      if (destination.endsWith("bitacora.md")) throw new Error("synthetic transcript failure");
+      return original(source, destination);
+    });
+    await f.publisher.publishReady();
+    await assert.rejects(access(f.path("session-1", ".transcription-ready")));
+  });
+
+  it("does not create a marker when a later artifact fails", async (test) => {
+    const f = await fixture(test);
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [job("session-1")] })));
+    const original = fs.rename.bind(fs);
+    test.mock.method(fs, "rename", async (source: string, destination: string) => {
+      if (destination.endsWith("transcript_full.txt")) throw new Error("synthetic later artifact failure");
+      return original(source, destination);
+    });
+    await f.publisher.publishReady();
+    await access(join(f.exports, "session-1", "bitacora.md"));
+    await assert.rejects(access(f.path("session-1", ".transcription-ready")));
+  });
+
+  it("keeps the publication retryable when marker installation fails", async (test) => {
+    const f = await fixture(test);
+    const publishedJob = job("session-1");
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [publishedJob] })));
+    const original = fs.rename.bind(fs);
+    const failure = test.mock.method(fs, "rename", async (source: string, destination: string) => {
+      if (destination.endsWith(".transcription-ready")) throw new Error("synthetic marker failure");
+      return original(source, destination);
+    });
+    await f.publisher.publishReady();
+    await access(join(f.exports, "session-1", "bitacora.md"));
+    await assert.rejects(access(f.path("session-1", ".transcription-ready")));
+    failure.mock.restore();
+    await f.publisher.publishReady();
+    const content = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    const transcript = await readFile(join(f.exports, "session-1", "bitacora.md"));
+    assert.equal(verifyReadyMarker(content, "session-1", [publishedJob], transcript), "verified");
+  });
+
+  it("keeps the old marker stale and preserves history if replacement is interrupted", async (test) => {
+    const f = await fixture(test);
+    let current = job("session-1");
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [current] })));
+    await f.publisher.publishReady();
+    const oldMarker = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    const oldTranscript = await readFile(join(f.exports, "session-1", "bitacora.md"), "utf8");
+    current = { ...current, completed_at: "2026-01-01T03:00:01+00:00", result: { language: "en", segments: [] } };
+    const original = fs.rename.bind(fs);
+    const failure = test.mock.method(fs, "rename", async (source: string, destination: string) => {
+      if (destination.endsWith("transcript_full.txt")) throw new Error("synthetic interruption");
+      return original(source, destination);
+    });
+    await f.publisher.publishReady();
+    assert.equal(await readFile(f.path("session-1", ".transcription-ready"), "utf8"), oldMarker);
+    assert.equal(verifyReadyMarker(oldMarker, "session-1", [current],
+      await readFile(join(f.exports, "session-1", "bitacora.md"))), "mismatch");
+    const history = join(f.exports, "session-1", "publication-history", createHash("sha256").update(oldMarker).digest("hex"));
+    assert.equal(await readFile(join(history, "bitacora.md"), "utf8"), oldTranscript);
+    failure.mock.restore();
+    await f.publisher.publishReady();
+    assert.equal(verifyReadyMarker(await readFile(f.path("session-1", ".transcription-ready"), "utf8"), "session-1",
+      [current], await readFile(join(f.exports, "session-1", "bitacora.md"))), "verified");
+  });
+
+  it("preserves an existing historical marker and transcript", async (test) => {
+    const f = await fixture(test);
+    const legacy = "2026-01-01T01:00:02.000Z\n";
+    await mkdir(join(f.exports, "session-1"), { recursive: true });
+    await writeFile(f.path("session-1", ".transcription-ready"), legacy);
+    await writeFile(join(f.exports, "session-1", "bitacora.md"), "historical transcript\n");
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [job("session-1")] })));
+    await f.publisher.publishReady();
+    assert.equal(await readFile(f.path("session-1", ".transcription-ready"), "utf8"), legacy);
+    assert.equal(await readFile(join(f.exports, "session-1", "bitacora.md"), "utf8"), "historical transcript\n");
+  });
+
+  it("does not regenerate an already verified v1 publication", async (test) => {
+    const f = await fixture(test);
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [job("session-1")] })));
+    await f.publisher.publishReady();
+    const before = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    const observations = f.observations();
+    await f.publisher.publishReady();
+    assert.equal(await readFile(f.path("session-1", ".transcription-ready"), "utf8"), before);
+    assert.equal(f.observations(), observations);
+  });
+
+  it("preserves a manually changed bitácora when jobs later change without regeneration", async (test) => {
+    const f = await fixture(test);
+    let current = job("session-1");
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [current] })));
+    await f.publisher.publishReady();
+    const marker = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    await writeFile(join(f.exports, "session-1", "bitacora.md"), "manual revision\n");
+    current = { ...current, result: { language: "en", segments: [] } };
+    await f.publisher.publishReady();
+    assert.equal(await readFile(join(f.exports, "session-1", "bitacora.md"), "utf8"), "manual revision\n");
+    assert.equal(await readFile(f.path("session-1", ".transcription-ready"), "utf8"), marker);
+  });
+
+  it("replaces a legacy marker only with explicit regeneration evidence", async (test) => {
+    const f = await fixture(test);
+    const legacy = "2026-01-01T01:00:02.000Z\n";
+    await writeFile(f.path("session-1", ".transcription-ready"), legacy);
+    await writeFile(f.path("session-1", ".transcription-regenerating"), "retry");
+    await mkdir(join(f.exports, "session-1"), { recursive: true });
+    await writeFile(join(f.exports, "session-1", "bitacora.md"), "old transcript\n");
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [job("session-1")] })));
+    await f.publisher.publishReady();
+    const current = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    assert.equal(verifyReadyMarker(current, "session-1", [job("session-1")],
+      await readFile(join(f.exports, "session-1", "bitacora.md"))), "verified");
+    const history = join(f.exports, "session-1", "publication-history", createHash("sha256").update(legacy).digest("hex"));
+    assert.equal(await readFile(join(history, ".transcription-ready"), "utf8"), legacy);
+    assert.equal(await readFile(join(history, "bitacora.md"), "utf8"), "old transcript\n");
+    await assert.rejects(access(f.path("session-1", ".transcription-regenerating")));
+  });
+
+  it("does not replace a marker that appears before installation", async (test) => {
+    const f = await fixture(test);
+    const legacy = "2026-01-01T01:00:02.000Z\n";
+    f.setObserving(async () => { await writeFile(f.path("session-1", ".transcription-ready"), legacy); });
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [job("session-1")] })));
+    await f.publisher.publishReady();
+    assert.equal(await readFile(f.path("session-1", ".transcription-ready"), "utf8"), legacy);
+  });
+
+  it("uses a new digest when retranscription yields different results", async (test) => {
+    const f = await fixture(test);
+    let current = job("session-1");
+    test.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ jobs: [current] })));
+    await f.publisher.publishReady();
+    const firstContent = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    const firstTranscript = await readFile(join(f.exports, "session-1", "bitacora.md"), "utf8");
+    const first = parseReadyMarker(firstContent);
+    assert.equal(first.kind, "verifiable");
+    current = { ...current, completed_at: "2026-01-01T02:00:01+00:00",
+      result: { language: "en", segments: [] } };
+    await f.publisher.publishReady();
+    const secondContent = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    const second = parseReadyMarker(secondContent);
+    const history = join(f.exports, "session-1", "publication-history", createHash("sha256").update(firstContent).digest("hex"));
+    assert.equal(await readFile(join(history, ".transcription-ready"), "utf8"), firstContent);
+    assert.equal(await readFile(join(history, "bitacora.md"), "utf8"), firstTranscript);
+    assert.equal(second.kind, "verifiable");
+    if (first.kind !== "verifiable" || second.kind !== "verifiable") return;
+    assert.notEqual(second.marker.jobs_digest, first.marker.jobs_digest);
+    assert.equal(verifyReadyMarker(secondContent, "session-1", [current],
+      await readFile(join(f.exports, "session-1", "bitacora.md"))), "verified");
+  });
+
+  it("does not mark changed jobs as ready and republishes their new snapshot on retry", async (test) => {
+    const f = await fixture(test);
+    const original = job("session-1");
+    const changed = { ...original, completed_at: "2026-01-01T02:00:01+00:00",
+      result: { language: "es", segments: [], status: "unintelligible" } };
+    let requests = 0;
+    test.mock.method(globalThis, "fetch", async () => {
+      requests++;
+      return new Response(JSON.stringify({ jobs: [requests === 1 ? original : changed] }));
+    });
+    await f.publisher.publishReady();
+    await access(join(f.exports, "session-1", "bitacora.md"));
+    await assert.rejects(access(f.path("session-1", ".transcription-ready")));
+    await f.publisher.publishReady();
+    const content = await readFile(f.path("session-1", ".transcription-ready"), "utf8");
+    assert.equal(verifyReadyMarker(content, "session-1", [changed],
+      await readFile(join(f.exports, "session-1", "bitacora.md"))), "verified");
+    assert.equal(requests, 4);
   });
 });

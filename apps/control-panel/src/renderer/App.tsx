@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -27,6 +27,10 @@ import { SessionDetailPanel, type SessionDetailTab } from "./components/SessionD
 import { Sidebar, type SidebarPage } from "./components/Sidebar";
 import { StatusCard } from "./components/StatusCard";
 import { SetupWizard } from "./SetupWizard";
+import { deriveProcessingStages } from "./processing-stages";
+import { MaintenanceRequestGate } from "./maintenance-request";
+import { maintenanceDisplay } from "./maintenance-display";
+import { StateUpdateGate } from "./state-update-gate";
 
 import type {
   DottyState,
@@ -47,7 +51,7 @@ type Page = SidebarPage;
 
 const initialState: DottyState = {
   timestamp: new Date().toISOString(),
-  bot: { running: false, connected: false, pid: null, connectedAt: null },
+  bot: { running: false, connected: false, pid: null, connectedAt: null, status: "unknown", reason: "Esperando la primera comprobación del bot." },
   transcriber: {
     available: false,
     model: null,
@@ -122,16 +126,6 @@ function getNarrativeStatusLabel(state: TranscriptSummary["narrativeState"]) {
   }
 }
 
-function stageStatusLabel(status: NonNullable<TranscriptSummary["processing"]>["stages"][number]["status"]): string {
-  if (status === "completed") return "COMPLETADO";
-  if (status === "running") return "PROCESANDO";
-  if (status === "pending") return "PENDIENTE";
-  if (status === "warning") return "AVISO";
-  if (status === "blocked") return "BLOQUEADO";
-  if (status === "error") return "ERROR";
-  return "DESCONOCIDO";
-}
-
 export function App() {
   const [page, setPage] = useState<Page>("dashboard");
   const [state, setState] = useState<DottyState>(initialState);
@@ -159,12 +153,17 @@ export function App() {
   const [editorialState, setEditorialState] = useState<EditorialLearningState | null>(null);
   const [editorialComment, setEditorialComment] = useState("");
   const [editorialBusy, setEditorialBusy] = useState(false);
+  const selectionRequest = useRef(0);
+  const stateRequest = useRef(new StateUpdateGate());
+  const maintenanceRequest = useRef(new MaintenanceRequestGate());
 
   const loadTranscripts = useCallback(async () => {
     const next = await window.dotty.listTranscripts();
     setTranscripts(next);
     if (!selected && next[0]) {
+      const request = ++selectionRequest.current;
       const detail = await window.dotty.readTranscript(next[0].sessionId);
+      if (request !== selectionRequest.current) return;
       setSelected(detail);
       const mode = detail.narrativeContent === null ? "transcript" : "narrative";
       setReaderMode(mode);
@@ -184,19 +183,37 @@ export function App() {
   }, [selected?.sessionId]);
 
   const loadMaintenance = useCallback(async () => {
-    setMaintenance(await window.dotty.getMaintenanceState());
+    const request = maintenanceRequest.current.begin();
+    try {
+      const next = await window.dotty.getMaintenanceState();
+      if (maintenanceRequest.current.isCurrent(request)) setMaintenance(next);
+    } catch {
+      if (maintenanceRequest.current.isCurrent(request)) setMaintenance((previous) => ({
+        ...previous,
+        checkedAt: new Date().toISOString(),
+        failureQuery: {
+          status: previous.failureQuery?.lastSuccessAt ? "stale" : "unavailable",
+          lastSuccessAt: previous.failureQuery?.lastSuccessAt ?? null,
+          reason: "network",
+          detail: "No se pudo actualizar el estado de incidencias del panel.",
+          action: "Comprueba el panel y el transcriptor; la consulta se reintentará automáticamente.",
+        },
+      }));
+    }
   }, []);
 
   useEffect(() => {
-    void window.dotty.getState().then(setState);
+    const request = stateRequest.current.beginRequest();
+    void window.dotty.getState().then((next) => { if (stateRequest.current.isCurrent(request)) setState(next); });
     void window.dotty.getSetupStatus().then(setSetupStatus);
     void window.dotty.getSystemStatus().then(setSystemStatus);
-    void window.dotty.getMaintenanceState().then(setMaintenance);
+    void loadMaintenance();
     return window.dotty.onState((next) => {
+      stateRequest.current.acceptEvent();
       setState(next);
       void window.dotty.getSystemStatus().then(setSystemStatus);
     });
-  }, []);
+  }, [loadMaintenance]);
 
   useEffect(() => {
     if (!selected) {
@@ -236,27 +253,33 @@ export function App() {
   useEffect(() => {
     if (!selected?.sessionId || (page !== "processing" && page !== "sessions" && narrativeBusy === null)) return;
     let active = true;
+    let inFlight = false;
     let sawRawRegeneration = false;
     const refreshProcessing = async () => {
-      const processing = await window.dotty.getSessionProcessingStatus(selected.sessionId);
-      if (!active) return;
-      const rawStage = processing.stages.find((stage) => stage.id === "transcription");
-      const regenerating = rawStage?.details.startsWith("Rehaciendo raw") ?? false;
-      if (regenerating) sawRawRegeneration = true;
-      setSelected((current) => current?.sessionId === selected.sessionId
-        ? { ...current, processing }
-        : current);
-      setSessionDetails((current) => current?.id === selected.sessionId
-        ? { ...current, processing }
-        : current);
-      if (sawRawRegeneration && !regenerating) {
-        sawRawRegeneration = false;
-        const refreshed = await window.dotty.readTranscript(selected.sessionId).catch(() => null);
-        if (active && refreshed) {
-          setSelected((current) => current?.sessionId === selected.sessionId ? refreshed : current);
-          setNotice("Raw actualizado. Revisa la nueva transcripción y regenera el guion si corresponde.");
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const processing = await window.dotty.getSessionProcessingStatus(selected.sessionId);
+        if (!active) return;
+        const rawStage = processing.stages.find((stage) => stage.id === "transcription");
+        const regenerating = rawStage?.details.startsWith("Rehaciendo raw") ?? false;
+        if (regenerating) sawRawRegeneration = true;
+        setSelected((current) => current?.sessionId === selected.sessionId
+          ? { ...current, processing }
+          : current);
+        setSessionDetails((current) => current?.id === selected.sessionId
+          ? { ...current, processing }
+          : current);
+        if (sawRawRegeneration && !regenerating) {
+          sawRawRegeneration = false;
+          const refreshed = await window.dotty.readTranscript(selected.sessionId).catch(() => null);
+          if (active && refreshed) {
+            setSelected((current) => current?.sessionId === selected.sessionId ? refreshed : current);
+            setNotice("Raw actualizado. Revisa la nueva transcripción y regenera el guion si corresponde.");
+          }
         }
-      }
+      } catch { /* La siguiente consulta volverá a comprobar la sesión. */ }
+      finally { inFlight = false; }
     };
     void refreshProcessing();
     const timer = window.setInterval(() => void refreshProcessing(), 2_000);
@@ -285,7 +308,9 @@ export function App() {
   };
 
   const selectTranscript = async (summary: TranscriptSummary) => {
+    const request = ++selectionRequest.current;
     const detail = await window.dotty.readTranscript(summary.sessionId);
+    if (request !== selectionRequest.current) return;
     setSelected(detail);
     const mode = detail.narrativeContent === null ? "transcript" : "narrative";
     setReaderMode(mode);
@@ -522,52 +547,19 @@ export function App() {
   const lastSession = transcripts[0] ?? null;
   const systemControlStatus = state.operation
     ? state.operation.kind === "restart" ? "REINICIANDO" : state.operation.kind === "disconnect" || state.operation.kind === "stop" ? "DETENIENDO" : "INICIANDO"
-    : systemOperational ? "OPERATIVO" : partiallyReady ? "ERROR" : "APAGADO";
+    : systemOperational ? "OPERATIVO" : state.bot.status === "unknown" ? "DESCONOCIDO" : partiallyReady ? "ERROR" : "APAGADO";
 
-  const processingStages = useMemo<Array<{ id: string; label: string; status: string; details: string; progress: number | undefined; current: number | undefined; total: number | undefined; errors: number; warnings: number; artifact: string | undefined }>>(() => {
-    if (selected?.processing?.stages?.length) {
-      return selected.processing.stages.map((stage) => ({
-        id: stage.id,
-        label: stage.label,
-        status: stage.id === "transcription" && working?.session_id === selected.sessionId && stage.status !== "completed"
-          ? "PROCESANDO" : stageStatusLabel(stage.status),
-        details: stage.id === "transcription" && working?.session_id === selected.sessionId && (working.session_total_jobs ?? 0) > 0
-          ? `${working.session_completed_jobs ?? 0} de ${working.session_total_jobs} fragmentos · ${working.session_failed_jobs ?? 0} fallidos`
-          : stage.details,
-        progress: stage.id === "transcription" && working?.session_id === selected.sessionId
-          ? working.session_progress ?? working.progress
-          : stage.progress,
-        current: stage.id === "transcription" && working?.session_id === selected.sessionId
-          ? working.session_completed_jobs : stage.current,
-        total: stage.id === "transcription" && working?.session_id === selected.sessionId
-          ? working.session_total_jobs : stage.total,
-        errors: stage.errors ?? 0,
-        warnings: stage.warnings ?? 0,
-        artifact: stage.artifact,
-      }));
-    }
-    const transcribeStatus = working ? "PROCESANDO" : state.transcriber.available ? "COMPLETADO" : "PENDIENTE";
-    const logStatus = selected && selected.content ? "COMPLETADO" : transcripts.some((entry) => Boolean(entry.title)) ? "PENDIENTE" : "DESCONOCIDO";
-    const narrativeStatus = selected ? (() => {
-      if (selected.narrativeContent) return "COMPLETADO";
-      if (selected.narrativeState === "generating") return "PROCESANDO";
-      if (selected.narrativeState === "failed") return "ERROR";
-      return selected.narrativeState === "queued" ? "PENDIENTE" : "DESCONOCIDO";
-    })() : transcripts.some((entry) => entry.narrativeState === "ready") ? "COMPLETADO" : "PENDIENTE";
-    const publicationStatus = selected?.canOpenDiscord ? "COMPLETADO" : selected?.narrativeContent ? "PENDIENTE" : "DESCONOCIDO";
-
-    return [
-      { id: "capture", label: "Grabación", status: state.bot.connected ? "COMPLETADO" : state.bot.running ? "PROCESANDO" : "DESCONOCIDO", details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
-      { id: "transcription", label: "Transcripción", status: transcribeStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
-      { id: "raw_quality", label: "Bitácora", status: logStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
-      { id: "assembly", label: "Narrativa", status: narrativeStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
-      { id: "publication", label: "Publicación", status: publicationStatus, details: "Estado general", progress: undefined, current: undefined, total: undefined, errors: 0, warnings: 0, artifact: undefined },
-    ];
-  }, [selected, state.bot.connected, state.bot.running, state.transcriber.available, transcripts, working]);
+  const processingStages = useMemo(() => deriveProcessingStages(selected, transcripts, state), [selected, transcripts, state]);
   const completedStages = processingStages.filter((stage) => stage.status === "COMPLETADO").length;
   const narrativeProgress = selected?.processing?.narrativeProgress ?? selected?.narrativeProgress ?? 0;
   const narrativePhase = selected?.processing?.narrativePhase ?? selected?.narrativePhase ?? "Sin generar";
   const publicationStage = selected?.processing?.stages.find((stage) => stage.id === "publication");
+  const failureQuery = maintenance.failureQuery;
+  const failureDisplay = maintenanceDisplay(maintenance);
+  const failuresCurrent = failureQuery?.status === "current";
+  const incidentsConfirmed = failureDisplay.confirmed;
+  const lastFailureUpdate = failureQuery?.lastSuccessAt
+    ? new Date(failureQuery.lastSuccessAt).toLocaleString("es-CL") : null;
 
   if (!setupStatus) return <div className="setup-loading">Cargando configuración de Dotty...</div>;
   if (!setupStatus.configured) return <SetupWizard status={setupStatus} onComplete={(next) => { setSetupStatus(next); setPage("dashboard"); }} />;
@@ -593,7 +585,7 @@ export function App() {
           </div>
           <div className="topbar-state">
             <StatusDot active={fullyReady} warning={partiallyReady && !fullyReady} />
-            <span>{state.operation ? operationLabels[state.operation.kind] : fullyReady ? "Todos los sistemas operativos" : partiallyReady ? "Servicios iniciando" : "Servicios detenidos"}</span>
+            <span>{state.operation ? operationLabels[state.operation.kind] : fullyReady ? "Todos los sistemas operativos" : state.bot.status === "unknown" ? "Estado del bot desconocido" : partiallyReady ? "Servicios iniciando" : "Servicios detenidos"}</span>
           </div>
         </header>
 
@@ -606,7 +598,7 @@ export function App() {
         {page === "dashboard" && (
           <section className="page-content dashboard-page">
             <div className="service-grid compact-grid">
-              <StatusCard icon={<Bot size={22} />} title="DOTTY BOT" value={state.bot.connected ? "Online" : state.bot.running ? "Iniciando" : "Offline"} detail={state.bot.connectedAt ? `Conectado desde ${formatDate(state.bot.connectedAt)}` : "Sin conexión activa"} tone={state.bot.connected ? "good" : state.bot.running ? "warn" : "muted"} />
+              <StatusCard icon={<Bot size={22} />} title="DOTTY BOT" value={{ stopped: "Detenido", starting: "Iniciando", active: "Proceso activo", connected: "Discord conectado", disconnected: "Discord desconectado", reconnecting: "Reconectando", error: "Error", unknown: "Estado desconocido" }[state.bot.status ?? "unknown"]} detail={state.bot.reason ?? (state.bot.connectedAt ? `Conectado desde ${formatDate(state.bot.connectedAt)}` : "Sin conexión activa")} tone={state.bot.connected ? "good" : state.bot.running ? "warn" : "muted"} />
               <StatusCard icon={<Cpu size={22} />} title="TRANSCRIPTOR" value={state.transcriber.available ? "Disponible" : "No disponible"} detail={state.transcriber.model ?? (state.transcriber.available ? "Modelo cargado" : "Sin comprobación disponible")} tone={state.transcriber.available ? "good" : "muted"} />
               <StatusCard icon={<Gauge size={22} />} title="OLLAMA" value={systemStatus?.ollama.available ? "Disponible" : "No disponible"} detail={systemStatus?.ollama.error ?? systemStatus?.ollama.modelConfigured ?? "Sin modelo actual"} tone={systemStatus?.ollama.available ? "good" : "muted"} />
               <StatusCard icon={<Database size={22} />} title="ÚLTIMA SESIÓN" value={lastSession?.title ?? "Sin sesiones"} detail={lastSession ? `${lastSession.campaignName ?? "Campaña sin nombre"} · Sesión ${lastSession.sequenceNumber ?? "sin número"} · ${formatSessionStatus(lastSession.status)}` : "No disponible"} tone={lastSession ? "good" : "muted"} />
@@ -632,6 +624,12 @@ export function App() {
                     <strong>{maintenance.issues[0].title}</strong>
                     <span>{maintenance.issues[0].status} · {maintenance.issues[0].failedJobs} fallidos</span>
                     {maintenance.issues[0].lastError && <small>{maintenance.issues[0].lastError}</small>}
+                  </div>
+                ) : !incidentsConfirmed ? (
+                  <div className="error-stack">
+                    <strong>Estado de incidencias desconocido</strong>
+                    <small>{maintenance.localScanAvailable === false ? "No se pudieron revisar las sesiones locales." : failureQuery?.detail ?? "Aún no hay una consulta válida de incidencias."}</small>
+                    {lastFailureUpdate && <small>Última actualización correcta: {lastFailureUpdate}.</small>}
                   </div>
                 ) : selected?.narrativeError ? (
                   <div className="error-stack">
@@ -797,7 +795,19 @@ export function App() {
 
               <article className="panel compact-panel">
                 <div className="panel-heading"><div><span className="eyebrow">RECUPERACIÓN</span><h3>Reparación y mantenimiento</h3></div><ShieldCheck size={18} /></div>
-                {maintenance.issues.length === 0 ? (
+                {!failuresCurrent && <div className="error-stack" role="status">
+                  <strong>{failureDisplay.stale ? "Incidencias desactualizadas" : "Estado de incidencias desconocido"}</strong>
+                  <span>{failureQuery?.detail ?? "Aún no se pudieron consultar las incidencias."}</span>
+                  {lastFailureUpdate && <small>Última actualización correcta: {lastFailureUpdate}.</small>}
+                  {failureQuery?.action && <small>{failureQuery.action}</small>}
+                </div>}
+                {maintenance.localScanAvailable === false && <div className="error-stack" role="status">
+                  <strong>Sesiones locales no disponibles</strong>
+                  <span>No se pudieron revisar las grabaciones locales; el estado de incidencias está incompleto.</span>
+                  <small>Comprueba el acceso a la carpeta de datos. El panel volverá a consultar automáticamente.</small>
+                </div>}
+                {failuresCurrent && lastFailureUpdate && <p>Última actualización correcta: {lastFailureUpdate}.</p>}
+                {failureDisplay.empty ? (
                   <div className="empty-inline"><ShieldCheck size={28} /><div><strong>Sin incidencias</strong><span>No hay grabaciones ni transcripciones bloqueadas.</span></div></div>
                 ) : (
                   maintenance.issues.map((issue) => (
@@ -808,7 +818,7 @@ export function App() {
                         {issue.lastError && <small>{issue.lastError}</small>}
                       </div>
                       <div className="issue-actions">
-                        {issue.canRetry && <button disabled={maintenanceBusy !== null} onClick={() => void runMaintenance("retry-failed", issue.sessionId)}>Reintentar</button>}
+                        {issue.canRetry && <button disabled={maintenanceBusy !== null || !failuresCurrent} onClick={() => void runMaintenance("retry-failed", issue.sessionId)}>Reintentar</button>}
                         {issue.canRecover && <button className="primary" disabled={maintenanceBusy !== null} onClick={() => void runMaintenance("recover-session", issue.sessionId)}>Recuperar y transcribir</button>}
                       </div>
                     </div>

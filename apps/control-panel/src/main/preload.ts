@@ -58,6 +58,7 @@ const api: DottyDesktopApi = {
   runMaintenanceAction: (action: MaintenanceAction, sessionId: string) =>
     ipcRenderer.invoke("dotty:maintenance-action", action, sessionId),
   getSetupStatus: () => ipcRenderer.invoke("dotty:setup-status"),
+  getSetupSafety: (config: SetupConfig) => ipcRenderer.invoke("dotty:setup-safety", config),
   browseSetupPath: (kind: SetupBrowseKind) =>
     ipcRenderer.invoke("dotty:setup-browse", kind),
   validateDiscord: (config: SetupConfig) =>

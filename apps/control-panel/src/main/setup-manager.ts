@@ -1,15 +1,20 @@
 import { execFile, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomBytes, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { access, copyFile, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { shell } from "electron";
 
-import type { SetupConfig, SetupResult, SetupStatus, TranscriptionMode } from "../shared/contracts.js";
+import type { SetupConfig, SetupResult, SetupSafetyStatus, SetupStatus, TranscriptionMode } from "../shared/contracts.js";
+import { SetupOperationLock } from "./setup-operation-lock.js";
+import { inspectSetupSafety } from "./setup-safety.js";
 
 const execFileAsync = promisify(execFile);
 const snowflake = /^\d{17,20}$/;
+
+class SetupSafetyError extends Error {}
 
 function parseEnv(content: string): Map<string, string> {
   const values = new Map<string, string>();
@@ -20,8 +25,19 @@ function parseEnv(content: string): Map<string, string> {
   return values;
 }
 
-function envValue(value: string): string {
-  return value.replace(/[\r\n]/g, "").trim();
+function mergeEnv(raw: string, updates: Map<string, string>): string {
+  const separator = raw.includes("\r\n") ? "\r\n" : "\n";
+  const seen = new Set<string>();
+  const lines = raw ? raw.split(/\r?\n/) : [];
+  const merged = lines.flatMap((line) => {
+    const key = /^\s*([A-Z][A-Z0-9_]*)=/.exec(line)?.[1];
+    if (!key || !updates.has(key)) return [line];
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [`${key}=${updates.get(key)}`];
+  });
+  for (const [key, value] of updates) if (!seen.has(key)) merged.push(`${key}=${value}`);
+  return merged.join(separator).replace(/(?:\r?\n)*$/u, separator);
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -37,9 +53,32 @@ async function findCommand(command: string): Promise<string> {
 
 export class SetupManager {
   private readonly envPath: string;
+  private readonly lock: SetupOperationLock;
 
-  constructor(private readonly projectRoot: string) {
+  constructor(private readonly projectRoot: string,
+    private readonly inspect: typeof inspectSetupSafety = inspectSetupSafety) {
     this.envPath = join(projectRoot, ".env");
+    this.lock = new SetupOperationLock(projectRoot);
+  }
+
+  async getSafety(config: SetupConfig): Promise<SetupSafetyStatus> {
+    if (await exists(join(this.projectRoot, ".setup-operation.lock"))) return {
+      status: "blocked", message: "Ya hay una operación de configuración o arranque en curso.",
+      action: "Espera a que termine. Si el candado sobrevivió a una caída, revísalo antes de retirarlo manualmente.",
+    };
+    return this.checkActivity(config);
+  }
+
+  private async checkActivity(config: SetupConfig): Promise<SetupSafetyStatus> {
+    let raw = "";
+    try { raw = await readFile(this.envPath, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return {
+      status: "unknown", message: "No se pudo leer la configuración actual.",
+      action: "Comprueba el acceso a .env antes de continuar.",
+    }; }
+    const oldData = parseEnv(raw).get("DOTTY_DATA_DIR");
+    const dirs = [config.dataDirectory, oldData ? resolve(this.projectRoot, oldData) : join(this.projectRoot, "data")];
+    return this.inspect(dirs);
   }
 
   async getStatus(): Promise<SetupStatus> {
@@ -108,50 +147,69 @@ export class SetupManager {
   async save(config: SetupConfig): Promise<SetupResult> {
     const validation = await this.validateLocal(config);
     if (!validation.ok) return validation;
-    const old = parseEnv(await readFile(this.envPath, "utf8").catch(() => ""));
-    const token = config.discordToken.trim() || (config.keepExistingToken ? old.get("DISCORD_TOKEN") || "" : "");
-    if (!token) return { ok: false, message: "Falta el token de Discord." };
-    const mode = config.transcriptionMode;
-    const gpuDetected = mode === "auto" ? (await this.detectGpu()).detected : false;
-    const device = mode === "cpu" || (mode === "auto" && !gpuDetected) ? "cpu" : "cuda";
-    const compute = device === "cpu" ? "int8" : "float16";
-    const secret = old.get("TRANSCRIBER_SHARED_SECRET") || randomBytes(48).toString("base64url");
-    const lines = [
-      "# Configuración creada por el asistente de Dotty",
-      `DISCORD_TOKEN=${envValue(token)}`,
-      `DISCORD_CLIENT_ID=${envValue(config.discordClientId)}`,
-      `DISCORD_GUILD_ID=${envValue(config.discordGuildId)}`,
-      "",
-      "# Rutas y servicios locales",
-      `DATABASE_URL=file:${join(config.dataDirectory, "dotty.db").replace(/\\/g, "/")}`,
-      "TRANSCRIBER_BASE_URL=http://127.0.0.1:8765",
-      `TRANSCRIBER_SHARED_SECRET=${secret}`,
-      `DOTTY_DATA_DIR=${envValue(config.dataDirectory)}`,
-      `DOTTY_PYTHON_EXECUTABLE=${envValue(config.pythonExecutable)}`,
-      `DOTTY_NPM_EXECUTABLE=${envValue(config.npmExecutable)}`,
-      "DOTTY_LOG_LEVEL=info",
-      "OLLAMA_BASE_URL=http://127.0.0.1:11434",
-      `OLLAMA_MODEL=${old.get("OLLAMA_MODEL") || "qwen3:4b"}`,
-      `DOTTY_OLLAMA_EXECUTABLE=${old.get("DOTTY_OLLAMA_EXECUTABLE") || "./runtime/ollama/ollama.exe"}`,
-      `OLLAMA_MODELS=${old.get("OLLAMA_MODELS") || join(config.dataDirectory, "models", "ollama")}`,
-      "",
-      "# Transcripción local",
-      `DOTTY_TRANSCRIPTION_MODE=${mode}`,
-      `WHISPER_MODEL=${envValue(config.whisperModel)}`,
-      `WHISPER_DEVICE=${device}`,
-      `WHISPER_COMPUTE_TYPE=${compute}`,
-      "WHISPER_LANGUAGE=es",
-      "WHISPER_INITIAL_PROMPT=Dotty es un bot de Discord que transcribe sesiones de juegos de rol.",
-      "",
-    ];
-    await mkdir(config.dataDirectory, { recursive: true });
-    await writeFile(this.envPath, lines.join("\n"), { encoding: "utf8", mode: 0o600 });
     try {
-      await this.run(config.npmExecutable, ["run", "db:deploy"], this.projectRoot);
-      await this.run(config.npmExecutable, ["run", "commands:deploy"], this.projectRoot);
-      return { ok: true, message: "Configuración guardada y comando /dotty registrado en tu servidor." };
+      return await this.lock.run(async () => {
+        await this.requireSafe(config);
+        let raw = "";
+        try { raw = await readFile(this.envPath, "utf8"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        const old = parseEnv(raw);
+        const priorData = old.get("DOTTY_DATA_DIR");
+        if (priorData && resolve(this.projectRoot, priorData) !== resolve(config.dataDirectory)) {
+          return { ok: false, message: "El cambio de carpeta de datos requiere un traslado manual y verificado.",
+            details: ["Conserva la carpeta actual o realiza el traslado con Dotty detenido."] };
+        }
+        const token = config.discordToken.trim() || (config.keepExistingToken ? old.get("DISCORD_TOKEN") || "" : "");
+        if (!token) return { ok: false, message: "Falta el token de Discord." };
+        const mode = config.transcriptionMode;
+        const gpuDetected = mode === "auto" ? (await this.detectGpu()).detected : false;
+        const device = mode === "cpu" || (mode === "auto" && !gpuDetected) ? "cpu" : "cuda";
+        const updates = new Map<string, string>([
+          ["DISCORD_TOKEN", token], ["DISCORD_CLIENT_ID", config.discordClientId],
+          ["DISCORD_GUILD_ID", config.discordGuildId], ["DOTTY_DATA_DIR", config.dataDirectory],
+          ["DOTTY_PYTHON_EXECUTABLE", config.pythonExecutable], ["DOTTY_NPM_EXECUTABLE", config.npmExecutable],
+          ["DOTTY_TRANSCRIPTION_MODE", mode], ["WHISPER_MODEL", config.whisperModel],
+          ["WHISPER_DEVICE", device], ["WHISPER_COMPUTE_TYPE", device === "cpu" ? "int8" : "float16"],
+        ]);
+        const defaults = new Map<string, string>([
+          ["DATABASE_URL", `file:${join(config.dataDirectory, "dotty.db").replace(/\\/g, "/")}`],
+          ["TRANSCRIBER_BASE_URL", "http://127.0.0.1:8765"],
+          ["TRANSCRIBER_SHARED_SECRET", randomBytes(48).toString("base64url")],
+          ["DOTTY_LOG_LEVEL", "info"], ["OLLAMA_BASE_URL", "http://127.0.0.1:11434"],
+          ["OLLAMA_MODEL", "qwen3:4b"], ["DOTTY_OLLAMA_EXECUTABLE", "./runtime/ollama/ollama.exe"],
+          ["OLLAMA_MODELS", join(config.dataDirectory, "models", "ollama")],
+          ["WHISPER_LANGUAGE", "es"],
+          ["WHISPER_INITIAL_PROMPT", "Dotty es un bot de Discord que transcribe sesiones de juegos de rol."],
+        ]);
+        for (const [key, value] of defaults) if (!old.has(key)) updates.set(key, value);
+        const next = mergeEnv(raw, updates);
+        const migrationNeeded = raw === "" && !await exists(join(config.dataDirectory, "dotty.db"));
+        await this.requireSafe(config);
+        if (migrationNeeded) {
+          await mkdir(config.dataDirectory, { recursive: true });
+          await this.run(config.npmExecutable, ["run", "db:deploy"], this.projectRoot,
+            { DATABASE_URL: old.get("DATABASE_URL") || defaults.get("DATABASE_URL")! });
+        }
+        await this.requireSafe(config);
+        await this.run(config.npmExecutable, ["run", "commands:deploy"], this.projectRoot,
+          { DISCORD_TOKEN: token, DISCORD_CLIENT_ID: config.discordClientId, DISCORD_GUILD_ID: config.discordGuildId });
+        await this.requireSafe(config);
+        const currentRaw = await readFile(this.envPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return "";
+          throw error;
+        });
+        if (currentRaw !== raw) throw new Error("La configuración cambió durante la operación; vuelve a revisarla.");
+        await this.writeEnvSafely(next, raw !== "");
+        return { ok: true, message: "Configuración guardada y comando /dotty registrado.",
+          details: migrationNeeded ? ["Base de datos inicial preparada."] :
+            ["La base de datos existente no se migró automáticamente. Revisa cualquier actualización de esquema por separado."] };
+      });
     } catch (error) {
-      return { ok: false, message: `La configuración se guardó, pero no se pudo terminar el registro en Discord: ${error instanceof Error ? error.message : String(error)}` };
+      const conflict = (error as NodeJS.ErrnoException).code === "EEXIST";
+      return { ok: false, message: error instanceof SetupSafetyError ? error.message : conflict ?
+        "Otra operación de configuración o arranque está en curso; no se aplicó el cambio." : "No se aplicó la configuración.",
+        details: [error instanceof Error && error.message.startsWith("La configuración cambió") ? error.message :
+          "Revisa la actividad de Dotty, los permisos y los registros del sistema antes de reintentar."] };
     }
   }
 
@@ -160,18 +218,52 @@ export class SetupManager {
     if (!validation.ok) return validation;
     const details: string[] = [];
     try {
-      const venvPython = join(this.projectRoot, "services", "transcriber", ".venv", "Scripts", "python.exe");
-      if (!await exists(venvPython)) {
-        await this.run(config.pythonExecutable, ["-m", "venv", join(this.projectRoot, "services", "transcriber", ".venv")]);
-        details.push("Entorno aislado de Python creado.");
-      }
-      await this.run(venvPython, ["-m", "pip", "install", "-r", join(this.projectRoot, "services", "transcriber", "requirements.txt")]);
-      details.push("Motor de transcripción instalado.");
-      await this.run(config.npmExecutable, ["install"], this.projectRoot);
-      details.push("Componentes del bot instalados.");
-      return { ok: true, message: "Todos los archivos necesarios están preparados.", details };
+      return await this.lock.run(async () => {
+        await this.requireSafe(config);
+        const venvPython = join(this.projectRoot, "services", "transcriber", ".venv", "Scripts", "python.exe");
+        if (!await exists(venvPython)) {
+          await this.requireSafe(config);
+          await this.run(config.pythonExecutable, ["-m", "venv", join(this.projectRoot, "services", "transcriber", ".venv")]);
+          details.push("Entorno aislado de Python creado.");
+        }
+        await this.requireSafe(config);
+        await this.run(venvPython, ["-m", "pip", "install", "-r", join(this.projectRoot, "services", "transcriber", "requirements.txt")]);
+        details.push("Motor de transcripción instalado.");
+        await this.requireSafe(config);
+        await this.run(config.npmExecutable, ["install"], this.projectRoot);
+        details.push("Componentes del bot instalados.");
+        return { ok: true, message: "Todos los archivos necesarios están preparados.", details };
+      });
     } catch (error) {
-      return { ok: false, message: `La preparación se detuvo: ${error instanceof Error ? error.message : String(error)}`, details };
+      const conflict = (error as NodeJS.ErrnoException).code === "EEXIST";
+      return { ok: false, message: error instanceof SetupSafetyError ? error.message : conflict ?
+        "Otra operación de configuración o arranque está en curso." :
+        "La preparación se detuvo antes de continuar con seguridad.",
+        details: [...details, "Comprueba que Dotty esté detenido y revisa los permisos y registros locales."] };
+    }
+  }
+
+  private async requireSafe(config: SetupConfig): Promise<void> {
+    const safety = await this.checkActivity(config);
+    if (safety.status !== "allowed") throw new SetupSafetyError(`${safety.message} ${safety.action}`);
+  }
+
+  private async writeEnvSafely(content: string, hadPrevious: boolean): Promise<void> {
+    const temporary = `${this.envPath}.${randomUUID()}.tmp`;
+    const handle = await open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(content, "utf8");
+      await handle.sync();
+      await handle.close();
+      if (hadPrevious) {
+        await copyFile(this.envPath, `${this.envPath}.backup-${randomUUID()}`, constants.COPYFILE_EXCL);
+      }
+      await rename(temporary, this.envPath);
+    } finally {
+      await handle.close().catch(() => undefined);
+      await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
     }
   }
 
@@ -186,6 +278,10 @@ export class SetupManager {
   }
 
   private async validateLocal(config: SetupConfig): Promise<SetupResult> {
+    for (const value of [config.discordToken, config.dataDirectory, config.pythonExecutable,
+      config.npmExecutable, config.whisperModel]) {
+      if (/[\r\n\0]/u.test(value)) return { ok: false, message: "Los valores no pueden contener saltos de línea ni caracteres de control." };
+    }
     if (!snowflake.test(config.discordClientId) || !snowflake.test(config.discordGuildId)) {
       return { ok: false, message: "Revisa los IDs de Discord: deben tener entre 17 y 20 números." };
     }
@@ -195,6 +291,9 @@ export class SetupManager {
     if (!await exists(config.pythonExecutable)) return { ok: false, message: "No se encontró Python en la ruta elegida." };
     if (!await exists(config.npmExecutable)) return { ok: false, message: "No se encontró npm en la ruta elegida." };
     if (!["auto", "cuda", "cpu"].includes(config.transcriptionMode)) return { ok: false, message: "El modo de transcripción no es válido." };
+    if (!["small", "medium", "large-v3-turbo", "large-v3"].includes(config.whisperModel)) {
+      return { ok: false, message: "El modelo de voz no es válido." };
+    }
     return { ok: true, message: "Rutas correctas." };
   }
 
@@ -206,13 +305,13 @@ export class SetupManager {
     } catch { return { detected: false, name: null, driver: null, cudaRecommended: false }; }
   }
 
-  private run(executable: string, args: string[], cwd = dirname(executable)): Promise<void> {
+  private run(executable: string, args: string[], cwd = dirname(executable), variables: Record<string, string> = {}): Promise<void> {
     return new Promise((resolveRun, reject) => {
-      const child = spawn(executable, args, { cwd, windowsHide: true, stdio: "pipe" });
-      const errors: Buffer[] = [];
-      child.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+      const child = spawn(executable, args, { cwd, windowsHide: true, stdio: "pipe", env: { ...process.env, ...variables } });
+      child.stderr.resume();
+      child.stdout.resume();
       child.once("error", reject);
-      child.once("close", (code) => code === 0 ? resolveRun() : reject(new Error(Buffer.concat(errors).toString("utf8").trim().slice(-1200) || `código ${code}`)));
+      child.once("close", (code) => code === 0 ? resolveRun() : reject(new Error(`El comando terminó con código ${code ?? "desconocido"}.`)));
     });
   }
 }

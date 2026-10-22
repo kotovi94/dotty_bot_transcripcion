@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Bot,
   Check,
@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 
 import dottyBotImage from "./assets/dotty-bot.png";
-import type { SetupConfig, SetupResult, SetupStatus, TranscriptionMode } from "../shared/contracts";
+import type { SetupConfig, SetupResult, SetupSafetyStatus, SetupStatus, TranscriptionMode } from "../shared/contracts";
 
 const steps = ["Bienvenida", "Equipo", "Archivos", "Discord", "Listo"];
 
@@ -39,6 +39,23 @@ export function SetupWizard({ status, onComplete, embedded = false }: {
   const [result, setResult] = useState<SetupResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [prepared, setPrepared] = useState(status.checks.nodeModules && status.checks.transcriberEnvironment);
+  const [safety, setSafety] = useState<SetupSafetyStatus>({ status: "unknown",
+    message: "Comprobando si Dotty está inactivo.", action: "Espera a que termine la comprobación." });
+  useEffect(() => {
+    let active = true;
+    const check = async () => {
+      try {
+        const next = await window.dotty.getSetupSafety(config);
+        if (active) setSafety(next);
+      } catch {
+        if (active) setSafety({ status: "unknown", message: "No se pudo comprobar el estado de Dotty.",
+          action: "Revisa el panel y vuelve a intentarlo." });
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => void check(), 5_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [config]);
   const modeDescription = useMemo(() => {
     if (config.transcriptionMode === "cpu") return "Funciona en cualquier PC; tarda más y usa menos memoria con precisión int8.";
     if (config.transcriptionMode === "cuda") return "Usa la GPU NVIDIA y float16 para transcribir mucho más rápido.";
@@ -50,6 +67,7 @@ export function SetupWizard({ status, onComplete, embedded = false }: {
   const update = <K extends keyof SetupConfig>(key: K, value: SetupConfig[K]) => {
     setConfig((current) => ({ ...current, [key]: value }));
     setResult(null);
+    setSafety({ status: "unknown", message: "Comprobando si el cambio es seguro.", action: "Espera a que termine la comprobación." });
   };
 
   const browse = async (kind: "python" | "npm" | "data", key: "pythonExecutable" | "npmExecutable" | "dataDirectory") => {
@@ -58,9 +76,12 @@ export function SetupWizard({ status, onComplete, embedded = false }: {
   };
 
   const prepare = async () => {
-    setBusy(true); setResult({ ok: true, message: "Preparando los componentes. La primera vez puede tardar varios minutos..." });
-    const next = await window.dotty.prepareSetup(config);
-    setResult(next); setPrepared(next.ok); setBusy(false);
+    setBusy(true); setResult(null);
+    try {
+      const next = await window.dotty.prepareSetup(config);
+      setResult(next); setPrepared(next.ok);
+    } catch { setResult({ ok: false, message: "La preparación falló. Comprueba el estado de Dotty y vuelve a intentarlo." }); }
+    finally { setBusy(false); }
   };
 
   const testDiscord = async () => {
@@ -71,14 +92,16 @@ export function SetupWizard({ status, onComplete, embedded = false }: {
 
   const finish = async () => {
     setBusy(true); setResult(null);
-    const saved = await window.dotty.saveSetup(config);
-    setResult(saved);
-    if (saved.ok) {
-      const next = await window.dotty.getSetupStatus();
-      onComplete(next);
-      setStep(4);
-    }
-    setBusy(false);
+    try {
+      const saved = await window.dotty.saveSetup(config);
+      setResult(saved);
+      if (saved.ok) {
+        const next = await window.dotty.getSetupStatus();
+        onComplete(next);
+        setStep(4);
+      }
+    } catch { setResult({ ok: false, message: "No se pudo guardar la configuración. Revisa el estado de Dotty." }); }
+    finally { setBusy(false); }
   };
 
   return (
@@ -120,12 +143,13 @@ export function SetupWizard({ status, onComplete, embedded = false }: {
           <PathField label="Python 3.10 o posterior" value={config.pythonExecutable} valid={status.checks.python} onBrowse={() => void browse("python", "pythonExecutable")} onHelp={() => void window.dotty.openSetupLink("python")} />
           <PathField label="npm (incluido con Node.js 22)" value={config.npmExecutable} valid={status.checks.npm} onBrowse={() => void browse("npm", "npmExecutable")} onHelp={() => void window.dotty.openSetupLink("node")} />
           <PathField label="Carpeta para audios, bitácoras y respaldos" value={config.dataDirectory} valid={Boolean(config.dataDirectory)} onBrowse={() => void browse("data", "dataDirectory")} />
-          <button className="prepare-button" disabled={busy} onClick={() => void prepare()}>{busy ? <LoaderCircle className="spin" size={19} /> : prepared ? <Check size={19} /> : <Download size={19} />}<span><strong>{prepared ? "Componentes preparados" : "Instalar los componentes necesarios"}</strong><small>{prepared ? "Puedes reinstalarlos si necesitas reparar Dotty." : "Instala el bot y el motor de transcripción desde sus fuentes oficiales."}</small></span></button>
+          <button className="prepare-button" disabled={busy || safety.status !== "allowed"} onClick={() => void prepare()}>{busy ? <LoaderCircle className="spin" size={19} /> : prepared ? <Check size={19} /> : <Download size={19} />}<span><strong>{prepared ? "Componentes preparados" : "Instalar los componentes necesarios"}</strong><small>{prepared ? "Reinstalar modifica dependencias y requiere Dotty detenido." : "Instala el bot y el motor de transcripción con Dotty detenido."}</small></span></button>
         </section>}
 
         {step === 3 && <section>
           <span className="eyebrow">CONEXIÓN CON DISCORD</span><h1>Crea y conecta tu bot</h1>
           <p className="setup-lead">Abre el portal con el botón inferior. Crea una aplicación, entra a <b>Bot</b>, pulsa <b>Reset Token</b> y copia el token. En <b>General Information</b> encontrarás el Application ID.</p>
+          <p className="setup-lead">Al guardar se actualizará .env y se registrará el comando de Discord. En una instalación nueva se preparará la base de datos; una base existente no se migrará automáticamente.</p>
           <button className="portal-button" onClick={() => void window.dotty.openSetupLink("discord")}><Bot size={20} /><span><strong>Abrir Discord Developer Portal</strong><small>discord.com/developers/applications</small></span><ExternalLink size={17} /></button>
           <div className="discord-fields">
             <label className="setup-field"><span>Token secreto del bot <em>Bot → Reset Token</em></span><div><KeyRound size={17} /><input type="password" value={config.discordToken} placeholder={status.hasDiscordToken ? "Token guardado — escribe solo para reemplazarlo" : "Pega aquí el token"} onChange={(event) => update("discordToken", event.target.value)} /></div></label>
@@ -142,11 +166,13 @@ export function SetupWizard({ status, onComplete, embedded = false }: {
           <div className="finish-summary"><span><Cpu size={18} /> {config.transcriptionMode === "cpu" ? "CPU" : config.transcriptionMode === "cuda" ? "CUDA" : "Automático"}</span><span><FolderOpen size={18} /> Datos locales configurados</span><span><ShieldCheck size={18} /> Credenciales guardadas</span></div>
         </section>}
 
+        {(step === 2 || step === 3) && <div className={`setup-result ${safety.status === "allowed" ? "ok" : "error"}`} role="status"><span>{safety.status === "allowed" ? "✓" : "!"}</span><div><strong>{safety.status === "allowed" ? "Operación permitida" : safety.status === "blocked" ? "Operación bloqueada" : "Seguridad no verificable"}</strong><small>{safety.message}</small><small>{safety.action}</small></div></div>}
+        {busy && <div className="setup-result" role="status">Operación en curso. Espera el resultado antes de continuar.</div>}
         {result && <div className={`setup-result ${result.ok ? "ok" : "error"}`}>{result.ok ? <Check size={17} /> : <span>!</span>}<div><strong>{result.message}</strong>{result.details?.map((detail) => <small key={detail}>{detail}</small>)}</div></div>}
         <footer className="setup-footer">
           <button disabled={busy || step === 0 || step === 4 || (!embedded && step === 0)} onClick={() => setStep((value) => Math.max(0, value - 1))}><ChevronLeft size={17} /> Atrás</button>
           {step < 3 && <button className="primary" disabled={busy} onClick={() => setStep(step + 1)}>Continuar <ChevronRight size={17} /></button>}
-          {step === 3 && <button className="primary" disabled={busy} onClick={() => void finish()}>{busy ? <LoaderCircle className="spin" size={17} /> : <ShieldCheck size={17} />} Guardar y finalizar</button>}
+          {step === 3 && <button className="primary" disabled={busy || safety.status !== "allowed"} onClick={() => void finish()}>{busy ? <LoaderCircle className="spin" size={17} /> : <ShieldCheck size={17} />} Guardar y finalizar</button>}
           {step === 4 && <button className="primary" onClick={() => onComplete({ ...status, configured: true })}>Ir al panel <ChevronRight size={17} /></button>}
         </footer>
       </main>

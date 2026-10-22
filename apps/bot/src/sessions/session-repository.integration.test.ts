@@ -80,6 +80,7 @@ describe("PrismaSessionRepository", () => {
       occurredAt: new Date("2026-08-08T18:00:00.000Z"),
     });
     assert.equal(second.sequenceNumber, 41);
+    assert.deepEqual((await sessions.listActive()).map((session) => session.id), [second.id]);
   });
 
   it("rejects missing campaigns, parallel sessions and invalid transitions", async () => {
