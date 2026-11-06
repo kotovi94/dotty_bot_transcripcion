@@ -101,6 +101,16 @@ class JobStore:
             );
             CREATE INDEX IF NOT EXISTS transcription_job_status_created
               ON transcription_job(status, created_at);
+            CREATE TABLE IF NOT EXISTS processing_control (
+              id INTEGER PRIMARY KEY CHECK (id=1),
+              paused INTEGER NOT NULL CHECK (paused IN (0,1)),
+              updated_at TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO processing_control (id, paused, updated_at) VALUES (1, 0, '');
+            CREATE TABLE IF NOT EXISTS transcriber_instance_lease (
+              instance_id TEXT PRIMARY KEY,
+              acquired_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS session_admission (
               session_id TEXT PRIMARY KEY,
               closed_at TEXT NOT NULL,
@@ -263,6 +273,27 @@ class JobStore:
             connection.execute(
                 "ALTER TABLE transcription_job ADD COLUMN provenance_instance_id TEXT"
             )
+        if self._instance_lock is not None:
+            # The OS lock proves every earlier lock-backed process is gone.
+            # Only occupations with a durable lease from this protocol qualify;
+            # historical or lockless occupations remain uncertain.
+            with self._instance_lock.hold_identity() as instance_id:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(
+                        "INSERT INTO transcriber_instance_lease (instance_id, acquired_at) VALUES (?, ?)",
+                        (instance_id, _now()),
+                    )
+                    connection.execute(
+                        """UPDATE worker_occupation SET released_at=?
+                        WHERE released_at IS NULL AND instance_id<>?
+                        AND instance_id IN (SELECT instance_id FROM transcriber_instance_lease)""",
+                        (_now(), instance_id),
+                    )
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
         # Exhausted jobs must be visible/retryable, including queues written by
         # older versions that left an exhausted job in queued after a crash.
         connection.execute(
@@ -562,10 +593,31 @@ class JobStore:
             "workers_inactive": None,  # A database row is not a worker-liveness proof.
         }
 
+    def processing_paused(self) -> bool:
+        row = self._connection().execute("SELECT paused FROM processing_control WHERE id=1").fetchone()
+        return row is not None and row["paused"] == 1
+
+    def set_processing_paused(self, paused: bool) -> bool:
+        connection = self._connection()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "UPDATE processing_control SET paused=?, updated_at=? WHERE id=1",
+                (int(paused), _now()),
+            )
+            connection.execute("COMMIT")
+            return paused
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
     def claim_next(self) -> dict[str, Any] | None:
         connection = self._connection()
         connection.execute("BEGIN IMMEDIATE")
         try:
+            if self.processing_paused():
+                connection.execute("COMMIT")
+                return None
             row = connection.execute(
                 """SELECT * FROM transcription_job
                 WHERE status='queued' AND attempts < max_attempts
@@ -1000,16 +1052,18 @@ class JobStore:
         ).fetchall()
         return [_serialize(row) for row in rows]
 
-    def session_progress(self, session_id: str) -> dict[str, int]:
+    def session_progress(self, session_id: str) -> dict[str, Any]:
         _validate_session_id(session_id)
         escaped = session_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         rows = self._connection().execute(
-            "SELECT status, COUNT(*) AS count FROM transcription_job WHERE id LIKE ? ESCAPE '\\' GROUP BY status",
+            "SELECT status, COUNT(*) AS count, MAX(updated_at) AS latest_updated_at "
+            "FROM transcription_job WHERE id LIKE ? ESCAPE '\\' GROUP BY status",
             (f"{escaped}:%",),
         ).fetchall()
         counts = {"queued": 0, "processing": 0, "completed": 0, "failed": 0}
         counts.update({row["status"]: row["count"] for row in rows})
-        return {**counts, "total": sum(counts.values())}
+        latest = max((row["latest_updated_at"] for row in rows if row["latest_updated_at"]), default=None)
+        return {**counts, "total": sum(counts.values()), "latest_updated_at": latest}
 
     def delete_for_session(self, session_id: str) -> int:
         escaped = session_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

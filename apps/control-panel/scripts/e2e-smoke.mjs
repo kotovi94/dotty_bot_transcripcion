@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 
 const projectRoot = resolve(import.meta.dirname, "../../..");
 const electronPath = join(projectRoot, "node_modules", "electron", "dist", "electron.exe");
-const entryPath = join(projectRoot, "apps", "control-panel", "dist", "main", "main", "main.js");
+const entryPath = join(projectRoot, "apps", "control-panel", "dist", "main", "apps", "control-panel", "src", "main", "main.js");
 const debuggingPort = 12_000 + Math.floor(Math.random() * 2_000);
 
 async function hasActiveRecording() {

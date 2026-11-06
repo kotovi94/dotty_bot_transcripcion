@@ -5,6 +5,10 @@ export class MaintenanceRequestGate {
     return ++this.latest;
   }
 
+  invalidate(): void {
+    this.latest += 1;
+  }
+
   isCurrent(request: number): boolean {
     return request === this.latest;
   }

@@ -1,5 +1,7 @@
 import { resolve } from "node:path";
+import { spawn } from "node:child_process";
 import { readFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 
 import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
 
@@ -44,10 +46,12 @@ import {
   TranscriptionDispatcher,
 } from "./transcription/transcription-dispatcher.ts";
 import { TranscriptionPublisher } from "./transcription/transcription-publisher.ts";
+import { TranscriberWatchdog } from "./transcription/transcriber-watchdog.ts";
 import { AdaptiveVocabularyStore } from "./transcription/adaptive-vocabulary.ts";
 import { NarrativeGenerator } from "./narrative/narrative-generator.ts";
 import { NarrativePublicationService } from "./narrative/narrative-publication.ts";
 import { NarrativeManager } from "./narrative/narrative-manager.ts";
+import { AutomaticNarrative } from "./pipeline/automatic-narrative.ts";
 import { EditorialLearningService } from "./editorial/editorial-learning-service.ts";
 import { runShutdownActions } from "./shutdown.ts";
 
@@ -140,6 +144,14 @@ const narratives = new NarrativeManager(
   narrativePublication,
   logger,
 );
+const automaticNarrative = new AutomaticNarrative(
+  environment.DOTTY_DATA_DIR,
+  resolve(environment.DOTTY_DATA_DIR, "recordings"),
+  resolve(environment.DOTTY_DATA_DIR, "exports"),
+  environment.TRANSCRIBER_BASE_URL,
+  narratives,
+  logger,
+);
 const publisher = new TranscriptionPublisher(
   campaigns,
   resolve(environment.DOTTY_DATA_DIR, "recordings"),
@@ -152,6 +164,21 @@ const publisher = new TranscriptionPublisher(
   sessionCoordinator,
   reprocessIntents,
   activityDiagnostics,
+);
+const transcriberWatchdog = new TranscriberWatchdog(
+  new URL("/health", environment.TRANSCRIBER_BASE_URL).toString(),
+  () => {
+    const projectRoot = resolve(import.meta.dirname, "../../..");
+    const recoveryScript = resolve(projectRoot, "tools", "recover-dotty.ps1");
+    if (!existsSync(recoveryScript)) throw new Error(`No existe el recuperador: ${recoveryScript}`);
+    logger.error({ recoveryScript }, "El transcriptor no responde; iniciando recuperación automática de Dotty");
+    const recovery = spawn("powershell.exe", [
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", recoveryScript,
+    ], { cwd: projectRoot, windowsHide: true, detached: false, stdio: "ignore" });
+    recovery.on("error", (error) => logger.error({ error }, "No se pudo iniciar la recuperación automática"));
+    recovery.on("exit", (code, signal) => logger.error({ code, signal }, "El recuperador terminó antes de detener el bot"));
+    recovery.unref();
+  },
 );
 const transcriptionReports = new TranscriptionReportService(
   resolve(environment.DOTTY_DATA_DIR, "recordings"),
@@ -193,6 +220,8 @@ client.once(Events.ClientReady, async (readyClient) => {
   logger.info({ userId: readyClient.user.id }, "Dotty conectado a Discord");
   await botStatus.setPhase("ready", readyClient.user.id).catch((error) => logger.warn({ error }, "No se pudo guardar el estado del bot"));
   publisher.start();
+  automaticNarrative.start();
+  transcriberWatchdog.start();
 });
 function updateBotPhase(phase: "ready" | "disconnected" | "reconnecting"): void {
   void botStatus.setPhase(phase, client.user?.id).catch((error) =>
@@ -380,6 +409,8 @@ async function shutdown(signal: string): Promise<void> {
     { resource: "transcriptions", run: () => transcriptions.stop() },
     { resource: "transcriptionReports", run: () => transcriptionReports.stop() },
     { resource: "publisher", run: () => publisher.stop() },
+    { resource: "transcriberWatchdog", run: () => transcriberWatchdog.stop() },
+    { resource: "automaticNarrative", run: () => automaticNarrative.stop() },
     { resource: "audioRetention", run: () => audioRetention.stop() },
     { resource: "automaticBackups", run: () => automaticBackups.stop() },
     { resource: "sessionLifecycle", run: async () => { lifecycleReport = await sessionLifecycle.shutdown(); } },

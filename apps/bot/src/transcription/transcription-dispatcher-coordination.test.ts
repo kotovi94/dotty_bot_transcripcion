@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -85,6 +85,52 @@ async function fixture(test: { after(callback: () => Promise<void>): void }, ids
 }
 
 describe("coordinated transcription dispatch", () => {
+  it("skips a session whose database status differs from its manifest before scanning chunks", async (test) => {
+    const f = await fixture(test);
+    f.sessions.get("session-1")!.status = "failed";
+    let posts = 0;
+    test.mock.method(globalThis, "fetch", async () => { posts += 1; return new Response(null, { status: 200 }); });
+
+    await f.dispatcher.dispatchCompleted();
+    assert.equal(posts, 0);
+    await assert.rejects(access(f.path("session-1", ".transcription-jobs")));
+  });
+
+  it("queues the most recently updated session first", async (test) => {
+    const f = await fixture(test, ["older", "newer"]);
+    await utimes(f.path("older", "manifest.json"), new Date("2026-01-01"), new Date("2026-01-01"));
+    await utimes(f.path("newer", "manifest.json"), new Date("2026-01-02"), new Date("2026-01-02"));
+    const posted: string[] = [];
+    test.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      posted.push((JSON.parse(String(init?.body)) as { id: string }).id);
+      return new Response(null, { status: 200 });
+    });
+
+    await f.dispatcher.dispatchCompleted();
+    assert.deepEqual(posted, ["newer:chunk-1", "older:chunk-1"]);
+  });
+
+  it("queues a valid chunk while another chunk's WAV is unavailable, then resumes it", async (test) => {
+    const f = await fixture(test);
+    const manifest = f.manifest("session-1");
+    manifest.chunks.push({ id: "chunk-2", speakerUserId: "user-2", file: "audio-2.wav", startedOffsetMs: 1_000 });
+    await writeFile(f.path("session-1", "manifest.json"), JSON.stringify(manifest));
+    const posted: string[] = [];
+    test.mock.method(globalThis, "fetch", async (_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      posted.push((JSON.parse(String(init?.body)) as { id: string }).id);
+      return new Response(null, { status: 200 });
+    });
+
+    await f.dispatcher.dispatchCompleted();
+    assert.deepEqual(posted, ["session-1:chunk-1"]);
+    await assert.rejects(access(f.path("session-1", ".transcription-enqueued")));
+
+    await writeFile(f.path("session-1", "audio-2.wav"), Buffer.alloc(48, 2));
+    await f.restart().dispatchCompleted();
+    assert.deepEqual(posted, ["session-1:chunk-1", "session-1:chunk-2"]);
+    await access(f.path("session-1", ".transcription-enqueued"));
+  });
+
   for (const phase of [null, "completed", "prepared", "delete-confirmed", "recovering", "redispatch-ready"] as const) {
     it(`applies provisional intent policy: ${phase ?? "none"}`, async (test) => {
       const f = await fixture(test);

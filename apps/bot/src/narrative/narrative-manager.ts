@@ -21,6 +21,10 @@ export class NarrativeManager {
     return this.generator.getReviewStatus(sessionId);
   }
 
+  hasActiveGeneration(): boolean {
+    return this.active.size > 0;
+  }
+
   async start(sessionId: string): Promise<{ started: boolean; status: NarrativeStatus }> {
     const running = this.active.get(sessionId);
     if (running !== undefined) {

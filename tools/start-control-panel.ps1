@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $electronPath = Join-Path $projectRoot "node_modules\electron\dist\electron.exe"
-$applicationPath = Join-Path $projectRoot "apps\control-panel\dist\main\main\main.js"
+$applicationPath = Join-Path $projectRoot "apps\control-panel\dist\main\apps\control-panel\src\main\main.js"
 
 if (-not (Test-Path -LiteralPath $electronPath) -or -not (Test-Path -LiteralPath $applicationPath)) {
   Add-Type -AssemblyName System.Windows.Forms

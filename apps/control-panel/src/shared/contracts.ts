@@ -55,6 +55,7 @@ export interface DottyState {
     running: boolean;
     connected: boolean;
     pid: number | null;
+    instanceId?: string;
     connectedAt: string | null;
     status?: "stopped" | "starting" | "active" | "connected" | "disconnected" | "reconnecting" | "error" | "unknown";
     reason?: string | null;
@@ -67,6 +68,7 @@ export interface DottyState {
     activeDevice: string | null;
     computeType: string | null;
     queue: QueueState;
+    processingPaused?: boolean;
     work: WorkState | null;
   };
   operation: {
@@ -376,6 +378,12 @@ export interface DottyDesktopApi {
   getSystemStatus(): Promise<SystemStatus>;
   getSessionDetails(sessionId: string): Promise<SessionDetails | null>;
   getSessionProcessingStatus(sessionId: string): Promise<SessionProcessingStatus>;
+  getRecentProcessingSessions(): Promise<Array<{ sessionId: string; label: string; status: string }>>;
+  setProcessingPaused(paused: boolean): Promise<{ paused: boolean; activeWork?: WorkState | null }>;
+  getPipelineMode(): Promise<{ mode: "automatic" | "manual"; automaticFrom: string }>;
+  setPipelineMode(mode: "automatic" | "manual"): Promise<{ mode: "automatic" | "manual"; automaticFrom: string }>;
+  getAutostartEnabled(): Promise<boolean>;
+  setAutostartEnabled(enabled: boolean): Promise<boolean>;
   onState(callback: (state: DottyState) => void): () => void;
   runOperation(kind: OperationKind): Promise<OperationResult>;
   disconnect(): Promise<OperationResult>;

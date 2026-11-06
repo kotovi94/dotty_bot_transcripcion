@@ -97,7 +97,7 @@ function Test-BotRunning([datetime]$since = [datetime]::MinValue) {
 }
 
 function Test-TranscriberCommand([string]$command, [int]$port) {
-  return $command -match '(?i)(?:^|\s)-m\s+uvicorn\s+dotty_transcriber\.main:app(?:\s|$)' -and
+  return $command -match '(?i)(?:^|\s)-m\s+(?:uvicorn\s+dotty_transcriber\.main:app|dotty_transcriber\.server)(?:\s|$)' -and
     $command -match '(?i)(?:^|\s)--host\s+127\.0\.0\.1(?:\s|$)' -and
     $command -match "(?i)(?:^|\s)--port\s+$port(?:\s|$)"
 }
@@ -227,7 +227,7 @@ try {
   try {
     $transcriberProcess = Start-Process `
       -FilePath $pythonPath `
-      -ArgumentList @("-m", "uvicorn", "dotty_transcriber.main:app", "--host", "127.0.0.1", "--port", "$transcriberPort") `
+      -ArgumentList @("-m", "dotty_transcriber.server", "--host", "127.0.0.1", "--port", "$transcriberPort") `
       -WorkingDirectory $transcriberDirectory `
       -WindowStyle Hidden `
       -RedirectStandardOutput $transcriberStdout `

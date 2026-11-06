@@ -96,6 +96,27 @@ function showWindow(): void {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+  void startWhenOpened();
+}
+
+let openingStart: Promise<void> | null = null;
+function startWhenOpened(): Promise<void> {
+  if (e2eMode) return Promise.resolve();
+  if (openingStart) return openingStart;
+  openingStart = (async () => {
+    const setup = await setupManager.getStatus();
+    if (!setup.configured) return;
+    const current = await supervisor.getState();
+    if (current.bot.connected && current.transcriber.available) return;
+    const result = await supervisor.runOperation("start");
+    if (!result.accepted && result.message !== "Ya hay una operacion de Dotty en curso.") {
+      notifyProgress("No se pudo iniciar", result.message);
+    }
+    await broadcastState();
+  })().catch((error: unknown) => {
+    notifyProgress("No se pudo iniciar", error instanceof Error ? error.message : "Revisa el registro del panel.");
+  }).finally(() => { openingStart = null; });
+  return openingStart;
 }
 
 function createWindow(): void {
@@ -161,6 +182,19 @@ function registerIpc(): void {
   ipcMain.handle("dotty:get-session-processing-status", (_event, sessionId: string) =>
     supervisor.getSessionProcessingStatus(String(sessionId)),
   );
+  ipcMain.handle("dotty:get-recent-processing-sessions", () => supervisor.getRecentProcessingSessions());
+  ipcMain.handle("dotty:set-processing-paused", (_event, paused: boolean) => {
+    if (typeof paused !== "boolean") throw new Error("Estado de pausa inválido.");
+    return supervisor.setProcessingPaused(paused);
+  });
+  ipcMain.handle("dotty:get-pipeline-mode", () => supervisor.getPipelineMode());
+  ipcMain.handle("dotty:set-pipeline-mode", (_event, mode: "automatic" | "manual") =>
+    supervisor.setPipelineMode(mode));
+  ipcMain.handle("dotty:get-autostart-enabled", () => supervisor.getAutostartEnabled());
+  ipcMain.handle("dotty:set-autostart-enabled", (_event, enabled: boolean) => {
+    if (typeof enabled !== "boolean") throw new Error("Estado de inicio automático inválido.");
+    return supervisor.setAutostartEnabled(enabled);
+  });
   ipcMain.handle("dotty:operation", (_event, kind: OperationKind) => {
     if (!["start", "stop", "restart"].includes(kind)) {
       throw new Error("Operacion no permitida.");
@@ -347,6 +381,7 @@ if (gotLock) {
     createWindow();
     createTray();
     pollTimer = setInterval(() => void broadcastState(), 1_000);
+    void startWhenOpened();
     await pollProcessingProgress();
     progressPollTimer = setInterval(() => void pollProcessingProgress(), 5_000);
     await broadcastState();

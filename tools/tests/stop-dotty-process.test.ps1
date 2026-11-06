@@ -10,14 +10,24 @@ function global:Get-Process {
 }
 function global:Get-CimInstance {
   param([string]$ClassName, [string]$Filter)
+  if ($Filter -eq "ProcessId=4000" -and $global:dottyStopMode -eq "orphan") {
+    return [pscustomobject]@{
+      CommandLine = "python -m uvicorn dotty_transcriber.main:app --host 127.0.0.1 --port 8765"
+      ExecutablePath = (Join-Path $global:dottyFixtureProject "services/transcriber/.venv/Scripts/python.exe")
+      CreationDate = [datetime]::Now.AddSeconds(-10)
+    }
+  }
   if ($Filter -ne "ProcessId=4242") { throw "Unexpected process lookup" }
   return [pscustomobject]@{
     CommandLine = "python -m uvicorn dotty_transcriber.main:app --host 127.0.0.1 --port 8765"
     ExecutablePath = (Join-Path $global:dottyFixtureProject "services/transcriber/python.exe")
+    ParentProcessId = 4000
+    CreationDate = [datetime]::Now.AddSeconds(-9)
   }
 }
 function global:Get-NetTCPConnection {
   param([string]$State, [string]$ErrorAction)
+  if ($global:dottyStopMode -eq "orphan") { return $null }
   return [pscustomobject]@{ LocalPort = 8765; OwningProcess = 4242 }
 }
 function global:Invoke-RestMethod {
@@ -80,6 +90,7 @@ try {
   Invoke-Scenario "foreign" "identidad.*no coincide"
   Invoke-Scenario "timeout" "sigue activo"
   Invoke-Scenario "success" ""
+  Invoke-Scenario "orphan" ""
 } finally {
   foreach ($name in @("Get-Process", "Get-CimInstance", "Get-NetTCPConnection", "Invoke-RestMethod", "taskkill.exe", "Start-Sleep")) {
     Remove-Item -Path "function:global:$name" -ErrorAction SilentlyContinue

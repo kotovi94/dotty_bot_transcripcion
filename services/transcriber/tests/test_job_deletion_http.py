@@ -21,7 +21,8 @@ AUTH = {"authorization": "Bearer fixture-secret"}
 def service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     store = JobStore(tmp_path / "jobs.db")
     monkeypatch.setattr(main, "store", store, raising=False)
-    monkeypatch.setattr(main, "settings", SimpleNamespace(secret="fixture-secret"), raising=False)
+    monkeypatch.setattr(main, "settings", SimpleNamespace(secret="fixture-secret", data_dir=tmp_path), raising=False)
+    monkeypatch.setattr(main, "configured_data_dir", lambda: tmp_path)
     return TestClient(main.app), store, tmp_path / "jobs.db"
 
 

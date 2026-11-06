@@ -206,8 +206,19 @@ def health() -> dict[str, Any]:
         **engine.runtime_status,
         "diagnostics_enabled": settings.diagnostics_enabled,
         "queue": store.metrics(),
+        "processing_paused": store.processing_paused(),
         "work": store.current_work(),
     }
+
+
+@app.post("/v1/processing/pause", dependencies=[Depends(authorize)])
+def pause_processing() -> dict[str, Any]:
+    return {"paused": store.set_processing_paused(True), "active_work": store.current_work()}
+
+
+@app.post("/v1/processing/resume", dependencies=[Depends(authorize)])
+def resume_processing() -> dict[str, Any]:
+    return {"paused": store.set_processing_paused(False)}
 
 
 @app.post("/v1/jobs", dependencies=[Depends(authorize)])

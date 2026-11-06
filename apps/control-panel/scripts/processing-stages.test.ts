@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { it } from "node:test";
 import { DottySupervisor } from "../src/main/supervisor.ts";
-import { deriveProcessingStages } from "../src/renderer/processing-stages.ts";
+import { deriveLiveProcessingStages, deriveProcessingStages } from "../src/renderer/processing-stages.ts";
 import type { DottyState, ProcessingStage, TranscriptDetail } from "../src/shared/contracts.ts";
 import { createReadyMarker, serializeReadyMarker } from "../../../packages/shared/src/transcription-ready.ts";
 
@@ -44,6 +44,23 @@ function status(stages: ReturnType<typeof display>, id: string): string | undefi
 
 it("bot conectado sin sesión no completa la grabación", () => {
   assert.equal(status(display(null, state(true, true)), "capture"), "DESCONOCIDO");
+});
+
+it("muestra una grabación y trabajo activos aunque aún no exista bitácora", () => {
+  const processing = {
+    sessionId: "live", state: "transcribing" as const,
+    audio: { status: "completed" as const }, transcription: { status: "running" as const },
+    narrative: { status: "pending" as const }, publication: { status: "pending" as const },
+    stages: [stage("capture", "completed"), stage("transcription", "running")],
+  };
+  const stages = deriveLiveProcessingStages(processing, {
+    status: "processing", session_id: "live", session_completed_jobs: 2,
+    session_total_jobs: 4, session_failed_jobs: 0, session_progress: 0.5,
+  });
+  assert.equal(status(stages, "capture"), "COMPLETADO");
+  assert.equal(status(stages, "transcription"), "PROCESANDO");
+  assert.equal(stages[1]?.details, "2 de 4 fragmentos · 0 fallidos");
+  assert.equal(stages[1]?.progress, 0.5);
 });
 
 it("Python disponible sin transcripción no completa la etapa", () => {

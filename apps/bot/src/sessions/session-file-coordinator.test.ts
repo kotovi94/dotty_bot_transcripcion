@@ -62,6 +62,20 @@ describe("session file coordinator", () => {
     assert.equal(await readFile(path, "utf8"), "abandoned");
   });
 
+  it("reclaims a well-formed lock after its owner has exited", async (test) => {
+    const { coordinator } = await fixture(test);
+    const path = coordinator.pathFor("one");
+    await writeFile(path, JSON.stringify({
+      token: "d727a4c2-7eea-4c28-9c5c-f5be2bbcd024",
+      pid: 2_147_483_647,
+      createdAt: new Date(Date.now() - 120_000).toISOString(),
+    }));
+    let entered = false;
+    await coordinator.runExclusive("one", async () => { entered = true; }, { timeoutMs: 1_000 });
+    assert.equal(entered, true);
+    await assert.rejects(access(path), { code: "ENOENT" });
+  });
+
   it("never removes a replacement lock", async (test) => {
     const { coordinator } = await fixture(test);
     const path = coordinator.pathFor("one");

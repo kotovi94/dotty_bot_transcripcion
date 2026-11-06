@@ -43,7 +43,7 @@ export function evaluateBotHealth(raw: unknown, processInfo: BotProcessIdentity 
       !Number.isFinite(processStarted) || Math.abs(processStarted - started) > 2_000) {
     return empty("unknown", "El PID pertenece a un proceso distinto de la instancia registrada.");
   }
-  const common = { running: true, connected: false, pid: value.pid as number,
+  const common = { running: true, connected: false, pid: value.pid as number, instanceId: value.instanceId as string,
     connectedAt: null, heartbeatAt: value.heartbeatAt as string };
   if (now - heartbeat > 7_000) return { ...common, status: "unknown", reason: "La señal del bot está desactualizada." };
   switch (value.status) {

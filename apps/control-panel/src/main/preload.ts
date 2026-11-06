@@ -20,6 +20,12 @@ const api: DottyDesktopApi = {
   getSystemStatus: () => ipcRenderer.invoke("dotty:get-system-status"),
   getSessionDetails: (sessionId: string) => ipcRenderer.invoke("dotty:get-session-details", sessionId),
   getSessionProcessingStatus: (sessionId: string) => ipcRenderer.invoke("dotty:get-session-processing-status", sessionId),
+  getRecentProcessingSessions: () => ipcRenderer.invoke("dotty:get-recent-processing-sessions"),
+  setProcessingPaused: (paused: boolean) => ipcRenderer.invoke("dotty:set-processing-paused", paused),
+  getPipelineMode: () => ipcRenderer.invoke("dotty:get-pipeline-mode"),
+  setPipelineMode: (mode: "automatic" | "manual") => ipcRenderer.invoke("dotty:set-pipeline-mode", mode),
+  getAutostartEnabled: () => ipcRenderer.invoke("dotty:get-autostart-enabled"),
+  setAutostartEnabled: (enabled: boolean) => ipcRenderer.invoke("dotty:set-autostart-enabled", enabled),
   onState: (callback: (state: DottyState) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, state: DottyState) => callback(state);
     ipcRenderer.on("dotty:state", listener);

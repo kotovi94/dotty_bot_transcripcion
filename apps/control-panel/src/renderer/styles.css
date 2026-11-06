@@ -242,20 +242,31 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .mini-grid span { color: #7b8496; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .mini-grid strong { color: #edf3fd; font-size: 12px; }
 .processing-page, .tools-page { display: flex; flex-direction: column; gap: 16px; }
+.processing-page > .panel { flex: 0 0 auto; }
 .process-summary { min-height: 180px; }
 .process-map .panel-heading p { margin: 6px 0 0; color: #7f899d; font-size: 12px; }
+.process-controls { display: grid; gap: 7px; margin-top: 16px; max-width: 480px; }
+.process-controls label { color: #aab5c7; font-size: 11px; }
+.process-controls select { min-height: 38px; padding: 0 10px; border: 1px solid #364054; border-radius: 9px; background: #151c27; color: #edf2fc; }
+.process-headline { margin: 16px 0 0; color: #e7edf9; font-size: 13px; font-weight: 600; }
 .process-stage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
 .process-overall { margin-top: 16px; }
 .process-overall .work-title { margin-top: 14px; }
 .process-stage-track { height: 5px; overflow: hidden; border-radius: 99px; background: #28303e; }
 .process-stage-track > div { height: 100%; border-radius: inherit; background: #7468f5; transition: width .4s ease; }
-.process-stage-card.completed .process-stage-track > div { background: #43d68a; }
+.process-stage-card.completado .process-stage-track > div { background: #43d68a; }
+.process-context { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; padding: 12px; border: 1px solid rgba(109,94,252,.42); border-radius: 10px; background: rgba(109,94,252,.08); color: #e7edf9; font-size: 12px; }
+.process-context span { color: #b5bfd0; }
+.process-context button { padding: 6px 10px; border: 1px solid #5a55a0; border-radius: 8px; background: #282450; color: #fff; cursor: pointer; }
+.process-controls-row { margin-top: 12px; }
+.process-controls-row button { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 0 12px; border: 1px solid #4b5670; border-radius: 8px; background: #202a3a; color: #edf2fc; cursor: pointer; }
+.process-controls-row button:disabled { opacity: .5; cursor: default; }
 .process-stage-track.indeterminate > div { width: 35% !important; animation: process-pulse 1.5s ease-in-out infinite alternate; }
 @keyframes process-pulse { from { transform: translateX(0); } to { transform: translateX(185%); } }
 .process-stage-card { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 82px; padding: 13px; border: 1px solid #252d3b; border-radius: 12px; background: #10161f; }
-.process-stage-card.blocked, .process-stage-card.error { border-color: rgba(232,93,104,.38); background: rgba(94,26,35,.14); }
-.process-stage-card.warning { border-color: rgba(255,191,96,.3); }
-.process-stage-card.running { border-color: rgba(109,94,252,.42); box-shadow: inset 3px 0 0 #7163ff; }
+.process-stage-card.bloqueado, .process-stage-card.error { border-color: rgba(232,93,104,.38); background: rgba(94,26,35,.14); }
+.process-stage-card.aviso { border-color: rgba(255,191,96,.3); }
+.process-stage-card.procesando { border-color: rgba(109,94,252,.42); box-shadow: inset 3px 0 0 #7163ff; }
 .process-stage-index { color: #626e83; font: 700 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .process-stage-copy { display: grid; min-width: 0; gap: 5px; }
 .process-stage-copy strong { color: #edf2fc; font-size: 13px; }

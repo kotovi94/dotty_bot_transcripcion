@@ -11,6 +11,7 @@ const health = (state: unknown = status, process = processInfo) => evaluateBotHe
 
 test("bot conectado exige heartbeat e identidad vigentes", () => {
   assert.equal(health().status, "connected");
+  assert.equal(health().instanceId, "instance-a");
   assert.equal(health().connected, true);
   for (const phase of ["starting", "disconnected", "reconnecting", "error", "stopping"]) {
     const result = health({ ...status, status: phase });
@@ -19,6 +20,12 @@ test("bot conectado exige heartbeat e identidad vigentes", () => {
   assert.equal(health({ ...status, status: "starting" }).status, "starting");
   assert.equal(health({ ...status, status: "disconnected" }).status, "disconnected");
   assert.equal(health({ ...status, status: "reconnecting" }).status, "reconnecting");
+});
+
+test("un reinicio con el mismo PID conserva una identidad de instancia diferente", () => {
+  const restarted = health({ ...status, instanceId: "instance-b" });
+  assert.equal(restarted.instanceId, "instance-b");
+  assert.notEqual(restarted.instanceId, health().instanceId);
 });
 
 test("caída, PID reutilizado y proceso ajeno nunca conectan", () => {

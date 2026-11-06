@@ -118,8 +118,12 @@ export class TranscriptionPublisher {
     this.publishing = true;
     try {
       const directories = await fs.readdir(this.recordingsRoot, { withFileTypes: true });
-      for (const entry of directories) {
-        if (!entry.isDirectory()) continue;
+      const sessions = await Promise.all(directories.filter((entry) => entry.isDirectory()).map(async (entry) => ({
+        entry,
+        updatedAt: (await fs.stat(join(this.recordingsRoot, entry.name, "manifest.json")).catch(() => null))?.mtimeMs ?? 0,
+      })));
+      sessions.sort((left, right) => right.updatedAt - left.updatedAt);
+      for (const { entry } of sessions) {
         try {
           await this.publishDirectory(join(this.recordingsRoot, entry.name));
         } catch (error) {
@@ -150,6 +154,27 @@ export class TranscriptionPublisher {
     const manifestText = await fs.readFile(join(directory, "manifest.json"), "utf8");
     const manifest = JSON.parse(manifestText) as RecordingManifest;
     if (manifest.sessionId !== sessionId || !Array.isArray(manifest.chunks)) return;
+    const fetchTimeoutMs = Math.max(4_000, Math.min(30_000, manifest.chunks.length * 4));
+    const readyText = await fs.readFile(readyMarker, "utf8").catch(() => null);
+    const ready = readyText === null ? null : parseReadyMarker(readyText);
+    if (ready?.kind === "verifiable" && ready.marker.session_id === sessionId &&
+        !(await exists(join(directory, ".transcription-regenerating"))) &&
+        await exists(join(this.exportsRoot, sessionId, "bitacora.md"))) {
+      try {
+        const response = await fetch(
+          new URL(`/v1/sessions/${encodeURIComponent(sessionId)}/progress`, this.baseUrl),
+          { headers: { authorization: `Bearer ${this.secret}` }, signal: AbortSignal.timeout(4_000) },
+        );
+        if (response.ok) {
+          const progress = await response.json() as Record<string, unknown>;
+          const latest = typeof progress.latest_updated_at === "string" ? Date.parse(progress.latest_updated_at) : NaN;
+          if (progress.session_id === sessionId && progress.total === manifest.chunks.length &&
+              progress.completed === progress.total && progress.queued === 0 &&
+              progress.processing === 0 && progress.failed === 0 &&
+              Number.isFinite(latest) && latest <= Date.parse(ready.marker.published_at)) return;
+        }
+      } catch { /* An older or unavailable service needs the full verification path. */ }
+    }
     const publishStarted = performance.now();
     let payload: { jobs: TranscriptionJob[] };
     try {
@@ -157,7 +182,7 @@ export class TranscriptionPublisher {
         new URL(`/v1/sessions/${encodeURIComponent(manifest.sessionId)}`, this.baseUrl),
         {
           headers: { authorization: `Bearer ${this.secret}` },
-          signal: AbortSignal.timeout(4_000),
+          signal: AbortSignal.timeout(fetchTimeoutMs),
         },
       );
       if (!response.ok) throw new Error(`Could not read transcript: HTTP ${response.status}`);
@@ -449,7 +474,7 @@ export class TranscriptionPublisher {
     // Python may accept a direct retry while the bot holds its own session lock.
     const latestResponse = await fetch(new URL(`/v1/sessions/${encodeURIComponent(sessionId)}`, this.baseUrl), {
       headers: { authorization: `Bearer ${this.secret}` },
-      signal: AbortSignal.timeout(4_000),
+      signal: AbortSignal.timeout(fetchTimeoutMs),
     });
     if (!latestResponse.ok) throw new Error(`Could not recheck transcription jobs: HTTP ${latestResponse.status}`);
     const latestPayload = (await latestResponse.json()) as { jobs?: TranscriptionJob[] };

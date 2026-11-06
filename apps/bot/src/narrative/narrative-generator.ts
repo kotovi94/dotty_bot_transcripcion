@@ -5,6 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { writeFileAtomically } from "../recording/atomic-json-file.ts";
 import type { EditorialLearningService } from "../editorial/editorial-learning-service.ts";
 import { verifyDraft } from "../editorial/draft-verifier.ts";
+import { ownerHasExited } from "../sessions/session-file-coordinator.ts";
 import { readNarrativeReview, type NarrativeReviewManifest } from "./narrative-review.ts";
 import { readNarrativeTranscript, type NarrativeTranscript } from "./transcript-source.ts";
 
@@ -253,6 +254,7 @@ export class NarrativeGenerator {
     let ollamaTouched = false;
 
     try {
+      await this.waitIfProcessingPaused(sessionId, 0.01);
       engineLock = await this.acquireEngineLock(sessionId);
       await this.writeStatus(sessionId, "generating", 0.02, "Preparando la transcripción");
       const transcript = await this.readTranscript(sessionId);
@@ -300,6 +302,7 @@ export class NarrativeGenerator {
       await fs.mkdir(workDirectory, { recursive: true });
 
       for (const [index, block] of transcriptBlocks.entries()) {
+        await this.waitIfProcessingPaused(sessionId, 0.05 + (index / Math.max(transcriptBlocks.length, 1)) * 0.35);
         await this.writeStatus(
           sessionId,
           "generating",
@@ -500,6 +503,7 @@ export class NarrativeGenerator {
         sessionId,
       );
       const campaignContext = renderContext(context);
+      await this.waitIfProcessingPaused(sessionId, 0.62);
       await this.writeStatus(sessionId, "generating", 0.62, "Escribiendo prólogo y título");
       const prologue = buildDeterministicPrologue(campaignName, sequenceNumber, transcript.manifest);
 
@@ -1061,14 +1065,47 @@ export class NarrativeGenerator {
   }
 
   private async removeStaleLock(path: string): Promise<boolean> {
+    let content: string;
+    let identity: Awaited<ReturnType<typeof fs.stat>>;
     try {
-      const payload = JSON.parse(await fs.readFile(path, "utf8")) as { pid?: number };
-      if (typeof payload.pid === "number" && processIsRunning(payload.pid)) return false;
+      [content, identity] = await Promise.all([fs.readFile(path, "utf8"), fs.stat(path)]);
+    } catch { return false; }
+    let payload: { pid?: unknown; createdAt?: unknown };
+    try { payload = JSON.parse(content) as typeof payload; }
+    catch { return false; }
+    if (typeof payload.pid !== "number" || !Number.isSafeInteger(payload.pid) || payload.pid <= 0 ||
+        typeof payload.createdAt !== "string" || !Number.isFinite(Date.parse(payload.createdAt)) ||
+        !(await ownerHasExited(payload.pid, payload.createdAt))) return false;
+    try {
+      const [current, stat] = await Promise.all([fs.readFile(path, "utf8"), fs.stat(path)]);
+      if (current !== content || stat.dev !== identity.dev || stat.ino !== identity.ino) return false;
+      await fs.rm(path);
+      return true;
     } catch {
-      // Un archivo antiguo sin propietario verificable se puede recuperar.
+      return false;
     }
-    await fs.rm(path, { force: true });
-    return true;
+  }
+
+  private async waitIfProcessingPaused(sessionId: string, progress: number): Promise<void> {
+    if (!this.transcriberBaseUrl) return;
+    let announced = false;
+    for (;;) {
+      let paused = false;
+      try {
+        const response = await this.request(new URL("/health", this.transcriberBaseUrl), {
+          signal: AbortSignal.timeout(3_000),
+        });
+        if (!response.ok) return;
+        const health = await response.json() as { processing_paused?: boolean };
+        paused = health.processing_paused === true;
+      } catch { return; }
+      if (!paused) return;
+      if (!announced) {
+        await this.writeStatus(sessionId, "queued", progress, "Pausado; esperando reanudación");
+        announced = true;
+      }
+      await delay(2_000);
+    }
   }
 
   private async readTranscript(sessionId: string): Promise<ExportedTranscript> {
@@ -2399,15 +2436,6 @@ async function fileExists(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
-  }
-}
-
-function processIsRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 

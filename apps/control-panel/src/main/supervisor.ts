@@ -58,6 +58,7 @@ interface HealthPayload {
   model_loaded?: boolean;
   compute_type?: string;
   queue?: Partial<DottyState["transcriber"]["queue"]>;
+  processing_paused?: boolean;
   work?: DottyState["transcriber"]["work"];
 }
 
@@ -74,6 +75,7 @@ export class DottySupervisor {
   recordingsRoot: string;
   private readonly failureTracker = new FailureTracker();
   private lastBotProcess: CachedBotIdentity | null = null;
+  private operationPreflight = false;
 
   private operation: {
     kind: OperationKind;
@@ -193,42 +195,106 @@ export class DottySupervisor {
     return status;
   }
 
-  async getRecentProcessingSessions(limit = 5): Promise<Array<{ sessionId: string; label: string }>> {
+  async setProcessingPaused(paused: boolean): Promise<{ paused: boolean; activeWork?: DottyState["transcriber"]["work"] }> {
+    const result = await this.transcriberRequest(`/v1/processing/${paused ? "pause" : "resume"}`, "POST") as {
+      paused?: unknown; active_work?: DottyState["transcriber"]["work"];
+    };
+    if (result.paused !== paused) throw new Error("El transcriptor no confirmó el cambio de pausa.");
+    return { paused, activeWork: result.active_work ?? null };
+  }
+
+  async getPipelineMode(): Promise<{ mode: "automatic" | "manual"; automaticFrom: string }> {
+    const path = join(this.dataRoot, "pipeline-mode.json");
+    try {
+      const handle = await open(path, "wx");
+      try {
+        await handle.writeFile(`${JSON.stringify({ version: 1, mode: "automatic", automaticFrom: new Date().toISOString() })}\n`);
+      } finally { await handle.close(); }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const parsed = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    if (parsed.version !== 1 || (parsed.mode !== "automatic" && parsed.mode !== "manual") ||
+        typeof parsed.automaticFrom !== "string" || !Number.isFinite(Date.parse(parsed.automaticFrom))) {
+      throw new Error("Configuración del flujo inválida; revisa pipeline-mode.json.");
+    }
+    return { mode: parsed.mode, automaticFrom: parsed.automaticFrom };
+  }
+
+  async setPipelineMode(mode: "automatic" | "manual"): Promise<{ mode: "automatic" | "manual"; automaticFrom: string }> {
+    if (mode !== "automatic" && mode !== "manual") throw new Error("Modo de procesamiento inválido.");
+    const previous = await this.getPipelineMode();
+    const result = {
+      mode,
+      automaticFrom: mode === "automatic" && previous.mode !== "automatic"
+        ? new Date().toISOString() : previous.automaticFrom,
+    };
+    await writeFileAtomically(join(this.dataRoot, "pipeline-mode.json"), `${JSON.stringify({ version: 1, ...result })}\n`);
+    return result;
+  }
+
+  private async autostartOperation(operation: "get" | "enable" | "disable"): Promise<boolean> {
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+      join(this.projectRoot, "tools", "autostart-dotty.ps1"), "-Operation", operation,
+    ], { timeout: 20_000, windowsHide: true });
+    const result = stdout.trim();
+    if (result !== "true" && result !== "false") throw new Error("Windows no confirmó el estado del inicio automático.");
+    return result === "true";
+  }
+
+  async getAutostartEnabled(): Promise<boolean> {
+    if (process.platform !== "win32") return false;
+    return this.autostartOperation("get");
+  }
+
+  async setAutostartEnabled(enabled: boolean): Promise<boolean> {
+    if (process.platform !== "win32") throw new Error("El inicio automático requiere Windows.");
+    const result = await this.autostartOperation(enabled ? "enable" : "disable");
+    if (result !== enabled) throw new Error("Windows no confirmó el cambio de inicio automático.");
+    return result;
+  }
+
+  async getRecentProcessingSessions(limit = 5): Promise<Array<{ sessionId: string; label: string; status: string }>> {
     const entries = await readdir(this.recordingsRoot, { withFileTypes: true }).catch(() => [] as Dirent[]);
-    const sessions = await Promise.all(entries.filter((entry) => entry.isDirectory() && /^[a-zA-Z0-9_-]+$/u.test(entry.name))
-      .map(async (entry) => {
+    const recent = await Promise.all(entries.filter((entry) => entry.isDirectory() && /^[a-zA-Z0-9_-]+$/u.test(entry.name))
+      .map(async (entry) => ({ entry, updatedAt: (await stat(join(this.recordingsRoot, entry.name, "manifest.json")).catch(() => null))?.mtimeMs ?? 0 })));
+    recent.sort((left, right) => right.updatedAt - left.updatedAt);
+    const sessions = await Promise.all(recent.slice(0, Math.max(limit, 1)).map(async ({ entry }) => {
         const manifest = await this.readManifest(entry.name);
         if (!manifest) return null;
         return {
           sessionId: entry.name,
           label: `${typeof manifest.campaignName === "string" ? manifest.campaignName : "Campaña"} · sesión ${typeof manifest.sequenceNumber === "number" ? manifest.sequenceNumber : entry.name}`,
-          startedAt: typeof manifest.startedAt === "string" ? manifest.startedAt : "",
+          status: typeof manifest.status === "string" ? manifest.status : "unknown",
         };
       }));
     return sessions.filter((session): session is NonNullable<typeof session> => session !== null)
-      .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
-      .slice(0, limit)
-      .map(({ sessionId, label }) => ({ sessionId, label }));
+      .map(({ sessionId, label, status }) => ({ sessionId, label, status }));
   }
 
   async runOperation(kind: OperationKind): Promise<OperationResult> {
-    if (this.operation) {
+    if (this.operation || this.operationPreflight) {
       return {
         accepted: false,
         message: "Ya hay una operacion de Dotty en curso.",
       };
     }
 
-    if (kind !== "start") {
-      const activeRecording = await this.findProtectedRecording();
-      if (activeRecording !== null) {
-        return {
-          accepted: false,
-          message: activeRecording.status === "finalizing"
-            ? "Dotty está cerrando una grabación. Espera a que termine antes de apagar o reiniciar."
-            : "Hay una grabación activa o pausada. Finalízala desde Discord antes de apagar o reiniciar Dotty.",
-        };
-      }
+    this.operationPreflight = true;
+    let activeRecording: { status: string } | null = null;
+    try {
+      if (kind !== "start") activeRecording = await this.findProtectedRecording();
+    } finally {
+      this.operationPreflight = false;
+    }
+    if (activeRecording !== null) {
+      return {
+        accepted: false,
+        message: activeRecording.status === "finalizing"
+          ? "Dotty está cerrando una grabación. Espera a que termine antes de apagar o reiniciar."
+          : "Hay una grabación activa o pausada. Finalízala desde Discord antes de apagar o reiniciar Dotty.",
+      };
     }
 
     const scriptNames: Record<OperationKind, string> = {
@@ -335,7 +401,6 @@ export class DottySupervisor {
               this.readNarrativeReview(sessionId, false),
             ]);
             const firstLine = content.split(/\r?\n/, 1)[0] ?? sessionId;
-            const processing = await this.getSessionProcessingStatus(sessionId);
             const participants = this.extractParticipants(manifest, content);
             const startedAt = typeof manifest?.startedAt === "string" ? manifest.startedAt : null;
             const endedAt = typeof manifest?.endedAt === "string" ? manifest.endedAt : null;
@@ -362,7 +427,6 @@ export class DottySupervisor {
               endedAt,
               durationSeconds,
               participants,
-              processing,
               errors: this.normalizeErrors(manifest, narrative),
             };
           } catch {
@@ -385,6 +449,7 @@ export class DottySupervisor {
     if (!summary) throw new Error("No se encontro la bitacora seleccionada.");
     return {
       ...summary,
+      processing: await this.getSessionProcessingStatus(sessionId),
       content: await readFile(this.transcriptPath(sessionId), "utf8"),
       narrativeContent: await readFile(this.narrativePath(sessionId), "utf8").catch(() => null),
       narrativeReview: await this.readNarrativeReview(sessionId, true),
@@ -810,6 +875,7 @@ export class DottySupervisor {
         activeDevice: health.model_loaded === false ? null : health.active_device ?? null,
         computeType: health.active_compute_type ?? health.compute_type ?? null,
         queue: { ...emptyQueue, ...health.queue },
+        ...(typeof health.processing_paused === "boolean" ? { processingPaused: health.processing_paused } : {}),
         work: health.work ?? null,
       };
     } catch {
@@ -1258,10 +1324,10 @@ export class DottySupervisor {
     sessionId: string, manifest: Record<string, unknown> | null, hasTranscript: boolean,
   ): Promise<NonNullable<SessionProcessingStatus["transcriptionEvidence"]>> {
     try {
-      return await new SessionFileCoordinator(join(this.dataRoot, "session-locks")).runExclusive(
-        sessionId, () => this.readTranscriptionEvidenceLocked(sessionId, manifest, hasTranscript),
-        { timeoutMs: 250 },
-      );
+      // This is a read-only snapshot. The marker digest checks the transcript
+      // and jobs together, so an in-flight mutation is reported on the next
+      // refresh without competing for the writer's session lock.
+      return await this.readTranscriptionEvidenceLocked(sessionId, manifest, hasTranscript);
     } catch {
       return { availability: "unavailable", publication: "unavailable", total: null,
         queued: null, processing: null, completed: null, failed: null };
@@ -1310,9 +1376,30 @@ export class DottySupervisor {
     const intentUncertain = intentEntries.some((entry) => entry.startsWith(`${intentPrefix}.`));
     const pendingMutation = entries.some((entry) => entry.endsWith(".posting")) || regenerating || intentPending || intentUncertain ||
       (manifest?.status === "completed" && !enqueued);
+    const markerPath = join(directory, ".transcription-ready");
+    let marker: string | null;
+    try { marker = await readFile(markerPath, "utf8"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { ...empty("unavailable", "unavailable"), pendingMutation };
+      marker = null;
+    }
+    if (marker === null) {
+      try {
+        const progress = await this.transcriberRequest(`/v1/sessions/${encodeURIComponent(sessionId)}/progress`, "GET", 1_500) as Record<string, unknown>;
+        const keys = ["queued", "processing", "completed", "failed", "total"] as const;
+        if (progress.session_id === sessionId && keys.every((key) => Number.isSafeInteger(progress[key]) && Number(progress[key]) >= 0) &&
+          Number(progress.queued) + Number(progress.processing) + Number(progress.completed) + Number(progress.failed) === Number(progress.total)) {
+          return { availability: "available", publication: "missing", pendingMutation,
+            queued: Number(progress.queued), processing: Number(progress.processing),
+            completed: Number(progress.completed), failed: Number(progress.failed), total: Number(progress.total) };
+        }
+      } catch { /* Older transcriber versions may not expose compact progress. */ }
+    }
     let payload: unknown;
+    const chunkCount = Array.isArray(manifest?.chunks) ? manifest.chunks.length : 0;
+    const jobsTimeoutMs = Math.min(30_000, Math.max(1_500, chunkCount * 4));
     try {
-      payload = await this.transcriberRequest(`/v1/sessions/${encodeURIComponent(sessionId)}`, "GET", 1_500);
+      payload = await this.transcriberRequest(`/v1/sessions/${encodeURIComponent(sessionId)}`, "GET", jobsTimeoutMs);
     } catch { return { ...empty("unavailable", "unavailable"), pendingMutation }; }
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
       return { ...empty("invalid", "unavailable"), pendingMutation };
@@ -1332,22 +1419,16 @@ export class DottySupervisor {
       completed: jobs.filter((job) => job.status === "completed").length,
       failed: jobs.filter((job) => job.status === "failed").length,
     };
-    const markerPath = join(directory, ".transcription-ready");
-    let marker: string | null;
-    try { marker = await readFile(markerPath, "utf8"); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { availability: "available", publication: "unavailable", ...counts, pendingMutation };
-      marker = null;
-    }
     if (marker === null) return { availability: "available", publication: "missing", ...counts, pendingMutation };
     const parsed = parseReadyMarker(marker);
     if (parsed.kind !== "verifiable") return { availability: "available", publication: parsed.kind, ...counts, pendingMutation };
     if (parsed.marker.session_id !== sessionId) return { availability: "available", publication: "stale", ...counts, pendingMutation };
     if (!hasTranscript) return { availability: "available", publication: "stale", ...counts, pendingMutation };
     const chunks = manifest?.chunks;
+    const jobIds = new Set(jobs.map((job) => job.id));
     if (!Array.isArray(chunks) || chunks.length !== jobs.length || chunks.some((chunk) =>
       chunk === null || typeof chunk !== "object" ||
-      !jobs.some((job) => job.id === `${sessionId}:${(chunk as { id?: unknown }).id}`))) {
+      !jobIds.has(`${sessionId}:${(chunk as { id?: unknown }).id}`))) {
       return { availability: "available", publication: "stale", ...counts, pendingMutation };
     }
     try {

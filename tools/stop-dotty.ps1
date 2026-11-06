@@ -38,7 +38,7 @@ $transcriberUri = [uri]$configuredTranscriberBaseUrl
 $transcriberPort = $transcriberUri.Port
 
 function Test-TranscriberCommand([string]$command, [int]$port) {
-  return $command -match '(?i)(?:^|\s)-m\s+uvicorn\s+dotty_transcriber\.main:app(?:\s|$)' -and
+  return $command -match '(?i)(?:^|\s)-m\s+(?:uvicorn\s+dotty_transcriber\.main:app|dotty_transcriber\.server)(?:\s|$)' -and
     $command -match '(?i)(?:^|\s)--host\s+127\.0\.0\.1(?:\s|$)' -and
     $command -match "(?i)(?:^|\s)--port\s+$port(?:\s|$)"
 }
@@ -114,15 +114,37 @@ foreach ($pidFile in @("dotty.pid", "transcriber.pid", "ollama.pid")) {
   $processId = 0
   if ([int]::TryParse((Get-Content -LiteralPath $path -Raw).Trim(), [ref]$processId)) {
     if ($pidFile -eq "transcriber.pid" -and (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
-      $health = Invoke-RestMethod -Uri "$($configuredTranscriberBaseUrl.TrimEnd('/'))/health" -TimeoutSec 2
       $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
         Where-Object { $_.LocalPort -eq $transcriberPort })
       $ownerPid = if ($listeners.Count -gt 0) { [int]$listeners[0].OwningProcess } else { 0 }
-      if ($health.status -ne "ok" -or $ownerPid -eq 0 -or
-          @($listeners | Where-Object { $_.OwningProcess -ne $ownerPid }).Count -gt 0) {
-        throw "La identidad del transcriptor no coincide con el puerto; no se terminara."
+      $health = $null
+      if ($ownerPid -ne 0) {
+        try {
+          $health = Invoke-RestMethod -Uri "$($configuredTranscriberBaseUrl.TrimEnd('/'))/health" -TimeoutSec 2
+        } catch {
+          throw "El puerto del transcriptor esta ocupado pero no responde; no se terminara sin verificar su identidad."
+        }
+        if ($health.status -ne "ok" -or
+            @($listeners | Where-Object { $_.OwningProcess -ne $ownerPid }).Count -gt 0) {
+          throw "La identidad del transcriptor no coincide con el puerto; no se terminara."
+        }
       }
-      if (Test-Path -LiteralPath $transcriberLaunchIdPath) {
+      $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction Stop
+      $venvPython = Join-Path $projectRoot "services\transcriber\.venv\Scripts\python.exe"
+      if ($null -eq $owner -or -not (Test-TranscriberCommand ([string]$owner.CommandLine) $transcriberPort)) {
+        throw "La identidad del transcriptor no pudo verificarse; no se terminara."
+      }
+      if ($ownerPid -eq 0) {
+        # A failed Windows accept loop may leave Python alive with no listener.
+        # Verify the exact venv parent/child pair before stopping that orphan.
+        $wrapper = Get-CimInstance Win32_Process -Filter "ProcessId=$($owner.ParentProcessId)" -ErrorAction Stop
+        if ($null -eq $wrapper -or
+            -not [string]::Equals([string]$wrapper.ExecutablePath, $venvPython, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-TranscriberCommand ([string]$wrapper.CommandLine) $transcriberPort) -or
+            ([datetime]$owner.CreationDate -lt ([datetime]$wrapper.CreationDate).AddSeconds(-2))) {
+          throw "El transcriptor sin puerto no pudo verificarse; no se terminara."
+        }
+      } elseif (Test-Path -LiteralPath $transcriberLaunchIdPath) {
         $expectedLaunchId = (Get-Content -LiteralPath $transcriberLaunchIdPath -Raw).Trim()
         if ($expectedLaunchId -eq "" -or $health.launch_id -ne $expectedLaunchId -or
             $health.pid -ne $processId -or $ownerPid -ne $processId) {
@@ -131,13 +153,12 @@ foreach ($pidFile in @("dotty.pid", "transcriber.pid", "ollama.pid")) {
       } else {
         # The old launcher stored the venv redirector PID, not its Uvicorn child.
         $wrapper = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction Stop
-        $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction Stop
-        $venvPython = Join-Path $projectRoot "services\transcriber\.venv\Scripts\python.exe"
+        $listenerOwner = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction Stop
         if ($null -eq $wrapper -or $null -eq $owner -or
-            $owner.ParentProcessId -ne $processId -or
+            $listenerOwner.ParentProcessId -ne $processId -or
             -not [string]::Equals([string]$wrapper.ExecutablePath, $venvPython, [StringComparison]::OrdinalIgnoreCase) -or
             -not (Test-TranscriberCommand ([string]$wrapper.CommandLine) $transcriberPort) -or
-            -not (Test-TranscriberCommand ([string]$owner.CommandLine) $transcriberPort) -or
+            -not (Test-TranscriberCommand ([string]$listenerOwner.CommandLine) $transcriberPort) -or
             ($null -ne $health.pid -and $health.pid -ne $ownerPid)) {
           throw "La identidad heredada del transcriptor no pudo verificarse; no se terminara."
         }
@@ -155,13 +176,13 @@ foreach ($processId in ($servicePids | Select-Object -Unique)) {
     $ownedProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$processId"
     $commandLine = [string]$ownedProcess.CommandLine
     $executablePath = [string]$ownedProcess.ExecutablePath
-    if ($commandLine -notmatch 'dotty_transcriber\.main:app|ollama(?:\.exe)?["\s]+serve') {
+    if ($commandLine -notmatch 'dotty_transcriber\.(?:main:app|server)|ollama(?:\.exe)?["\s]+serve') {
       throw "El PID $processId no corresponde a un servicio verificable de Dotty. No se terminara."
     }
     $insideProject = $executablePath.StartsWith($projectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
     $matchesVenvBase = $processId -eq $verifiedTranscriberPid -and $basePython -and
       [string]::Equals($executablePath, $basePython, [StringComparison]::OrdinalIgnoreCase) -and
-      $commandLine -match 'dotty_transcriber\.main:app'
+      $commandLine -match 'dotty_transcriber\.(?:main:app|server)'
     if (-not $insideProject -and -not $matchesVenvBase) {
       throw "El PID $processId pertenece a otra instalacion. No se terminara."
     }

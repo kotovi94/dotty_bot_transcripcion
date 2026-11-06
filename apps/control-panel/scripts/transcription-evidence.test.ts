@@ -78,7 +78,7 @@ it("verifies only the selected session's current jobs and published transcript",
   const ready = new Promise<void>((resolve) => { entered = resolve; });
   const holding = coordinator.runExclusive("session-one", async () => { entered(); await held; });
   await ready;
-  assert.equal((await read()).transcription.status, "unknown");
+  assert.equal((await read()).transcription.status, "completed");
   release();
   await holding;
   assert.equal((await read()).transcription.status, "completed");

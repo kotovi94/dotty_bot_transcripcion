@@ -63,3 +63,25 @@ it("cleans only post-stop artifacts after a simulated successful stop", async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it("rejects overlapping stop and restart during asynchronous recording preflight", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dotty-supervisor-race-"));
+  try {
+    let finishPreflight!: (value: null) => void;
+    let launches = 0;
+    const process = new SimulatedProcess();
+    const supervisor = new DottySupervisor(root, (() => { launches += 1; return process; }) as unknown as typeof spawn);
+    (supervisor as unknown as { findProtectedRecording: () => Promise<null> }).findProtectedRecording =
+      () => new Promise((resolve) => { finishPreflight = resolve; });
+    const first = supervisor.runOperation("stop");
+    const second = await supervisor.runOperation("restart");
+    assert.equal(second.accepted, false);
+    finishPreflight(null);
+    assert.equal((await first).accepted, true);
+    assert.equal(launches, 1);
+    process.emit("close", 0);
+    await waitForCompletion(supervisor);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

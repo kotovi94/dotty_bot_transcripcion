@@ -1,6 +1,7 @@
 import type {
   DottyState,
   ProcessingStageStatus,
+  SessionProcessingStatus,
   TranscriptDetail,
   TranscriptSummary,
   WorkState,
@@ -30,6 +31,26 @@ function stageStatusLabel(status: ProcessingStageStatus): string {
   if (status === "blocked") return "BLOQUEADO";
   if (status === "error") return "ERROR";
   return "DESCONOCIDO";
+}
+
+export function deriveLiveProcessingStages(processing: SessionProcessingStatus, work: WorkState | null): DisplayStage[] {
+  return processing.stages.map((stage) => {
+    const activeWork = stage.id === "transcription" && work?.session_id === processing.sessionId;
+    return {
+      id: stage.id,
+      label: stage.label,
+      status: activeWork ? "PROCESANDO" : stageStatusLabel(stage.status),
+      details: activeWork && (work.session_total_jobs ?? 0) > 0
+        ? `${work.session_completed_jobs ?? 0} de ${work.session_total_jobs} fragmentos · ${work.session_failed_jobs ?? 0} fallidos`
+        : stage.details,
+      progress: activeWork ? work.session_progress ?? work.progress : stage.progress,
+      current: activeWork ? work.session_completed_jobs : stage.current,
+      total: activeWork ? work.session_total_jobs : stage.total,
+      errors: stage.errors ?? 0,
+      warnings: stage.warnings ?? 0,
+      artifact: stage.artifact,
+    };
+  });
 }
 
 function captureStatus(session: Session | null, status?: ProcessingStageStatus): string {

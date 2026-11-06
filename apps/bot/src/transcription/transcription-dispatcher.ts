@@ -75,8 +75,12 @@ export class TranscriptionDispatcher {
     this.dispatching = true;
     try {
       const directories = await fs.readdir(this.recordingsRoot, { withFileTypes: true });
-      for (const entry of directories) {
-        if (!entry.isDirectory()) continue;
+      const sessions = await Promise.all(directories.filter((entry) => entry.isDirectory()).map(async (entry) => ({
+        entry,
+        updatedAt: (await fs.stat(join(this.recordingsRoot, entry.name, "manifest.json")).catch(() => null))?.mtimeMs ?? 0,
+      })));
+      sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const { entry } of sessions) {
         try {
           await this.dispatchDirectory(join(this.recordingsRoot, entry.name));
         } catch (error) {
@@ -115,6 +119,8 @@ export class TranscriptionDispatcher {
       return;
     }
     if (manifest.sessionId !== sessionId || !Array.isArray(manifest.chunks) || manifest.chunks.length === 0) return;
+    const session = await this.sessions.findById(sessionId);
+    if (session === null || session.status !== manifest.status) return;
 
     const contextStarted = performance.now();
     const transcriptionContext = await this.buildContext(manifest);
@@ -138,6 +144,9 @@ export class TranscriptionDispatcher {
       const jobMarkers = join(directory, ".transcription-jobs");
       const jobMarker = join(jobMarkers, chunk.id);
       const postingMarker = join(jobMarkers, `${chunk.id}.posting`);
+      // Accepted markers are durable; avoid reparsing a large manifest for each
+      // already queued chunk after a restart. A later scan handles reprocessing.
+      if (await jobMarkerExists(jobMarker)) continue;
       const body = await this.coordinator.runExclusive(sessionId, async () => {
         if (!(await this.validate(directory, manifestText, chunk.id))) return;
         if (await jobMarkerExists(jobMarker)) return;
@@ -255,8 +264,11 @@ export class TranscriptionDispatcher {
       manifest.status !== session.status ||
       !Array.isArray(manifest.chunks) || manifest.chunks.length === 0 ||
       await markerExists(join(directory, ".transcription-enqueued"))) return false;
-    if (chunkId !== undefined && !manifest.chunks.some((chunk) => chunk.id === chunkId && isEligible(manifest, chunk))) return false;
-    for (const chunk of manifest.chunks) {
+    const chunksToCheck = chunkId === undefined
+      ? manifest.chunks
+      : manifest.chunks.filter((chunk) => chunk.id === chunkId && isEligible(manifest, chunk));
+    if (chunksToCheck.length === 0) return false;
+    for (const chunk of chunksToCheck) {
       if (typeof chunk.file !== "string" || typeof chunk.id !== "string" ||
         !/^[a-zA-Z0-9_-]+$/u.test(chunk.id) || !chunk.file.toLowerCase().endsWith(".wav")) return false;
       const path = resolve(directory, chunk.file);

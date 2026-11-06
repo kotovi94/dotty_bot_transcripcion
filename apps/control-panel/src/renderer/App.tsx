@@ -27,7 +27,7 @@ import { SessionDetailPanel, type SessionDetailTab } from "./components/SessionD
 import { Sidebar, type SidebarPage } from "./components/Sidebar";
 import { StatusCard } from "./components/StatusCard";
 import { SetupWizard } from "./SetupWizard";
-import { deriveProcessingStages } from "./processing-stages";
+import { deriveLiveProcessingStages, deriveProcessingStages } from "./processing-stages";
 import { MaintenanceRequestGate } from "./maintenance-request";
 import { maintenanceDisplay } from "./maintenance-display";
 import { StateUpdateGate } from "./state-update-gate";
@@ -41,6 +41,7 @@ import type {
   MaintenanceState,
   OperationKind,
   SessionDetails,
+  SessionProcessingStatus,
   SetupStatus,
   SystemStatus,
   TranscriptDetail,
@@ -132,6 +133,15 @@ export function App() {
   const [notice, setNotice] = useState("");
   const [transcripts, setTranscripts] = useState<TranscriptSummary[]>([]);
   const [selected, setSelected] = useState<TranscriptDetail | null>(null);
+  const [processingError, setProcessingError] = useState(false);
+  const [processingSessionId, setProcessingSessionId] = useState<string | null>(null);
+  const [processingSession, setProcessingSession] = useState<SessionProcessingStatus | null>(null);
+  const [processingControlBusy, setProcessingControlBusy] = useState(false);
+  const [recentProcessingSessions, setRecentProcessingSessions] = useState<Array<{ sessionId: string; label: string; status: string }>>([]);
+  const [pipelineMode, setPipelineModeState] = useState<"automatic" | "manual" | null>(null);
+  const [pipelineModeBusy, setPipelineModeBusy] = useState(false);
+  const [autostartEnabled, setAutostartEnabledState] = useState<boolean | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -154,22 +164,39 @@ export function App() {
   const [editorialComment, setEditorialComment] = useState("");
   const [editorialBusy, setEditorialBusy] = useState(false);
   const selectionRequest = useRef(0);
+  const selectionEpoch = useRef(new StateUpdateGate());
+  const selectedSessionId = useRef<string | null>(null);
   const stateRequest = useRef(new StateUpdateGate());
+  const setupRequest = useRef(new StateUpdateGate());
+  const systemRequest = useRef(new StateUpdateGate());
+  const transcriptRequest = useRef(new StateUpdateGate());
+  const detailsRequest = useRef(new StateUpdateGate());
+  const editorialRequest = useRef(new StateUpdateGate());
+  const logsRequest = useRef(new StateUpdateGate());
+  const operationRequest = useRef(new StateUpdateGate());
   const maintenanceRequest = useRef(new MaintenanceRequestGate());
+  const maintenanceInFlight = useRef<Promise<void> | null>(null);
+  const panelMounted = useRef(false);
 
   const loadTranscripts = useCallback(async () => {
-    const next = await window.dotty.listTranscripts();
+    const request = transcriptRequest.current.beginRequest();
+    const next = await window.dotty.listTranscripts().catch(() => null);
+    if (!next) return;
+    if (!transcriptRequest.current.isCurrent(request)) return;
     setTranscripts(next);
-    if (!selected && next[0]) {
+    if (!selectedSessionId.current && next[0]) {
+      selectedSessionId.current = next[0].sessionId;
+      selectionEpoch.current.beginRequest();
       const request = ++selectionRequest.current;
-      const detail = await window.dotty.readTranscript(next[0].sessionId);
-      if (request !== selectionRequest.current) return;
+      const detail = await window.dotty.readTranscript(next[0].sessionId).catch(() => null);
+      if (request !== selectionRequest.current || selectedSessionId.current !== next[0].sessionId) return;
+      if (!detail) { selectedSessionId.current = null; return; }
       setSelected(detail);
       const mode = detail.narrativeContent === null ? "transcript" : "narrative";
       setReaderMode(mode);
       setDraft(mode === "narrative" ? detail.narrativeContent ?? "" : detail.content);
     }
-  }, [selected]);
+  }, []);
 
   useEffect(() => {
     if (!notice) return;
@@ -178,54 +205,138 @@ export function App() {
   }, [notice]);
 
   useEffect(() => {
-    if (!selected?.sessionId) { setEditorialState(null); return; }
-    void window.dotty.getEditorialLearning(selected.sessionId).then(setEditorialState).catch(() => setEditorialState(null));
+    const sessionId = selected?.sessionId;
+    const request = editorialRequest.current.beginRequest();
+    if (!sessionId) { setEditorialState(null); return; }
+    setEditorialState(null);
+    void window.dotty.getEditorialLearning(sessionId).then((next) => {
+      if (editorialRequest.current.isCurrent(request) && selectedSessionId.current === sessionId) setEditorialState(next);
+    }).catch(() => {
+      if (editorialRequest.current.isCurrent(request) && selectedSessionId.current === sessionId) setEditorialState(null);
+    });
+    return () => editorialRequest.current.invalidate();
   }, [selected?.sessionId]);
 
-  const loadMaintenance = useCallback(async () => {
-    const request = maintenanceRequest.current.begin();
-    try {
-      const next = await window.dotty.getMaintenanceState();
-      if (maintenanceRequest.current.isCurrent(request)) setMaintenance(next);
-    } catch {
-      if (maintenanceRequest.current.isCurrent(request)) setMaintenance((previous) => ({
-        ...previous,
-        checkedAt: new Date().toISOString(),
-        failureQuery: {
-          status: previous.failureQuery?.lastSuccessAt ? "stale" : "unavailable",
-          lastSuccessAt: previous.failureQuery?.lastSuccessAt ?? null,
-          reason: "network",
-          detail: "No se pudo actualizar el estado de incidencias del panel.",
-          action: "Comprueba el panel y el transcriptor; la consulta se reintentará automáticamente.",
-        },
-      }));
+  const loadMaintenance = useCallback(async (force = false) => {
+    if (!panelMounted.current) return;
+    if (maintenanceInFlight.current) {
+      if (!force) return;
+      await maintenanceInFlight.current;
+      if (!panelMounted.current) return;
     }
+    const request = maintenanceRequest.current.begin();
+    const pending = (async () => {
+      try {
+        const next = await window.dotty.getMaintenanceState();
+        if (maintenanceRequest.current.isCurrent(request)) setMaintenance(next);
+      } catch {
+        if (maintenanceRequest.current.isCurrent(request)) setMaintenance((previous) => ({
+          ...previous,
+          checkedAt: new Date().toISOString(),
+          failureQuery: {
+            status: previous.failureQuery?.lastSuccessAt ? "stale" : "unavailable",
+            lastSuccessAt: previous.failureQuery?.lastSuccessAt ?? null,
+            reason: "network",
+            detail: "No se pudo actualizar el estado de incidencias del panel.",
+            action: "Comprueba el panel y el transcriptor; la consulta se reintentará automáticamente.",
+          },
+        }));
+      }
+    })();
+    maintenanceInFlight.current = pending;
+    try { await pending; }
+    finally { if (maintenanceInFlight.current === pending) maintenanceInFlight.current = null; }
   }, []);
 
   useEffect(() => {
+    panelMounted.current = true;
     const request = stateRequest.current.beginRequest();
-    void window.dotty.getState().then((next) => { if (stateRequest.current.isCurrent(request)) setState(next); });
-    void window.dotty.getSetupStatus().then(setSetupStatus);
-    void window.dotty.getSystemStatus().then(setSystemStatus);
-    void loadMaintenance();
-    return window.dotty.onState((next) => {
+    void window.dotty.getState().then((next) => { if (stateRequest.current.isCurrent(request)) setState(next); }).catch(() => undefined);
+    const setupGeneration = setupRequest.current.beginRequest();
+    void window.dotty.getSetupStatus().then((next) => {
+      if (setupRequest.current.isCurrent(setupGeneration)) setSetupStatus(next);
+    }).catch(() => undefined);
+    let systemInFlight = false;
+    let systemPending = false;
+    let active = true;
+    let currentInstanceId: string | null = null;
+    const refreshSystem = () => {
+      if (systemInFlight) { systemPending = true; return; }
+      systemInFlight = true;
+      const systemGeneration = systemRequest.current.beginRequest();
+      void window.dotty.getSystemStatus().then((next) => {
+        if (systemRequest.current.isCurrent(systemGeneration) && (next.bot.instanceId ?? null) === currentInstanceId) setSystemStatus(next);
+      }).catch(() => undefined).finally(() => {
+        systemInFlight = false;
+        if (systemPending && active) { systemPending = false; refreshSystem(); }
+      });
+    };
+    refreshSystem();
+    void loadMaintenance(true);
+    const unsubscribe = window.dotty.onState((next) => {
       stateRequest.current.acceptEvent();
       setState(next);
-      void window.dotty.getSystemStatus().then(setSystemStatus);
+      const instanceId = next.bot.instanceId ?? null;
+      if (instanceId !== currentInstanceId) {
+        currentInstanceId = instanceId;
+        systemRequest.current.invalidate();
+      }
+      refreshSystem();
     });
+    return () => { panelMounted.current = false; active = false; unsubscribe(); stateRequest.current.invalidate(); systemRequest.current.invalidate(); setupRequest.current.invalidate(); maintenanceRequest.current.invalidate(); };
   }, [loadMaintenance]);
 
   useEffect(() => {
-    if (!selected) {
+    const sessionId = selected?.sessionId;
+    const request = detailsRequest.current.beginRequest();
+    if (!sessionId) {
       setSessionDetails(null);
       return;
     }
-    void window.dotty.getSessionDetails(selected.sessionId).then(setSessionDetails);
-  }, [selected]);
+    setSessionDetails((current) => current?.id === sessionId ? current : null);
+    void window.dotty.getSessionDetails(sessionId).then((next) => {
+      if (detailsRequest.current.isCurrent(request) && selectedSessionId.current === sessionId) setSessionDetails(next);
+    }).catch(() => undefined);
+    return () => detailsRequest.current.invalidate();
+  }, [selected?.sessionId]);
 
   useEffect(() => {
-    void loadTranscripts();
+    let initialInFlight = false;
+    const retryLoad = async () => {
+      if (initialInFlight) return;
+      initialInFlight = true;
+      try { await loadTranscripts(); }
+      finally { initialInFlight = false; }
+    };
+    void retryLoad();
+    const retry = window.setInterval(() => {
+      if (!selectedSessionId.current) void retryLoad();
+    }, 3_000);
+    return () => {
+      window.clearInterval(retry);
+      transcriptRequest.current.invalidate();
+      selectionEpoch.current.invalidate();
+      selectionRequest.current += 1;
+      detailsRequest.current.invalidate();
+      editorialRequest.current.invalidate();
+      logsRequest.current.invalidate();
+      operationRequest.current.invalidate();
+    };
   }, [loadTranscripts]);
+
+  useEffect(() => {
+    if (page !== "sessions") return;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try { await loadTranscripts(); }
+      finally { inFlight = false; }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [page, loadTranscripts]);
 
   useEffect(() => {
     if (page !== "dashboard") return;
@@ -241,17 +352,24 @@ export function App() {
 
   useEffect(() => {
     if (page !== "dashboard" && page !== "tools" && page !== "sessions") return;
+    let inFlight = false;
     const refresh = async () => {
-      const next = await window.dotty.readLogs(logKind);
-      setLogs(next);
+      if (inFlight) return;
+      inFlight = true;
+      const request = logsRequest.current.beginRequest();
+      try {
+        const next = await window.dotty.readLogs(logKind);
+        if (logsRequest.current.isCurrent(request)) setLogs(next);
+      } catch { /* El siguiente sondeo reintentará la lectura. */ }
+      finally { inFlight = false; }
     };
     void refresh();
     const timer = window.setInterval(() => void refresh(), 1_500);
-    return () => window.clearInterval(timer);
+    return () => { window.clearInterval(timer); logsRequest.current.invalidate(); };
   }, [page, logKind]);
 
   useEffect(() => {
-    if (!selected?.sessionId || (page !== "processing" && page !== "sessions" && narrativeBusy === null)) return;
+    if (!selected?.sessionId || (page !== "sessions" && page !== "dashboard" && narrativeBusy === null)) return;
     let active = true;
     let inFlight = false;
     let sawRawRegeneration = false;
@@ -261,6 +379,7 @@ export function App() {
       try {
         const processing = await window.dotty.getSessionProcessingStatus(selected.sessionId);
         if (!active) return;
+        if (page !== "processing") setProcessingError(false);
         const rawStage = processing.stages.find((stage) => stage.id === "transcription");
         const regenerating = rawStage?.details.startsWith("Rehaciendo raw") ?? false;
         if (regenerating) sawRawRegeneration = true;
@@ -272,45 +391,137 @@ export function App() {
           : current);
         if (sawRawRegeneration && !regenerating) {
           sawRawRegeneration = false;
+          const request = ++selectionRequest.current;
           const refreshed = await window.dotty.readTranscript(selected.sessionId).catch(() => null);
-          if (active && refreshed) {
+          if (active && refreshed && request === selectionRequest.current && selectedSessionId.current === selected.sessionId) {
             setSelected((current) => current?.sessionId === selected.sessionId ? refreshed : current);
             setNotice("Raw actualizado. Revisa la nueva transcripción y regenera el guion si corresponde.");
           }
         }
-      } catch { /* La siguiente consulta volverá a comprobar la sesión. */ }
+      } catch { if (active && page !== "processing") setProcessingError(true); }
       finally { inFlight = false; }
     };
     void refreshProcessing();
-    const timer = window.setInterval(() => void refreshProcessing(), 2_000);
+    const timer = window.setInterval(() => void refreshProcessing(), narrativeBusy ? 2_000 : page === "dashboard" ? 10_000 : 8_000);
     return () => { active = false; window.clearInterval(timer); };
   }, [page, narrativeBusy, selected?.sessionId]);
+
+  const focusedProcessingId = processingSessionId ?? state.transcriber.work?.session_id ??
+    recentProcessingSessions.find((entry) => ["recording", "paused", "finalizing"].includes(entry.status))?.sessionId ??
+    selected?.sessionId ?? recentProcessingSessions[0]?.sessionId ?? null;
+  const focusedSessionIsActive = state.transcriber.work?.session_id === focusedProcessingId ||
+    recentProcessingSessions.some((entry) => entry.sessionId === focusedProcessingId && ["recording", "paused", "finalizing"].includes(entry.status));
+  useEffect(() => {
+    if (page === "processing" && processingSessionId === null && state.transcriber.work?.session_id) {
+      setProcessingSessionId(state.transcriber.work.session_id);
+    }
+  }, [page, processingSessionId, state.transcriber.work?.session_id]);
+  useEffect(() => {
+    if (page !== "processing") return;
+    let active = true;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const [recent, mode, autostart] = await Promise.all([
+          window.dotty.getRecentProcessingSessions(), window.dotty.getPipelineMode(),
+          window.dotty.getAutostartEnabled().catch(() => null),
+        ]);
+        if (active) { setRecentProcessingSessions(recent); setPipelineModeState(mode.mode); setAutostartEnabledState(autostart); }
+        if (focusedProcessingId) {
+          const processing = await window.dotty.getSessionProcessingStatus(focusedProcessingId);
+          if (active) { setProcessingSession(processing); setProcessingError(false); }
+        }
+      } catch { if (active) setProcessingError(true); }
+      finally { inFlight = false; }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), focusedSessionIsActive ? 3_000 : 30_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [page, focusedProcessingId, focusedSessionIsActive]);
 
   const runOperation = async (kind: Exclude<OperationKind, "disconnect">) => {
     if (state.operation) return;
     if ((kind === "stop" || kind === "restart") && (working || state.bot.connected) && !window.confirm("Hay una sesión o servicio activo. ¿Quieres continuar?")) return;
-    const result = await window.dotty.runOperation(kind);
-    setNotice(result.message);
-    window.setTimeout(() => setNotice(""), 3_000);
+    const request = operationRequest.current.beginRequest();
+    try {
+      const result = await window.dotty.runOperation(kind);
+      if (operationRequest.current.isCurrent(request)) setNotice(result.message);
+    } catch {
+      if (operationRequest.current.isCurrent(request)) setNotice("No se pudo solicitar la operación.");
+    }
+  };
+
+  const setProcessingPaused = async (paused: boolean) => {
+    if (processingControlBusy) return;
+    setProcessingControlBusy(true);
+    try {
+      const result = await window.dotty.setProcessingPaused(paused);
+      setState((current) => ({ ...current, transcriber: { ...current.transcriber, processingPaused: result.paused } }));
+      setNotice(paused
+        ? result.activeWork ? "Pausa solicitada. El fragmento activo terminará antes de detener la cola." : "Cola pausada. Los trabajos pendientes se conservan."
+        : "Cola reanudada. Los trabajos pendientes continuarán automáticamente.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "No se pudo cambiar la pausa del transcriptor.");
+    } finally { setProcessingControlBusy(false); }
+  };
+
+  const setAutomaticNarrative = async (automatic: boolean) => {
+    if (pipelineModeBusy) return;
+    setPipelineModeBusy(true);
+    try {
+      const result = await window.dotty.setPipelineMode(automatic ? "automatic" : "manual");
+      setPipelineModeState(result.mode);
+      setNotice(automatic
+        ? "Modo automático activado para las sesiones que se cierren desde ahora. El guion quedará pendiente de aprobación."
+        : "Modo manual activado. Los guiones existentes y el raw se conservan.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "No se pudo cambiar el modo del guion.");
+    } finally { setPipelineModeBusy(false); }
+  };
+
+  const setWindowsAutostart = async (enabled: boolean) => {
+    if (autostartBusy) return;
+    setAutostartBusy(true);
+    try {
+      const result = await window.dotty.setAutostartEnabled(enabled);
+      setAutostartEnabledState(result);
+      setNotice(result ? "Dotty se iniciará al entrar en Windows." : "Inicio automático de Windows desactivado.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "No se pudo cambiar el inicio de Windows.");
+    } finally { setAutostartBusy(false); }
   };
 
   const disconnect = async () => {
     if (state.operation || !window.confirm("Esto detendrá completamente los servicios de Dotty y limpiará sus PID y locks. ¿Continuar?")) return;
-    const result = await window.dotty.disconnect();
-    setNotice(result.message);
-    window.setTimeout(() => setNotice(""), 3_000);
+    const request = operationRequest.current.beginRequest();
+    try {
+      const result = await window.dotty.disconnect();
+      if (operationRequest.current.isCurrent(request)) setNotice(result.message);
+    } catch {
+      if (operationRequest.current.isCurrent(request)) setNotice("No se pudo solicitar la desconexión.");
+    }
   };
 
   const restoreBotIcon = async () => {
     const result = await window.dotty.restoreBotIcon();
     setNotice(result.message);
-    window.setTimeout(() => setNotice(""), 4_000);
   };
 
   const selectTranscript = async (summary: TranscriptSummary) => {
+    setProcessingError(false);
+    selectedSessionId.current = summary.sessionId;
+    selectionEpoch.current.beginRequest();
     const request = ++selectionRequest.current;
-    const detail = await window.dotty.readTranscript(summary.sessionId);
-    if (request !== selectionRequest.current) return;
+    detailsRequest.current.invalidate();
+    editorialRequest.current.invalidate();
+    setSelected((current) => current?.sessionId === summary.sessionId ? current : null);
+    setSessionDetails((current) => current?.id === summary.sessionId ? current : null);
+    setEditorialState(null);
+    const detail = await window.dotty.readTranscript(summary.sessionId).catch(() => null);
+    if (request !== selectionRequest.current || selectedSessionId.current !== summary.sessionId) return;
+    if (!detail) { setNotice("No se pudo cargar la sesión. Inténtalo de nuevo."); return; }
     setSelected(detail);
     const mode = detail.narrativeContent === null ? "transcript" : "narrative";
     setReaderMode(mode);
@@ -321,14 +532,28 @@ export function App() {
     setTranscriptSearch("");
   };
 
+  const refreshSelected = async (sessionId: string, selection: number): Promise<TranscriptDetail | null> => {
+    if (!selectionEpoch.current.isCurrent(selection) || selectedSessionId.current !== sessionId) return null;
+    const request = ++selectionRequest.current;
+    const detail = await window.dotty.readTranscript(sessionId);
+    if (request !== selectionRequest.current || !selectionEpoch.current.isCurrent(selection) || selectedSessionId.current !== sessionId) return null;
+    setSelected(detail);
+    const detailsGeneration = detailsRequest.current.beginRequest();
+    void window.dotty.getSessionDetails(sessionId).then((next) => {
+      if (detailsRequest.current.isCurrent(detailsGeneration) && selectedSessionId.current === sessionId) setSessionDetails(next);
+    }).catch(() => undefined);
+    return detail;
+  };
+
   const saveCurrentDocument = async () => {
     if (!selected) return;
+    const selection = selectionEpoch.current.snapshot();
     const result = readerMode === "narrative"
       ? await window.dotty.saveNarrative(selected.sessionId, draft)
       : await window.dotty.saveTranscript(selected.sessionId, draft);
     if (result.saved) {
-      const refreshed = await window.dotty.readTranscript(selected.sessionId);
-      setSelected(refreshed);
+      const refreshed = await refreshSelected(selected.sessionId, selection);
+      if (!refreshed) return;
       setDraft(readerMode === "narrative" ? refreshed.narrativeContent ?? "" : refreshed.content);
       setEditing(false);
       const backupNotice = result.backupName ? ` Respaldo: ${result.backupName}` : "";
@@ -340,6 +565,7 @@ export function App() {
 
   const saveEditorialLearning = async () => {
     if (!selected || editorialBusy) return;
+    const selection = selectionEpoch.current.snapshot();
     const editedVersion = editing ? draft : selected.narrativeContent ?? draft;
     const originalVersion = selected.narrativeContent ?? "";
     if (editorialComment.trim() === "" && editedVersion.trim() === originalVersion.trim()) {
@@ -350,14 +576,18 @@ export function App() {
     try {
       if (editing) await window.dotty.saveNarrative(selected.sessionId, editedVersion);
       const result = await window.dotty.submitEditorialFeedback(selected.sessionId, editorialComment, editedVersion);
-      setEditorialState(await window.dotty.getEditorialLearning(selected.sessionId));
-      setEditorialComment("");
-      setSelected({ ...selected, narrativeContent: editedVersion, updatedAt: new Date().toISOString() });
-      setEditing(false);
-      setNotice(`Aprendizaje guardado: ${result.candidates.length} propuesta(s) pendientes de aprobación.`);
+      const editorialRequestId = editorialRequest.current.beginRequest();
+      const nextEditorial = await window.dotty.getEditorialLearning(selected.sessionId);
+      if (editorialRequest.current.isCurrent(editorialRequestId) && selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setEditorialState(nextEditorial);
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) {
+        setEditorialComment("");
+        setSelected((current) => current?.sessionId === selected.sessionId ? { ...current, narrativeContent: editedVersion, updatedAt: new Date().toISOString() } : current);
+        setEditing(false);
+        setNotice(`Aprendizaje guardado: ${result.candidates.length} propuesta(s) pendientes de aprobación.`);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
-      setNotice(message.includes("No hay correcciones ni instrucciones")
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(message.includes("No hay correcciones ni instrucciones")
         ? "Primero modifica el guion o escribe una instrucción para que Dotty tenga algo que aprender."
         : "No se pudo guardar el aprendizaje. El guion no fue dañado.");
     } finally {
@@ -367,11 +597,16 @@ export function App() {
 
   const decideEditorialRule = async (ruleId: string, decision: "approve" | "reject" | "deprecate", scope?: EditorialScope) => {
     if (!selected || editorialBusy) return;
+    const selection = selectionEpoch.current.snapshot();
     setEditorialBusy(true);
     try {
       await window.dotty.decideEditorialRule(ruleId, decision, scope);
-      setEditorialState(await window.dotty.getEditorialLearning(selected.sessionId));
-      setNotice(decision === "approve" ? "Regla editorial aprobada." : "Propuesta descartada.");
+      const request = editorialRequest.current.beginRequest();
+      const next = await window.dotty.getEditorialLearning(selected.sessionId);
+      if (editorialRequest.current.isCurrent(request) && selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) {
+        setEditorialState(next);
+        setNotice(decision === "approve" ? "Regla editorial aprobada." : "Propuesta descartada.");
+      }
     } finally {
       setEditorialBusy(false);
     }
@@ -379,11 +614,16 @@ export function App() {
 
   const rollbackEditorialRule = async (ruleId: string) => {
     if (!selected || editorialBusy) return;
+    const selection = selectionEpoch.current.snapshot();
     setEditorialBusy(true);
     try {
       await window.dotty.rollbackEditorialRule(ruleId);
-      setEditorialState(await window.dotty.getEditorialLearning(selected.sessionId));
-      setNotice("Regla editorial restaurada a su versión anterior.");
+      const request = editorialRequest.current.beginRequest();
+      const next = await window.dotty.getEditorialLearning(selected.sessionId);
+      if (editorialRequest.current.isCurrent(request) && selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) {
+        setEditorialState(next);
+        setNotice("Regla editorial restaurada a su versión anterior.");
+      }
     } finally {
       setEditorialBusy(false);
     }
@@ -397,6 +637,7 @@ export function App() {
 
   const generateNarrative = async () => {
     if (!selected || narrativeBusy !== null) return;
+    const selection = selectionEpoch.current.snapshot();
     if (selected.narrativeContent !== null && !window.confirm(
       "Ya existe un guion guardado. Regenerarlo puede reemplazarlo (se conservará un respaldo). ¿Continuar?",
     )) return;
@@ -404,10 +645,9 @@ export function App() {
     setNotice("Dotty está generando el guion localmente. Puede tardar varios minutos.");
     try {
       const result = await window.dotty.generateNarrative(selected.sessionId);
-      setNotice(result.message);
-      const detail = await window.dotty.readTranscript(selected.sessionId);
-      setSelected(detail);
-      if (result.ok && detail.narrativeContent !== null) {
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(result.message);
+      const detail = await refreshSelected(selected.sessionId, selection);
+      if (detail && result.ok && detail.narrativeContent !== null) {
         setReaderMode("narrative");
         setDraft(detail.narrativeContent);
       }
@@ -419,15 +659,15 @@ export function App() {
 
   const regenerateRaw = async () => {
     if (!selected || rawBusy || narrativeBusy !== null) return;
+    const selection = selectionEpoch.current.snapshot();
     setRawBusy(true);
     try {
       const result = await window.dotty.regenerateRaw(selected.sessionId);
-      setNotice(result.message);
-      const detail = await window.dotty.readTranscript(selected.sessionId);
-      setSelected(detail);
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(result.message);
+      await refreshSelected(selected.sessionId, selection);
       await loadTranscripts();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "No se pudo rehacer el raw.");
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(error instanceof Error ? error.message : "No se pudo rehacer el raw.");
     } finally {
       setRawBusy(false);
     }
@@ -435,12 +675,12 @@ export function App() {
 
   const verifyNarrative = async () => {
     if (!selected || narrativeBusy !== null) return;
+    const selection = selectionEpoch.current.snapshot();
     setNarrativeBusy("verify");
     try {
       const result = await window.dotty.verifyNarrative(selected.sessionId);
-      setNotice(result.message);
-      const detail = await window.dotty.readTranscript(selected.sessionId);
-      setSelected(detail);
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(result.message);
+      await refreshSelected(selected.sessionId, selection);
       await loadTranscripts();
     } finally {
       setNarrativeBusy(null);
@@ -449,12 +689,12 @@ export function App() {
 
   const approveNarrativeScene = async (sceneId: string) => {
     if (!selected || narrativeBusy !== null || reviewSceneBusy !== null) return;
+    const selection = selectionEpoch.current.snapshot();
     setReviewSceneBusy(sceneId);
     try {
       const result = await window.dotty.approveNarrativeScene(selected.sessionId, sceneId);
-      setNotice(result.message);
-      const detail = await window.dotty.readTranscript(selected.sessionId);
-      setSelected(detail);
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(result.message);
+      await refreshSelected(selected.sessionId, selection);
       await loadTranscripts();
     } finally {
       setReviewSceneBusy(null);
@@ -463,12 +703,12 @@ export function App() {
 
   const approveNarrative = async () => {
     if (!selected || narrativeBusy !== null) return;
+    const selection = selectionEpoch.current.snapshot();
     setNarrativeBusy("approve");
     try {
       const result = await window.dotty.approveNarrative(selected.sessionId);
-      setNotice(result.message);
-      const detail = await window.dotty.readTranscript(selected.sessionId);
-      setSelected(detail);
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(result.message);
+      await refreshSelected(selected.sessionId, selection);
       await loadTranscripts();
     } finally {
       setNarrativeBusy(null);
@@ -477,6 +717,7 @@ export function App() {
 
   const publishNarrative = async () => {
     if (!selected || narrativeBusy !== null) return;
+    const selection = selectionEpoch.current.snapshot();
     setNarrativeBusy("publish");
     try {
       if (selected.narrativeContent === null) {
@@ -497,9 +738,8 @@ export function App() {
       )) return;
 
       const result = await window.dotty.publishNarrative(selected.sessionId);
-      setNotice(result.message);
-      const detail = await window.dotty.readTranscript(selected.sessionId);
-      setSelected(detail);
+      if (selectionEpoch.current.isCurrent(selection) && selectedSessionId.current === selected.sessionId) setNotice(result.message);
+      await refreshSelected(selected.sessionId, selection);
       await loadTranscripts();
     } finally {
       setNarrativeBusy(null);
@@ -511,12 +751,11 @@ export function App() {
     try {
       const result = await window.dotty.runMaintenanceAction(action, sessionId);
       setNotice(result.message);
-      await loadMaintenance();
+      await loadMaintenance(true);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "No se pudo completar la recuperación.");
     } finally {
       setMaintenanceBusy(null);
-      window.setTimeout(() => setNotice(""), 5_000);
     }
   };
 
@@ -550,7 +789,20 @@ export function App() {
     : systemOperational ? "OPERATIVO" : state.bot.status === "unknown" ? "DESCONOCIDO" : partiallyReady ? "ERROR" : "APAGADO";
 
   const processingStages = useMemo(() => deriveProcessingStages(selected, transcripts, state), [selected, transcripts, state]);
-  const completedStages = processingStages.filter((stage) => stage.status === "COMPLETADO").length;
+  const dashboardStage = processingStages.find((stage) => ["ERROR", "BLOQUEADO", "PROCESANDO"].includes(stage.status));
+  const dashboardHeadline = dashboardStage ? `${dashboardStage.label}: ${dashboardStage.details}`
+    : selected ? `${processingStages.filter((stage) => stage.status === "COMPLETADO").length} de ${processingStages.length} etapas completadas`
+      : "Sin sesión seleccionada";
+  const focusedStages = focusedProcessingId && processingSession?.sessionId === focusedProcessingId
+    ? deriveLiveProcessingStages(processingSession, working)
+    : focusedProcessingId === selected?.sessionId ? processingStages : [];
+  const completedStages = focusedStages.filter((stage) => stage.status === "COMPLETADO").length;
+  const activeStage = focusedStages.find((stage) => stage.status === "PROCESANDO");
+  const problemStage = focusedStages.find((stage) => stage.status === "ERROR" || stage.status === "BLOQUEADO");
+  const processingHeadline = processingError ? "No se pudo actualizar el estado de esta sesión"
+    : problemStage ? `${problemStage.label}: ${problemStage.details}`
+      : activeStage ? `${activeStage.label}: ${activeStage.details}`
+        : focusedProcessingId ? `${completedStages} de ${focusedStages.length} etapas completadas` : "Selecciona una sesión para ver sus etapas";
   const narrativeProgress = selected?.processing?.narrativeProgress ?? selected?.narrativeProgress ?? 0;
   const narrativePhase = selected?.processing?.narrativePhase ?? selected?.narrativePhase ?? "Sin generar";
   const publicationStage = selected?.processing?.stages.find((stage) => stage.id === "publication");
@@ -562,7 +814,7 @@ export function App() {
     ? new Date(failureQuery.lastSuccessAt).toLocaleString("es-CL") : null;
 
   if (!setupStatus) return <div className="setup-loading">Cargando configuración de Dotty...</div>;
-  if (!setupStatus.configured) return <SetupWizard status={setupStatus} onComplete={(next) => { setSetupStatus(next); setPage("dashboard"); }} />;
+  if (!setupStatus.configured) return <SetupWizard status={setupStatus} onComplete={(next) => { setupRequest.current.invalidate(); setSetupStatus(next); setPage("dashboard"); }} />;
 
   return (
     <div className="app-shell">
@@ -606,7 +858,7 @@ export function App() {
 
             <div className="overview-grid dashboard-grid">
               <article className="panel compact-panel">
-                <div className="panel-heading"><div><span className="eyebrow">PROCESAMIENTO</span><h3>Estado actual</h3></div><Activity size={18} /></div>
+                <div className="panel-heading"><div><span className="eyebrow">PROCESAMIENTO · {selected?.title ?? "SIN SESIÓN"}</span><h3>{dashboardHeadline}</h3></div><Activity size={18} /></div>
                 <div className="stage-list">
                   {processingStages.map((stage) => (
                     <div key={stage.label} className="stage-row">
@@ -745,28 +997,73 @@ export function App() {
         {page === "processing" && (
           <section className="page-content processing-page">
             <div className="panel compact-panel process-summary process-map">
-              <div className="panel-heading"><div><span className="eyebrow">MAPA OPERATIVO</span><h3>{selected?.title ?? "Procesamiento del bot"}</h3><p>{selected ? `Sesión ${selected.sequenceNumber ?? selected.sessionId} · ${processingStages.length} controles visibles` : "Selecciona una sesión para inspeccionar cada etapa con datos reales."}</p></div><Activity size={18} /></div>
-              {selected && <div className="process-overall">
-                <div className="work-title"><strong>Avance de la sesión</strong><span>{completedStages} de {processingStages.length} etapas completadas</span></div>
-                <div className="progress-track" role="progressbar" aria-label="Etapas completadas" aria-valuenow={completedStages} aria-valuemin={0} aria-valuemax={processingStages.length}><div style={{ width: `${completedStages / processingStages.length * 100}%` }} /></div>
-                {(selected.processing ? selected.processing.state === "generating_narrative" : selected.narrativeState === "generating") && <>
-                  <div className="work-title"><strong>Guion · {narrativePhase}</strong><span>{Math.round(narrativeProgress * 100)}%</span></div>
-                  <div className="progress-track" role="progressbar" aria-label="Generación del guion" aria-valuenow={Math.round(narrativeProgress * 100)} aria-valuemin={0} aria-valuemax={100}><div style={{ width: `${narrativeProgress * 100}%` }} /></div>
+              <div className="panel-heading"><div><span className="eyebrow">PROCESO DE LA SESIÓN</span><h3>{focusedProcessingId === selected?.sessionId ? selected?.title : recentProcessingSessions.find((entry) => entry.sessionId === focusedProcessingId)?.label ?? focusedProcessingId ?? "Selecciona una sesión"}</h3><p>{focusedProcessingId ? `${focusedStages.length} etapas · ${focusedProcessingId}` : "Elige una sesión para consultar su estado real."}</p></div><Activity size={18} /></div>
+              <div className="process-controls">
+                <label htmlFor="processing-session">Sesión que se muestra</label>
+                <select id="processing-session" value={focusedProcessingId ?? ""} onChange={(event) => { setProcessingSessionId(event.target.value); setProcessingSession(null); setProcessingError(false); }}>
+                  {!focusedProcessingId && <option value="">Selecciona una sesión</option>}
+                  {focusedProcessingId && !recentProcessingSessions.some((entry) => entry.sessionId === focusedProcessingId) && !transcripts.some((entry) => entry.sessionId === focusedProcessingId) && <option value={focusedProcessingId}>{working?.session_label ?? focusedProcessingId}</option>}
+                  {recentProcessingSessions.map((entry) => <option key={entry.sessionId} value={entry.sessionId}>{entry.label}</option>)}
+                  {transcripts.filter((entry) => !recentProcessingSessions.some((recent) => recent.sessionId === entry.sessionId)).map((entry) => <option key={entry.sessionId} value={entry.sessionId}>{entry.title} · {formatSessionStatus(entry.status)}</option>)}
+                </select>
+              </div>
+              <div className="process-controls-row">
+                {focusedProcessingId && transcripts.some((entry) => entry.sessionId === focusedProcessingId) && <button onClick={() => {
+                  const summary = transcripts.find((entry) => entry.sessionId === focusedProcessingId);
+                  if (summary) void selectTranscript(summary);
+                  setPage("sessions");
+                }}>Abrir raw y guion</button>}
+                {maintenance.issues.some((issue) => issue.sessionId === focusedProcessingId) && <button onClick={() => setPage("tools")}>Ver recuperación manual</button>}
+              </div>
+              {working && focusedProcessingId !== working.session_id && <div className="process-context" role="status">
+                <strong>Transcripción activa en otra sesión</strong>
+                <span>{working.session_label ?? working.session_id}. Las etapas visibles pertenecen a la sesión elegida.</span>
+                <button onClick={() => { setProcessingSessionId(working.session_id ?? null); setProcessingSession(null); }}>Ver sesión activa</button>
+              </div>}
+              {processingError && <div className="error-stack" role="status"><strong>Estado sin actualizar</strong><span>La consulta falló. Se reintentará automáticamente; los datos visibles pueden estar desactualizados.</span></div>}
+              {focusedProcessingId && <p className="process-headline" role="status">{processingHeadline}</p>}
+              {focusedStages.length > 0 && <div className="process-overall">
+                <div className="work-title"><strong>Avance de la sesión</strong><span>{completedStages} de {focusedStages.length} etapas completadas</span></div>
+                <div className="progress-track" role="progressbar" aria-label="Etapas completadas" aria-valuenow={completedStages} aria-valuemin={0} aria-valuemax={focusedStages.length}><div style={{ width: `${completedStages / focusedStages.length * 100}%` }} /></div>
+                {processingSession?.sessionId === focusedProcessingId && processingSession.state === "generating_narrative" && <>
+                  <div className="work-title"><strong>Guion · {processingSession.narrativePhase ?? "Generando"}</strong><span>{Math.round((processingSession.narrativeProgress ?? 0) * 100)}%</span></div>
+                  <div className="progress-track" role="progressbar" aria-label="Generación del guion" aria-valuenow={Math.round((processingSession.narrativeProgress ?? 0) * 100)} aria-valuemin={0} aria-valuemax={100}><div style={{ width: `${(processingSession.narrativeProgress ?? 0) * 100}%` }} /></div>
                 </>}
               </div>}
-              <div className="process-stage-grid">
-                {processingStages.map((stage, index) => (
-                  <article key={stage.label} className={`process-stage-card ${stage.status.toLowerCase()}`}>
+              {focusedStages.length > 0 && <div className="process-stage-grid">
+                {focusedStages.map((stage, index) => (
+                  <article key={stage.id} className={`process-stage-card ${stage.status.toLowerCase()}`}>
                     <div className="process-stage-index">{String(index + 1).padStart(2, "0")}</div>
-                    <div className="process-stage-copy"><strong>{stage.label}</strong><span>{stage.details}</span><div className={`process-stage-track ${stage.status === "PROCESANDO" && stage.progress === undefined ? "indeterminate" : ""}`} role="progressbar" aria-label={stage.label} aria-valuenow={stage.status === "COMPLETADO" ? 100 : stage.progress === undefined ? undefined : Math.round(stage.progress * 100)} aria-valuemin={0} aria-valuemax={100}><div style={{ width: stage.status === "COMPLETADO" ? "100%" : `${Math.round(Math.max(0, Math.min(1, stage.progress ?? 0)) * 100)}%` }} /></div>{stage.artifact && <code>{stage.artifact}</code>}</div>
+                    <div className="process-stage-copy"><strong>{stage.label}</strong><span>{stage.details}</span>{(stage.status === "COMPLETADO" || stage.status === "PROCESANDO") && <div className={`process-stage-track ${stage.status === "PROCESANDO" && stage.progress === undefined ? "indeterminate" : ""}`} role="progressbar" aria-label={stage.label} aria-valuenow={stage.status === "COMPLETADO" ? 100 : stage.progress === undefined ? undefined : Math.round(stage.progress * 100)} aria-valuemin={0} aria-valuemax={100}><div style={{ width: stage.status === "COMPLETADO" ? "100%" : `${Math.round(Math.max(0, Math.min(1, stage.progress ?? 0)) * 100)}%` }} /></div>}{stage.artifact && <code>{stage.artifact}</code>}</div>
                     <div className="process-stage-state"><strong className={`badge ${stage.status.toLowerCase()}`}>{stage.status}</strong>{stage.total !== undefined && stage.total > 0 && <small>{stage.current ?? 0}/{stage.total}</small>}{(stage.errors > 0 || stage.warnings > 0) && <small>{stage.errors > 0 ? `${stage.errors} errores` : ""}{stage.errors > 0 && stage.warnings > 0 ? " · " : ""}{stage.warnings > 0 ? `${stage.warnings} avisos` : ""}</small>}</div>
                   </article>
                 ))}
-              </div>
+              </div>}
             </div>
 
             <div className="panel compact-panel process-summary">
               <div className="panel-heading"><div><span className="eyebrow">TRABAJO ACTIVO</span><h3>Transcripción actual</h3></div><CirclePower size={18} /></div>
+              <p>Bot: {state.bot.status === "unknown" ? "estado desconocido" : state.bot.connected ? "conectado a Discord" : state.bot.running ? "sin conexión a Discord" : "detenido"} · Transcriptor: {state.transcriber.available ? "disponible" : "no disponible"}</p>
+              <p>Cola: {state.transcriber.queue.queued} pendientes · {state.transcriber.queue.processing} procesando · {state.transcriber.queue.failed} fallidos</p>
+              <p>Cola de transcripción: {state.transcriber.processingPaused === true ? "pausada" : state.transcriber.processingPaused === false ? "activa" : "estado de pausa desconocido"}</p>
+              <p>Guion tras cerrar el raw: {pipelineMode === "automatic" ? "generación automática para nuevas sesiones" : pipelineMode === "manual" ? "inicio manual" : "consultando modo"}</p>
+              <div className="process-controls-row">
+                {pipelineMode === "automatic"
+                  ? <button disabled={pipelineModeBusy} onClick={() => void setAutomaticNarrative(false)}>Usar modo manual</button>
+                  : <button disabled={pipelineModeBusy || pipelineMode === null} onClick={() => void setAutomaticNarrative(true)}>Activar guion automático</button>}
+              </div>
+              <p>Al abrir la aplicación, Dotty se inicia automáticamente si está apagada.</p>
+              <p>Inicio con Windows (opcional): {autostartEnabled === true ? "activado" : autostartEnabled === false ? "desactivado" : "estado desconocido"}</p>
+              <div className="process-controls-row">
+                <button disabled={autostartBusy || autostartEnabled === null} onClick={() => void setWindowsAutostart(autostartEnabled !== true)}>
+                  {autostartEnabled === true ? "Desactivar inicio con Windows" : "Activar inicio con Windows"}
+                </button>
+              </div>
+              <div className="process-controls-row">
+                {state.transcriber.processingPaused === true
+                  ? <button disabled={processingControlBusy || !state.transcriber.available} onClick={() => void setProcessingPaused(false)}><Play size={15} /> Reanudar cola</button>
+                  : <button disabled={processingControlBusy || !state.transcriber.available || state.transcriber.processingPaused === undefined} onClick={() => void setProcessingPaused(true)}><Square size={15} /> Pausar tras el fragmento actual</button>}
+              </div>
               {working ? (
                 <>
                   <div className="work-title"><strong>{working.session_label ?? "Transcribiendo audio"}</strong><span>{progress}%</span></div>
@@ -829,7 +1126,7 @@ export function App() {
           </section>
         )}
 
-        {page === "settings" && <section className="page-content settings-page"><SetupWizard embedded status={setupStatus} onComplete={(next) => { setSetupStatus(next); setNotice("Configuración actualizada."); }} /></section>}
+        {page === "settings" && <section className="page-content settings-page"><SetupWizard embedded status={setupStatus} onComplete={(next) => { setupRequest.current.invalidate(); setSetupStatus(next); setNotice("Configuración actualizada."); }} /></section>}
       </main>
     </div>
   );

@@ -22,6 +22,9 @@ internal static class Program
             "control-panel",
             "dist",
             "main",
+            "apps",
+            "control-panel",
+            "src",
             "main",
             "main.js"
         );

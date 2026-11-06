@@ -8,6 +8,39 @@ from dotty_transcriber.instance_lock import TranscriberInstanceLock
 from dotty_transcriber.storage import JobInput, JobStore, PROVENANCE_PROTOCOL_VERSION
 
 
+def test_processing_pause_is_durable_and_does_not_interrupt_claimed_work(tmp_path: Path) -> None:
+    path = tmp_path / "queue.db"
+    store = JobStore(path)
+    store.enqueue(JobInput("session:first", "first.wav", "user", 0, "es"))
+    store.enqueue(JobInput("session:second", "second.wav", "user", 1, "es"))
+    first = store.claim_next()
+    assert first is not None
+    assert store.set_processing_paused(True) is True
+    assert store.claim_next() is None
+    assert store.complete(first["id"], first["claim_token"], {"segments": []})
+    assert store.release_occupation(first["occupation_id"], first["id"], first["claim_token"])
+    restarted = JobStore(path)
+    assert restarted.processing_paused() is True
+    assert restarted.claim_next() is None
+    assert restarted.set_processing_paused(False) is False
+    assert restarted.claim_next()["id"] == "session:second"
+
+
+def test_restart_does_not_release_legacy_occupation_without_lease(tmp_path: Path) -> None:
+    path = tmp_path / "queue.db"
+    legacy = JobStore(path)
+    legacy.enqueue(JobInput("session:chunk", "audio.wav", "user", 0, "es"))
+    claim = legacy.claim_next()
+    assert claim is not None
+    lock = TranscriberInstanceLock.acquire(tmp_path)
+    try:
+        restarted = JobStore(path, instance_lock=lock)
+        assert restarted.claim_next() is None
+        assert restarted.occupations_for_session("session")[0]["released_at"] is None
+    finally:
+        lock.release()
+
+
 def test_retranscribe_session_requeues_completed_audio_and_is_idempotent_while_running(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "queue.db")
     store.enqueue(JobInput("session-one:chunk-a", "a.wav", "speaker", 0, "es"))
@@ -20,7 +53,11 @@ def test_retranscribe_session_requeues_completed_audio_and_is_idempotent_while_r
     assert store.get("session-one:chunk-a")["result"] is None
     assert store.get("session-two:chunk-a")["status"] == "completed"
     assert store.retranscribe_session("session-one") == {"state": "running", "queued": 0, "total": 1}
-    assert store.session_progress("session-one") == {"queued": 1, "processing": 0, "completed": 0, "failed": 0, "total": 1}
+    progress = store.session_progress("session-one")
+    assert {key: value for key, value in progress.items() if key != "latest_updated_at"} == {
+        "queued": 1, "processing": 0, "completed": 0, "failed": 0, "total": 1,
+    }
+    assert isinstance(progress["latest_updated_at"], str)
 
 
 def test_job_provenance_uses_the_held_lock_identity_and_does_not_retrofit_old_jobs(
@@ -238,15 +275,19 @@ def test_session_inventory_preserves_provenance_across_retry_and_restart(
     second_lock = TranscriberInstanceLock.acquire(tmp_path)
     try:
         restarted = JobStore(path, instance_lock=second_lock)
-        assert restarted.claim_next() is None
         pending = restarted.inventory_for_session("pending")
-        assert pending["classification"] == "uncertain"
+        assert pending["classification"] == "protected-only"
         assert pending["counts"]["jobs_protected"] == 1
-        assert pending["counts"]["occupations_active"] == 1
-        assert pending["counts"]["occupations_unreconciled"] == 1
+        assert pending["counts"]["occupations_active"] == 0
+        assert pending["counts"]["occupations_unreconciled"] == 0
         assert pending["jobs"][0]["provenance_instance_id"] == first_instance_id
         assert pending["current_instance_id"] == second_lock.instance_id
         assert first_instance_id in pending["instance_ids"]
+        resumed = restarted.claim_next()
+        assert resumed is not None and resumed["id"] == "pending:chunk"
+        assert resumed["attempts"] == 2
+        assert restarted.complete(resumed["id"], resumed["claim_token"], {"segments": []})
+        assert restarted.release_occupation(resumed["occupation_id"], resumed["id"], resumed["claim_token"])
 
         retried_inventory = restarted.inventory_for_session("retry")
         assert retried_inventory["classification"] == "protected-only"
